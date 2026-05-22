@@ -402,12 +402,11 @@ impl AgentHarness {
     /// registration cycle — consumers should treat `NotificationHookStatus.state` as the
     /// source of truth for whether a hook is currently live.
     pub fn notification_status_snapshot(&self) -> NotificationStatusSnapshot {
-        let hooks: Vec<NotificationHookStatus> = self
-            .notification_hooks
-            .lock()
-            .iter()
-            .map(|h| h.status())
-            .collect();
+        // Clone the `Arc`s out of the registry first so each hook's `status()` runs without
+        // the registry mutex held. A slow `status()` (e.g. one that takes its own internal
+        // lock) would otherwise block concurrent `register_notification_hook` calls.
+        let hook_arcs: Vec<DynNotificationHook> = self.notification_hooks.lock().clone();
+        let hooks: Vec<NotificationHookStatus> = hook_arcs.iter().map(|h| h.status()).collect();
         NotificationStatusSnapshot {
             hooks,
             runtime: self.trigger_runtime.snapshot(),
