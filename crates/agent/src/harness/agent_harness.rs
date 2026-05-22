@@ -454,6 +454,14 @@ impl AgentHarness {
         // queue here — the hook's own backpressure is the right place for that since
         // it knows the transport's per-hook semantics (MCP push has no rate, hub frames
         // have per-topic rate limits, cron has burst smoothing).
+        //
+        // Contract: `handle_trigger` must not panic. The pump deliberately does NOT wrap
+        // the call in `catch_unwind`, because today every transition `handle_trigger` runs
+        // is internal (evaluator + audit append + emit). When sub-PR 4 starts dispatching
+        // accepted triggers into the agent loop (which can panic via user-provided tools /
+        // hooks), this loop will gain a `catch_unwind` shell plus a `HookPumpPanicked`
+        // event so the hook surface can show "pump dead" rather than silently buffering
+        // triggers into a dropped channel.
         let harness = Arc::clone(self);
         tokio::spawn(async move {
             while let Some(trigger) = rx.recv().await {
