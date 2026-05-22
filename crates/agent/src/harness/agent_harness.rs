@@ -111,6 +111,58 @@ use super::trigger_runtime::{
 };
 use super::types::{PromptTemplate, Skill};
 
+/// Decision returned from [`BeforeTriggerHook`]. Maps directly to terminal
+/// [`TriggerState`] variants when [`AgentHarness::handle_trigger`] resolves the trigger.
+///
+/// - `Allow` keeps the trigger on the `Accepted` path (default if no hook is configured).
+/// - `Deny { reason }` is a hard refusal; the trigger is recorded as `PermissionDenied`
+///   and the reason is captured in the audit record's `evaluator_decision`.
+/// - `Prompt { reason }` is a soft refusal; the trigger is recorded as `NeedsApproval`,
+///   and a future UI surface can offer the user replay. Today this is functionally a
+///   block — sub-PR 5 (running state machine) is where the prompt UI is wired in.
+///
+/// Token material **never** belongs in `reason`. Reasons surface in the audit
+/// record's `evaluator_decision` and in [`HarnessEvent::TriggerHandled`].
+#[derive(Clone, Debug, Default)]
+pub enum BeforeTriggerDecision {
+    #[default]
+    Allow,
+    Deny {
+        reason: String,
+    },
+    Prompt {
+        reason: String,
+    },
+}
+
+/// Snapshot passed into [`BeforeTriggerHook`]. Owned so the hook future can be `'static`.
+/// The hook sees the full trigger (including authority + payload summary) plus a
+/// point-in-time runtime snapshot so policy can reason about burst rates ("more than 10
+/// triggers from this source in the last window → require approval").
+#[derive(Clone, Debug)]
+pub struct BeforeTriggerContext {
+    pub trigger: super::trigger::Trigger,
+    pub runtime: super::trigger_runtime::TriggerRuntimeSnapshot,
+}
+
+/// Hook called by [`AgentHarness::handle_trigger`] after dedup + cycle evaluation
+/// returned `Accept`, but before the audit record is persisted. The hook returns a
+/// [`BeforeTriggerDecision`] mapping to a terminal [`TriggerState`]. If no hook is
+/// configured, the harness behaves as if the hook returned [`BeforeTriggerDecision::Allow`].
+///
+/// The hook runs after evaluator Accept on purpose: dedup / cycle decisions are
+/// pure-runtime concerns (no policy involvement); permission is a policy concern that
+/// applies only to triggers the runtime would otherwise process.
+pub type BeforeTriggerHook = Arc<
+    dyn Fn(
+            BeforeTriggerContext,
+            tokio_util::sync::CancellationToken,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = BeforeTriggerDecision> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Aggregated, copy-friendly snapshot returned by
 /// [`AgentHarness::notification_status_snapshot`]. The TUI / `/triggers hooks` command
 /// renders this directly; `hooks` is intentionally a snapshot `Vec` (not a live view) so the
@@ -150,6 +202,10 @@ pub struct AgentHarnessOptions {
     /// Optional trigger runtime config override. Defaults to
     /// [`TriggerRuntimeConfig::default`] (5-minute dedup, 5-hop cycle limit).
     pub trigger_runtime: TriggerRuntimeConfig,
+    /// Optional permission hook applied to triggers admitted by the dedup + cycle evaluator.
+    /// `None` is equivalent to a hook that always returns
+    /// [`BeforeTriggerDecision::Allow`]. See [`BeforeTriggerHook`].
+    pub before_trigger: Option<BeforeTriggerHook>,
 }
 
 impl AgentHarnessOptions {
@@ -168,6 +224,7 @@ impl AgentHarnessOptions {
             after_tool_call: None,
             budget_cap_usd: None,
             trigger_runtime: TriggerRuntimeConfig::default(),
+            before_trigger: None,
         }
     }
 }
@@ -200,6 +257,9 @@ pub struct AgentHarness {
     /// pump tasks are detached (`tokio::spawn`); they tear down naturally when the hook's
     /// `run` future completes or returns an error.
     notification_hooks: Arc<Mutex<Vec<DynNotificationHook>>>,
+    /// Optional permission hook applied to accepted triggers before they advance to a
+    /// terminal state. `None` defaults to [`BeforeTriggerDecision::Allow`].
+    before_trigger: Option<BeforeTriggerHook>,
 }
 
 impl AgentHarness {
@@ -237,6 +297,7 @@ impl AgentHarness {
             budget_cap_usd: options.budget_cap_usd,
             trigger_runtime: TriggerRuntime::with_config(options.trigger_runtime),
             notification_hooks: Arc::new(Mutex::new(Vec::new())),
+            before_trigger: options.before_trigger,
         }
     }
 
@@ -324,10 +385,37 @@ impl AgentHarness {
         let outcome = self.trigger_runtime.evaluate(&trigger);
 
         let (state, evaluator_decision) = match &outcome {
-            EvaluationOutcome::Accept => (
-                TriggerState::Accepted,
-                Some(serde_json::json!({ "outcome": "accept" })),
-            ),
+            EvaluationOutcome::Accept => {
+                // Evaluator said admit; run the permission hook to decide whether the
+                // accepted trigger advances to `Accepted` or stops at one of the
+                // policy-terminal states (`PermissionDenied` / `NeedsApproval`).
+                let permission_decision = self.run_before_trigger_hook(&trigger).await;
+                match permission_decision {
+                    BeforeTriggerDecision::Allow => (
+                        TriggerState::Accepted,
+                        Some(serde_json::json!({
+                            "outcome": "accept",
+                            "permission": "allow"
+                        })),
+                    ),
+                    BeforeTriggerDecision::Deny { reason } => (
+                        TriggerState::PermissionDenied,
+                        Some(serde_json::json!({
+                            "outcome": "accept",
+                            "permission": "deny",
+                            "reason": reason,
+                        })),
+                    ),
+                    BeforeTriggerDecision::Prompt { reason } => (
+                        TriggerState::NeedsApproval,
+                        Some(serde_json::json!({
+                            "outcome": "accept",
+                            "permission": "prompt",
+                            "reason": reason,
+                        })),
+                    ),
+                }
+            }
             EvaluationOutcome::Deduped {
                 replacement_policy,
                 previous_trace_id,
@@ -392,6 +480,24 @@ impl AgentHarness {
         });
 
         outcome
+    }
+
+    /// Invoke the optional permission hook on an accepted trigger. Returns
+    /// [`BeforeTriggerDecision::Allow`] when no hook is configured so the default-allow
+    /// policy is path-equivalent to omitting the hook entirely.
+    ///
+    /// The hook receives a [`CancellationToken`] that the harness does not currently
+    /// cancel; sub-PR 5 will pipe the harness's active-prompt cancel through this token so
+    /// a permission UI can be aborted by Ctrl-C.
+    async fn run_before_trigger_hook(&self, trigger: &Trigger) -> BeforeTriggerDecision {
+        let Some(hook) = self.before_trigger.clone() else {
+            return BeforeTriggerDecision::Allow;
+        };
+        let ctx = BeforeTriggerContext {
+            trigger: trigger.clone(),
+            runtime: self.trigger_runtime.snapshot(),
+        };
+        hook(ctx, tokio_util::sync::CancellationToken::new()).await
     }
 
     /// Point-in-time view of the harness's notification surface — the

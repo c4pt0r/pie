@@ -25,8 +25,8 @@ pub use types::{
 #[cfg(feature = "harness")]
 pub use harness::{
     agent_harness::{
-        AgentHarness, AgentHarnessOptions, HarnessEvent, HarnessListener,
-        NotificationStatusSnapshot,
+        AgentHarness, AgentHarnessOptions, BeforeTriggerContext, BeforeTriggerDecision,
+        BeforeTriggerHook, HarnessEvent, HarnessListener, NotificationStatusSnapshot,
     },
     compaction::{
         branch_summarization::{BranchSummaryResult, summarize_branch},

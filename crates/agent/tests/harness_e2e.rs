@@ -1611,3 +1611,189 @@ async fn register_notification_hook_snapshot_reflects_hook_status_state() {
     // Hook produced nothing so runtime counters stay at zero.
     assert_eq!(snap.runtime.accepted_total, 0);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────────────────
+// before_trigger hook — RFC 1 sub-PR 4 (permission evaluator extension)
+// ─────────────────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn before_trigger_default_allow_keeps_state_accepted() {
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage.clone() as Arc<dyn SessionStorage>);
+    let opts = AgentHarnessOptions::new(faux_model(), session.clone());
+    let harness = AgentHarness::new(opts);
+
+    let _ = harness
+        .handle_trigger(sample_trigger("perm-default", "trace-default"))
+        .await;
+
+    let entries = session.entries().await.unwrap();
+    let state = entries
+        .iter()
+        .find_map(|e| match e {
+            SessionTreeEntry::Custom {
+                custom_type, data, ..
+            } if custom_type == pie_agent_core::TriggerRecord::CUSTOM_TYPE => {
+                let r: pie_agent_core::TriggerRecord =
+                    serde_json::from_value(data.as_ref().unwrap().clone()).unwrap();
+                Some(r.state)
+            }
+            _ => None,
+        })
+        .expect("audit entry");
+    assert_eq!(
+        state,
+        pie_agent_core::TriggerState::Accepted,
+        "no hook → default Allow → Accepted"
+    );
+}
+
+#[tokio::test]
+async fn before_trigger_deny_records_permission_denied_state_and_reason() {
+    use pie_agent_core::{BeforeTriggerContext, BeforeTriggerDecision, BeforeTriggerHook};
+
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage.clone() as Arc<dyn SessionStorage>);
+    let mut opts = AgentHarnessOptions::new(faux_model(), session.clone());
+
+    let deny_hook: BeforeTriggerHook = Arc::new(|_ctx: BeforeTriggerContext, _cancel| {
+        Box::pin(async move {
+            BeforeTriggerDecision::Deny {
+                reason: "principal not on allow-list".into(),
+            }
+        })
+    });
+    opts.before_trigger = Some(deny_hook);
+    let harness = AgentHarness::new(opts);
+
+    let outcome = harness
+        .handle_trigger(sample_trigger("perm-deny", "trace-deny"))
+        .await;
+    assert!(
+        matches!(outcome, pie_agent_core::EvaluationOutcome::Accept),
+        "EvaluationOutcome is still Accept (evaluator decided to admit); the harness state is what reflects the deny"
+    );
+
+    let entries = session.entries().await.unwrap();
+    let record = entries
+        .iter()
+        .find_map(|e| match e {
+            SessionTreeEntry::Custom {
+                custom_type, data, ..
+            } if custom_type == pie_agent_core::TriggerRecord::CUSTOM_TYPE => {
+                let r: pie_agent_core::TriggerRecord =
+                    serde_json::from_value(data.as_ref().unwrap().clone()).unwrap();
+                Some(r)
+            }
+            _ => None,
+        })
+        .expect("audit entry");
+
+    assert_eq!(record.state, pie_agent_core::TriggerState::PermissionDenied);
+    let decision = record
+        .evaluator_decision
+        .as_ref()
+        .expect("evaluator_decision must capture deny reason");
+    assert_eq!(decision["permission"].as_str(), Some("deny"));
+    assert_eq!(
+        decision["reason"].as_str(),
+        Some("principal not on allow-list")
+    );
+}
+
+#[tokio::test]
+async fn before_trigger_prompt_records_needs_approval_state_and_reason() {
+    use pie_agent_core::{BeforeTriggerContext, BeforeTriggerDecision, BeforeTriggerHook};
+
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage.clone() as Arc<dyn SessionStorage>);
+    let mut opts = AgentHarnessOptions::new(faux_model(), session.clone());
+
+    let prompt_hook: BeforeTriggerHook = Arc::new(|_ctx: BeforeTriggerContext, _cancel| {
+        Box::pin(async move {
+            BeforeTriggerDecision::Prompt {
+                reason: "Cloudflare hub trigger from new principal".into(),
+            }
+        })
+    });
+    opts.before_trigger = Some(prompt_hook);
+    let harness = AgentHarness::new(opts);
+
+    let events = Arc::new(std::sync::Mutex::new(Vec::<HarnessEvent>::new()));
+    let sink = events.clone();
+    let _unsub = harness.subscribe_harness(Arc::new(move |ev: HarnessEvent| {
+        sink.lock().unwrap().push(ev);
+    }));
+
+    let _ = harness
+        .handle_trigger(sample_trigger("perm-prompt", "trace-prompt"))
+        .await;
+
+    let entries = session.entries().await.unwrap();
+    let record = entries
+        .iter()
+        .find_map(|e| match e {
+            SessionTreeEntry::Custom {
+                custom_type, data, ..
+            } if custom_type == pie_agent_core::TriggerRecord::CUSTOM_TYPE => {
+                let r: pie_agent_core::TriggerRecord =
+                    serde_json::from_value(data.as_ref().unwrap().clone()).unwrap();
+                Some(r)
+            }
+            _ => None,
+        })
+        .expect("audit entry");
+
+    assert_eq!(record.state, pie_agent_core::TriggerState::NeedsApproval);
+    assert_eq!(
+        record.evaluator_decision.as_ref().unwrap()["permission"].as_str(),
+        Some("prompt")
+    );
+
+    let evs = events.lock().unwrap().clone();
+    let handled_state = evs.iter().find_map(|e| match e {
+        HarnessEvent::TriggerHandled { state, .. } => Some(*state),
+        _ => None,
+    });
+    assert_eq!(
+        handled_state,
+        Some(pie_agent_core::TriggerState::NeedsApproval),
+        "TriggerHandled event must carry the policy-terminal state"
+    );
+}
+
+#[tokio::test]
+async fn before_trigger_hook_does_not_run_on_deduped_path() {
+    use pie_agent_core::{BeforeTriggerContext, BeforeTriggerDecision, BeforeTriggerHook};
+
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage.clone() as Arc<dyn SessionStorage>);
+    let mut opts = AgentHarnessOptions::new(faux_model(), session.clone());
+
+    let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = call_count.clone();
+    let hook: BeforeTriggerHook = Arc::new(move |_ctx: BeforeTriggerContext, _cancel| {
+        let counter = counter.clone();
+        Box::pin(async move {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            BeforeTriggerDecision::Allow
+        })
+    });
+    opts.before_trigger = Some(hook);
+    let harness = AgentHarness::new(opts);
+
+    // First call: Accept → hook runs once.
+    let _ = harness
+        .handle_trigger(sample_trigger("dup-key", "trace-1"))
+        .await;
+    // Second call (duplicate idempotency key): Deduped → hook MUST NOT run.
+    let _ = harness
+        .handle_trigger(sample_trigger("dup-key", "trace-2"))
+        .await;
+
+    assert_eq!(
+        call_count.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "hook must only run after evaluator Accept, never on Deduped/CycleSuppressed paths"
+    );
+}
