@@ -472,30 +472,37 @@ impl AgentHarness {
 
     /// Shared implementation behind auto + manual compaction. Returns `true` when compaction
     /// actually ran.
+    ///
+    /// Operates on the real session entries (via `self.session.branch(None)`) so the
+    /// `first_kept_entry_id` we persist on the `Compaction` record is reachable in the session
+    /// jsonl. The previous implementation synthesized fake `Message` entries from in-memory
+    /// `state.messages` with fresh uuidv7s — those ids were never written to the session, so
+    /// `--resume` could not locate them in `build_session_context` and silently dropped all
+    /// pre-compaction tail. See issue #19.
     async fn do_compact(
         &self,
         from_hook: bool,
         custom_instructions: Option<String>,
     ) -> Result<bool, AgentRunError> {
-        let (model, _messages_for_summary, entries) = {
-            let s = self.agent.state();
-            let model = match s.model.clone() {
-                Some(m) => m,
-                None => return Ok(false),
-            };
-            let messages = s.messages.clone();
-            // Convert agent-state messages into synthetic session entries for compact()'s
-            // signature. compact() only iterates Message entries; the others are ignored.
-            let entries: Vec<super::session::session::SessionTreeEntry> = messages
-                .into_iter()
-                .map(|m| super::session::session::SessionTreeEntry::Message {
-                    id: super::session::uuid::uuidv7(),
-                    parent_id: None,
-                    timestamp: chrono::Utc::now().to_rfc3339(),
-                    message: m,
-                })
-                .collect();
-            (model, s.messages.clone(), entries)
+        let model = match self.agent.state().model.clone() {
+            Some(m) => m,
+            None => return Ok(false),
+        };
+
+        // Source of truth: real session entries with their real ids.
+        let entries = match self.session.branch(None).await {
+            Ok(es) => es,
+            Err(e) => {
+                // Read failure is non-fatal: skip this compaction attempt; the loop will try
+                // again next time. We do not append a `Compaction` record and do not mutate
+                // agent state.
+                self.emit_harness_event(HarnessEvent::Compaction {
+                    from_hook,
+                    summary: format!("compaction skipped: session branch read failed: {e}"),
+                    tokens_before: 0,
+                });
+                return Ok(false);
+            }
         };
 
         let settings = self.compaction_settings.lock().clone();
@@ -516,12 +523,14 @@ impl AgentHarness {
             Err(e) => return Err(AgentRunError::Other(format!("compaction failed: {e}"))),
         };
 
+        let first_kept_entry_id = result.first_kept_entry_id.clone().unwrap_or_default();
+
         // Persist a compaction entry to the session.
         let _ = self
             .session
             .append_compaction(
                 result.summary.clone(),
-                result.first_kept_entry_id.clone().unwrap_or_default(),
+                first_kept_entry_id.clone(),
                 result.tokens_before,
                 None,
                 from_hook,
@@ -535,28 +544,41 @@ impl AgentHarness {
             tokens_before: result.tokens_before,
         });
 
-        // Replace agent state's prefix with a single compaction-summary custom message. Keep
-        // anything that came after the cut point.
+        // Replace agent state's prefix with a single compaction-summary message followed by
+        // the in-memory tail that corresponds to the kept session entries.
+        //
+        // `state.messages` is the in-memory mirror of session `Message` entries (the agent loop
+        // only appends `AgentMessage::Llm` variants there, and `make_session_listener`
+        // persists each one). So the in-memory index for the first kept entry equals the
+        // count of `Message` entries strictly before `first_kept_entry_id` in `entries`.
+        // Non-Message entries (ModelChange, ThinkingLevelChange, Custom{custom_type=trigger},
+        // BranchSummary, etc.) are not in `state.messages` and are skipped naturally.
         {
             let mut s = self.agent.state();
             let mut new_msgs: Vec<AgentMessage> = vec![compaction_summary(result.summary.clone())];
-            // Find first_kept_entry_id in the state.messages (none of which carry ids); a
-            // simple heuristic is to drop everything older than the cut and keep the tail.
-            // Concretely: keep the last N messages whose estimated tokens sum to at most
-            // `keep_recent_tokens` (matches `find_cut_point`).
-            let keep = settings.keep_recent_tokens as u64;
-            let mut acc = 0u64;
-            let mut tail: Vec<AgentMessage> = Vec::new();
-            for m in s.messages.iter().rev() {
-                let cost = super::compaction::compaction::estimate_tokens(m);
-                if acc + cost > keep {
-                    break;
+
+            if !first_kept_entry_id.is_empty() {
+                if let Some(real_idx) = entries.iter().position(|e| e.id() == first_kept_entry_id) {
+                    let kept_in_memory_start = entries[..real_idx]
+                        .iter()
+                        .filter(|e| {
+                            matches!(e, super::session::session::SessionTreeEntry::Message { .. })
+                        })
+                        .count();
+                    if kept_in_memory_start <= s.messages.len() {
+                        new_msgs.extend(s.messages[kept_in_memory_start..].iter().cloned());
+                    }
+                    // If `kept_in_memory_start` is out of range, the in-memory state has
+                    // diverged from the session (race or external mutation). We keep just the
+                    // summary; the next prompt rehydrates the rest if needed.
                 }
-                acc += cost;
-                tail.push(m.clone());
+                // If `first_kept_entry_id` is non-empty but not found in `entries`, treat as a
+                // legacy (pre-fix) bad record: keep just the summary, do not crash. Documented
+                // in CHANGELOG `### Fixed`.
             }
-            tail.reverse();
-            new_msgs.extend(tail);
+            // Empty `first_kept_entry_id` means `entries` was empty pre-compaction — only the
+            // summary is needed.
+
             s.messages = new_msgs;
         }
         Ok(true)

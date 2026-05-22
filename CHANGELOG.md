@@ -73,6 +73,21 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
 
 - **#18** Biased select against stream stalls so Ctrl-C unblocks the in-flight prompt
   within 500ms regardless of LLM stream state.
+- **#19** `AgentHarness` compaction now sources entries from the real session jsonl
+  (`session.branch(None)`) instead of synthesizing fresh `SessionTreeEntry::Message`
+  records with throwaway uuidv7 ids. The previous implementation wrote a
+  `first_kept_entry_id` to the `Compaction` record that was never reachable in the session,
+  so `--resume` silently dropped all pre-compaction tail messages. The in-memory tail
+  retained after compaction now maps back to the corresponding `state.messages` index by
+  counting `Message` entries strictly before `first_kept_entry_id`, replacing the previous
+  token-only heuristic. Sessions still containing legacy bad `firstKeptEntryId` values
+  recover best-effort: replay keeps only the compaction summary plus post-compaction
+  entries (no panic, no crash). Same PR also asserts `build_session_context` skips
+  `SessionTreeEntry::Custom { custom_type: "trigger" }` entries from the LLM message stream
+  while keeping them enumerable via `session.branch(None)` — a prerequisite invariant for
+  RFC 1 (issue #20) trigger audit work. Session-side read failures during compaction now
+  emit a `HarnessEvent::Compaction` with a `compaction skipped: ...` summary and leave both
+  the session jsonl and agent state untouched rather than crashing.
 - **#25 (PR A)** Register the `Skill` builtin tool the system prompt already advertises.
   Before this fix the model would call `Skill { name: "..." }` and receive
   `no tool named 'Skill'` because the tool was never wired into `default_tools`. On hit

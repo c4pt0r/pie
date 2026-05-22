@@ -4,9 +4,10 @@
 use std::sync::Arc;
 
 use pie_agent_core::{
-    AgentHarness, AgentHarnessOptions, AgentMessage, HarnessEvent, HarnessListener,
-    MemorySessionStorage, Session, SessionError, SessionErrorCode, SessionStorage,
-    SessionTreeEntry, Skill, StreamFn, ThinkingLevel,
+    AgentHarness, AgentHarnessOptions, AgentMessage, CompactionSettings, HarnessEvent,
+    HarnessListener, JsonlSessionRepo, MemorySessionStorage, Session, SessionError,
+    SessionErrorCode, SessionStorage, SessionTreeEntry, Skill, StreamFn, ThinkingLevel,
+    build_session_context,
 };
 use pie_ai::{
     AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream, AssistantRole,
@@ -709,4 +710,270 @@ async fn subscribe_harness_unsub_stops_delivery() {
         before,
         "no events should reach the listener after unsubscribe"
     );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────────────────
+// Issue #19 regression tests — compaction `first_kept_entry_id` must be reachable in the
+// session jsonl so `--resume` reconstructs the kept tail.
+// ──────────────────────────────────────────────────────────────────────────────────────────
+
+/// Round-trip: drive the harness through a few turns + force_compact, then drop the harness,
+/// reopen the same session jsonl, and verify `build_session_context` reproduces what was in
+/// in-memory state after compaction. The pre-fix bug was that `first_kept_entry_id` written to
+/// the session jsonl referenced a synthetic id that no real entry carried, so the rebuilt
+/// branch dropped the entire pre-compaction tail.
+#[tokio::test]
+async fn force_compact_writes_reachable_first_kept_entry_id_and_resume_preserves_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = JsonlSessionRepo::new(dir.path());
+    let session = repo.create("/tmp/test-cwd").await.unwrap();
+    let session_files = repo.list().await.unwrap();
+    assert_eq!(session_files.len(), 1);
+    let session_path = session_files[0].clone();
+
+    // Build a harness with a low keep_recent_tokens so a small transcript triggers compaction.
+    let mut opts = AgentHarnessOptions::new(faux_model(), session.clone());
+    opts.stream_fn = Some(faux_stream_fn("summary or assistant reply"));
+    opts.compaction = CompactionSettings {
+        enabled: true,
+        reserve_tokens: 0,
+        keep_recent_tokens: 4, // forces the cut close to the end
+    };
+    let harness = AgentHarness::new(opts);
+
+    // Drive three short prompts so we have ≥3 user/assistant pairs in the session.
+    harness.prompt("first").await.unwrap();
+    harness.prompt("second").await.unwrap();
+    harness.prompt("third").await.unwrap();
+
+    let entries_before = session.entries().await.unwrap();
+    let pre_compact_msg_count = entries_before
+        .iter()
+        .filter(|e| matches!(e, SessionTreeEntry::Message { .. }))
+        .count();
+    assert!(
+        pre_compact_msg_count >= 6,
+        "expected at least 3 user+assistant pairs in session, got {pre_compact_msg_count}"
+    );
+
+    // Force compaction.
+    let ran = harness.force_compact(None).await.unwrap();
+    assert!(ran, "force_compact should have produced a summary");
+
+    // Verify the persisted Compaction entry's first_kept_entry_id is reachable.
+    let entries_after = session.entries().await.unwrap();
+    let compaction_entry = entries_after
+        .iter()
+        .rev()
+        .find(|e| matches!(e, SessionTreeEntry::Compaction { .. }))
+        .expect("session should have a Compaction entry");
+    let SessionTreeEntry::Compaction {
+        first_kept_entry_id,
+        ..
+    } = compaction_entry
+    else {
+        unreachable!()
+    };
+    assert!(
+        !first_kept_entry_id.is_empty(),
+        "first_kept_entry_id must be set when compaction ran"
+    );
+    let kept = entries_after
+        .iter()
+        .find(|e| e.id() == first_kept_entry_id.as_str())
+        .expect(
+            "first_kept_entry_id MUST be reachable in the session entries (issue #19 regression)",
+        );
+    // The kept entry must be a `Message` and specifically a user-turn boundary.
+    let kept_msg = match kept {
+        SessionTreeEntry::Message { message, .. } => message,
+        other => panic!(
+            "first_kept_entry_id should point to a `Message` entry, got {:?}",
+            other.type_str()
+        ),
+    };
+    assert!(
+        matches!(kept_msg, AgentMessage::Llm(pie_ai::Message::User(_))),
+        "first_kept_entry_id should land on a user-turn-boundary Message"
+    );
+
+    // Snapshot in-memory state right after compaction.
+    let in_memory_after = harness.agent().state().messages.clone();
+    drop(harness);
+
+    // Reopen the session from disk and rebuild the context.
+    let reopened = repo.open(&session_path).await.unwrap();
+    let branch = reopened.branch(None).await.unwrap();
+    let rebuilt = build_session_context(&branch);
+
+    // The rebuilt message list must be non-trivial (the bug dropped everything except the
+    // summary) and must contain the same tail messages the live agent kept.
+    assert!(
+        rebuilt.messages.len() >= in_memory_after.len(),
+        "rebuilt context lost messages (live={}, rebuilt={}) — pre-fix regression",
+        in_memory_after.len(),
+        rebuilt.messages.len(),
+    );
+    // First message in both should be the compaction summary.
+    match (&in_memory_after[0], &rebuilt.messages[0]) {
+        (AgentMessage::Custom(a), AgentMessage::Custom(b)) => {
+            assert_eq!(a.role, "compaction_summary");
+            assert_eq!(b.role, "compaction_summary");
+        }
+        _ => panic!("expected both in-memory and rebuilt to start with compaction_summary"),
+    }
+}
+
+/// `build_session_context` must never inject `Custom { custom_type: "trigger" }` entries into
+/// the LLM message stream — those are audit trail only. Adding this assertion now so the RFC 1
+/// trigger work (issue #20) can rely on it as a prerequisite invariant.
+#[tokio::test]
+async fn build_session_context_skips_trigger_custom_entries() {
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage as Arc<dyn SessionStorage>);
+
+    let id_user = session.append_message(user_message("hello")).await.unwrap();
+    let _id_trigger = session
+        .append_custom(
+            "trigger",
+            Some(serde_json::json!({ "trace_id": "trace-1", "source_kind": "Hub" })),
+        )
+        .await
+        .unwrap();
+    let id_after = session
+        .append_message(user_message("after trigger"))
+        .await
+        .unwrap();
+
+    // The raw branch must include the trigger Custom entry (audit trail intact).
+    let branch = session.branch(None).await.unwrap();
+    let trigger_present = branch.iter().any(|e| {
+        matches!(
+            e,
+            SessionTreeEntry::Custom { custom_type, .. } if custom_type == "trigger"
+        )
+    });
+    assert!(
+        trigger_present,
+        "session.branch must still enumerate trigger Custom entries (audit trail)"
+    );
+    assert_eq!(branch.len(), 3);
+
+    // build_session_context must NOT translate the trigger Custom into an LLM message.
+    let ctx = build_session_context(&branch);
+    assert_eq!(
+        ctx.messages.len(),
+        2,
+        "expected only the two user Message entries in the LLM stream"
+    );
+    let ids: Vec<&str> = branch
+        .iter()
+        .filter_map(|e| match e {
+            SessionTreeEntry::Message { id, .. } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids, vec![id_user.as_str(), id_after.as_str()]);
+}
+
+/// `find_cut_point` (and `find_turn_start_index`) must always anchor `first_kept_entry_id` on
+/// a user-turn-boundary `Message` even when the cut threshold falls on or next to a trigger
+/// `Custom` entry. RFC 1 prerequisite — agent state mapping/rehydrate becomes ambiguous if
+/// `first_kept_entry_id` is allowed to reference a non-Message entry.
+#[tokio::test]
+async fn cut_point_anchors_on_user_message_even_around_trigger_custom() {
+    use pie_agent_core::find_cut_point;
+
+    // Build entries: user → assistant → Custom(trigger) → user → assistant.
+    // With keep_recent_tokens=1, the algorithm walks backward and hits the last
+    // user message; verify it does not land on the trigger Custom.
+    let user_a = SessionTreeEntry::Message {
+        id: "msg-user-a".into(),
+        parent_id: None,
+        timestamp: "t".into(),
+        message: user_message("user a"),
+    };
+    let assistant_a = SessionTreeEntry::Message {
+        id: "msg-asst-a".into(),
+        parent_id: Some("msg-user-a".into()),
+        timestamp: "t".into(),
+        message: AgentMessage::Llm(pie_ai::Message::Assistant(AssistantMessage {
+            role: AssistantRole::Assistant,
+            content: vec![ContentBlock::text("asst a")],
+            api: pie_ai::Api::from("faux"),
+            provider: pie_ai::Provider::from("faux"),
+            model: "faux".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: 0,
+        })),
+    };
+    let trigger_custom = SessionTreeEntry::Custom {
+        id: "custom-trigger-1".into(),
+        parent_id: Some("msg-asst-a".into()),
+        timestamp: "t".into(),
+        custom_type: "trigger".into(),
+        data: Some(serde_json::json!({"trace_id": "trace-1"})),
+    };
+    let user_b = SessionTreeEntry::Message {
+        id: "msg-user-b".into(),
+        parent_id: Some("custom-trigger-1".into()),
+        timestamp: "t".into(),
+        message: user_message("user b"),
+    };
+    let assistant_b = SessionTreeEntry::Message {
+        id: "msg-asst-b".into(),
+        parent_id: Some("msg-user-b".into()),
+        timestamp: "t".into(),
+        message: AgentMessage::Llm(pie_ai::Message::Assistant(AssistantMessage {
+            role: AssistantRole::Assistant,
+            content: vec![ContentBlock::text("asst b")],
+            api: pie_ai::Api::from("faux"),
+            provider: pie_ai::Provider::from("faux"),
+            model: "faux".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: 0,
+        })),
+    };
+    let entries = vec![user_a, assistant_a, trigger_custom, user_b, assistant_b];
+
+    let cut = find_cut_point(
+        &entries,
+        &CompactionSettings {
+            enabled: true,
+            reserve_tokens: 0,
+            keep_recent_tokens: 1, // tiny: forces walk-back to nearest user message
+        },
+    );
+
+    let first_kept_id = cut
+        .first_kept_entry_id
+        .as_deref()
+        .expect("non-empty entries must yield a first_kept_entry_id");
+    let kept = entries
+        .iter()
+        .find(|e| e.id() == first_kept_id)
+        .expect("first_kept_entry_id must be reachable in entries");
+    // Crucial: must be a Message (not Custom), and the message must be a user turn boundary.
+    match kept {
+        SessionTreeEntry::Message { message, .. } => {
+            assert!(
+                matches!(message, AgentMessage::Llm(pie_ai::Message::User(_))),
+                "first_kept_entry_id must land on a user-turn boundary Message"
+            );
+        }
+        other => panic!(
+            "first_kept_entry_id pointed to {:?}, expected Message",
+            other.type_str()
+        ),
+    }
 }
