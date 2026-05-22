@@ -241,9 +241,12 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
     tools.push(tools::skill_tool(skill_harness_cell.clone()));
 
     // MCP (issue #9): spawn every server configured under ~/.pie/mcp.toml or
-    // <cwd>/.pie/mcp.toml, append their tools to the registry.
+    // <cwd>/.pie/mcp.toml, append their tools to the registry. The notification hooks
+    // returned alongside the tools (RFC 1 — issue #20) are registered with the harness
+    // a few lines below, once we have an `Arc<AgentHarness>`.
     let mcp = mcp_loader::load_all(&cwd).await;
     let mcp_tool_count = mcp.tools.len();
+    let mcp_notification_hooks = mcp.notification_hooks;
     tools.extend(mcp.tools);
     let tool_names = tools
         .iter()
@@ -294,6 +297,19 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
         opts.after_tool_call = Some(lsp_supervisor::as_after_tool_call(lsp_supervisor.clone()));
     }
     let harness = std::sync::Arc::new(AgentHarness::new(opts));
+
+    // Wire each MCP server's `McpNotificationHook` into the harness now that we have an
+    // `Arc<AgentHarness>`. `register_notification_hook` spawns a driver task that runs
+    // `hook.run(sink)` and a pump task that drains the sink into `handle_trigger`; both
+    // tear down naturally when the MCP transport closes or the harness drops. Order
+    // matters for the Skill tool below: this block must precede `skill_harness_cell.set`
+    // only because the trigger pipeline is independent of skill state — flipping these
+    // around is fine; we keep them in this order so the trigger surface is live before
+    // the REPL accepts input.
+    for hook in mcp_notification_hooks {
+        harness.register_notification_hook(hook);
+    }
+
     // Resolve the Skill tool's chicken-and-egg harness reference (issue #25). The cell was
     // handed to the tool at construction time; we set it now, before the REPL accepts any
     // input. The `is_ok()` assert is a double-init guard: any future refactor that
