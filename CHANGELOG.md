@@ -125,6 +125,35 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
 - **#48** `/share` no longer passes the removed `gh gist create --secret` flag. Secret
   gists are the GitHub CLI default; `/share --public` still passes `--public`, and errors
   continue to preserve the underlying `gh` stderr.
+- **#39 (PR-A)** `NativeEnv::exec` now honors `ExecOptions::{timeout_secs, abort,
+  on_stdout, on_stderr}`. The previous implementation called `Command::output()` with a
+  `// TODO: timeout, onStdout/onStderr streaming, abort honoring.` comment, so callers
+  believing they had cancel/timeout semantics could leak runaway processes. The new
+  implementation spawns the child in its own Unix session/process group via `setsid()`
+  (so background descendants are reachable through `killpg`), drains stdout and stderr
+  concurrently on dedicated tasks (a serial drain would deadlock on a child that fills
+  stderr before closing stdout), and races `child.wait()` via `tokio::time::timeout`
+  against the abort token; on timeout / abort it `killpg(SIGKILL)`s the whole tree,
+  waits the reaper, and returns `ExecutionError { code: Timeout | Aborted, ... }`. New
+  tests cover normal completion, streaming callbacks, 1-second timeout on `sleep 10`
+  (returning well before 10s), abort-token cancellation, 4000-line stderr volume that
+  would have deadlocked the old serial drain, backgrounded descendant `(sleep N) & wait`
+  teardown, and exact stdout/stderr preservation without invented trailing newlines.
+- **#39 (PR-A)** `PermissionPolicy` no longer misses `rm` recursive+force flag
+  permutations or shell-quoted operands. The old regex caught `-rf`, `-fr`, and
+  `--recursive --force` (one ordering only); it missed `rm -r -f /`, `rm -f -r /`,
+  `rm --force --recursive /`, `rm -r --force /`, `rm --force -r /`, and any operand
+  carrying quotes like `rm -rf "/etc"`. The corpus now routes `rm` detection through a
+  token-aware classifier that splits on `;` / `&&` / `||` / `|`, walks each clause's
+  argv, sets `has_recursive` / `has_force` from any combination of short, long, and
+  separated flags, then runs each operand through a normalizer that strips one balanced
+  layer of `'`/`"` and rewrites `${HOME}` to `$HOME` before checking absolute path or
+  `~` / `$HOME` targets. Non-`rm` rules (sudo, curl|sh, dd, mkfs, chmod 777, shutdown,
+  git push --force, eval pipe, forkbomb) remain in the regex set since they don't have
+  the same permutation problem. Tests now include 25 dangerous variants (every short /
+  long / separated / mixed flag combination, leading-path `/bin/rm`, pipelined `rm`,
+  and 8 quoted/`${HOME}` operand shapes) plus 4 near-miss cases verifying the classifier
+  does not over-block (e.g. `rm -r` alone, `rm -f` alone, relative-path `rm -rf ./build`).
 - **#18** Biased select against stream stalls so Ctrl-C unblocks the in-flight prompt
   within 500ms regardless of LLM stream state.
 - **#19** `AgentHarness` compaction now sources entries from the real session jsonl
