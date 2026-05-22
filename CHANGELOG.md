@@ -122,6 +122,9 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
 
 ### Fixed
 
+- **#48** `/share` no longer passes the removed `gh gist create --secret` flag. Secret
+  gists are the GitHub CLI default; `/share --public` still passes `--public`, and errors
+  continue to preserve the underlying `gh` stderr.
 - **#18** Biased select against stream stalls so Ctrl-C unblocks the in-flight prompt
   within 500ms regardless of LLM stream state.
 - **#19** `AgentHarness` compaction now sources entries from the real session jsonl

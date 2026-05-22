@@ -804,10 +804,7 @@ impl SlashCommand for ShareCommand {
 
         let mut cmd = tokio::process::Command::new("gh");
         cmd.arg("gist").arg("create");
-        if !public {
-            // gh default is private (secret) gist already; pass it explicitly for clarity.
-            cmd.arg("--secret");
-        } else {
+        if public {
             cmd.arg("--public");
         }
         cmd.arg("--desc")

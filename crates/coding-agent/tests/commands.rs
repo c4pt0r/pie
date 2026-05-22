@@ -5,11 +5,14 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use pie_agent_core::{
     AgentHarness, AgentHarnessOptions, MemorySessionStorage, Session, SessionStorage,
     SessionTreeEntry, Skill, ThinkingLevel,
 };
+
+static PATH_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 // The binary crate doesn't expose `commands` — pull it in via path-include so this test
 // exercises the actual code path without restructuring the crate as a [lib]. `commands.rs`
@@ -244,6 +247,132 @@ async fn dispatch_quit_returns_quit_outcome() {
 }
 
 #[tokio::test]
+async fn dispatch_share_default_uses_gh_private_default_without_secret_flag() {
+    let _guard = PATH_ENV_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let argv_log = temp.path().join("argv.txt");
+    write_fake_gh(
+        temp.path(),
+        &format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" > '{}'
+printf '%s\n' 'https://gist.github.com/example/private'
+"#,
+            argv_log.display()
+        ),
+    );
+    let _path_guard = prepend_path(temp.path());
+
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage as Arc<dyn SessionStorage>);
+    let opts = AgentHarnessOptions::new(faux_model(), session);
+    let harness = Arc::new(AgentHarness::new(opts));
+
+    let registry = commands::Registry::with_builtins();
+    let cwd = std::env::current_dir().unwrap();
+    let ctx = commands::CommandCtx {
+        harness: &harness,
+        session_id: "test-share-default",
+        log_path: None,
+        tool_count: 0,
+        cwd: &cwd,
+    };
+
+    let outcome = commands::dispatch("/share", &registry, &ctx).await;
+    assert!(matches!(outcome, commands::CommandOutcome::Handled));
+    let argv = std::fs::read_to_string(argv_log).unwrap();
+    assert!(argv.contains("gist create"), "argv: {argv}");
+    assert!(
+        !argv.contains("--secret"),
+        "argv must not include removed gh flag: {argv}"
+    );
+    assert!(
+        !argv.contains("--public"),
+        "default share should remain private: {argv}"
+    );
+}
+
+#[tokio::test]
+async fn dispatch_share_public_passes_public_flag() {
+    let _guard = PATH_ENV_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let argv_log = temp.path().join("argv.txt");
+    write_fake_gh(
+        temp.path(),
+        &format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" > '{}'
+printf '%s\n' 'https://gist.github.com/example/public'
+"#,
+            argv_log.display()
+        ),
+    );
+    let _path_guard = prepend_path(temp.path());
+
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage as Arc<dyn SessionStorage>);
+    let opts = AgentHarnessOptions::new(faux_model(), session);
+    let harness = Arc::new(AgentHarness::new(opts));
+
+    let registry = commands::Registry::with_builtins();
+    let cwd = std::env::current_dir().unwrap();
+    let ctx = commands::CommandCtx {
+        harness: &harness,
+        session_id: "test-share-public",
+        log_path: None,
+        tool_count: 0,
+        cwd: &cwd,
+    };
+
+    let outcome = commands::dispatch("/share --public", &registry, &ctx).await;
+    assert!(matches!(outcome, commands::CommandOutcome::Handled));
+    let argv = std::fs::read_to_string(argv_log).unwrap();
+    assert!(argv.contains("--public"), "argv: {argv}");
+    assert!(
+        !argv.contains("--secret"),
+        "argv must not include removed gh flag: {argv}"
+    );
+}
+
+#[tokio::test]
+async fn dispatch_share_preserves_gh_stderr_on_failure() {
+    let _guard = PATH_ENV_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    write_fake_gh(
+        temp.path(),
+        r#"#!/bin/sh
+printf '%s\n' 'unknown flag: --secret' >&2
+exit 1
+"#,
+    );
+    let _path_guard = prepend_path(temp.path());
+
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage as Arc<dyn SessionStorage>);
+    let opts = AgentHarnessOptions::new(faux_model(), session);
+    let harness = Arc::new(AgentHarness::new(opts));
+
+    let registry = commands::Registry::with_builtins();
+    let cwd = std::env::current_dir().unwrap();
+    let ctx = commands::CommandCtx {
+        harness: &harness,
+        session_id: "test-share-failure",
+        log_path: None,
+        tool_count: 0,
+        cwd: &cwd,
+    };
+
+    let outcome = commands::dispatch("/share", &registry, &ctx).await;
+    match outcome {
+        commands::CommandOutcome::Error(message) => {
+            assert!(message.contains("gh gist create exited 1"), "{message}");
+            assert!(message.contains("unknown flag: --secret"), "{message}");
+        }
+        other => panic!("expected Error outcome, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn dispatch_skill_attaches_loaded_skill_without_exposing_body() {
     let storage = Arc::new(MemorySessionStorage::new());
     let session = Session::new(storage as Arc<dyn SessionStorage>);
@@ -339,3 +468,39 @@ async fn dispatch_skill_unknown_name_suggests_prefix_matches() {
 // that only the binary calls.
 #[allow(dead_code)]
 fn _path_check(_p: &Path) {}
+
+fn write_fake_gh(dir: &Path, body: &str) {
+    let path = dir.join("gh");
+    std::fs::write(&path, body).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).unwrap();
+    }
+}
+
+struct PathGuard {
+    original: Option<std::ffi::OsString>,
+}
+
+impl Drop for PathGuard {
+    fn drop(&mut self) {
+        match self.original.take() {
+            Some(value) => unsafe { std::env::set_var("PATH", value) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+    }
+}
+
+fn prepend_path(dir: &Path) -> PathGuard {
+    let original = std::env::var_os("PATH");
+    let mut paths = vec![dir.to_path_buf()];
+    if let Some(value) = original.as_ref() {
+        paths.extend(std::env::split_paths(value));
+    }
+    let joined = std::env::join_paths(paths).unwrap();
+    unsafe { std::env::set_var("PATH", joined) };
+    PathGuard { original }
+}
