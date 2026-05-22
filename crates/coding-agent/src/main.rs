@@ -32,6 +32,7 @@ mod skills;
 mod spinner;
 mod templates;
 mod tools;
+mod triggers;
 mod tui;
 
 use std::io::Write as _;
