@@ -50,10 +50,11 @@ hex = "0.4"
 directories = "5"
 
 [target.'cfg(unix)'.dependencies]
-# Unix-only: process-group teardown for shell hooks (`setsid` + `killpg`). Direct SIGKILL
-# on the `sh` PID leaks descendants like `(background) & wait`; running the child in its
-# own process group lets us KILL the whole tree on timeout/cancel. Same pattern as
-# `NativeEnv::exec` (PR #40) and the bash tool (PR #41).
+# Unix-only: process-group teardown (`setsid` + `killpg`) for `bash` tool and shell
+# hooks. Direct SIGKILL on the shell PID leaks descendants like `(sleep 60) & wait`;
+# running the child in its own process group lets us KILL the whole tree on
+# timeout/cancel. Same pattern as `NativeEnv::exec` (PR #40), the bash tool (PR #41),
+# and shell hooks (PR #58).
 libc = "0.2"
 
 [dev-dependencies]

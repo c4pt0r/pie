@@ -8,10 +8,13 @@
 //! 1. **stdout and stderr drain concurrently**, not sequentially. Sequential drain
 //!    deadlocks when the child writes enough to fill the stderr pipe while the tool is
 //!    blocked on stdout (or vice versa).
-//! 2. **Timeout and cancellation kill the child**. The previous implementation flagged
-//!    `[timed out]` / `[aborted]` in the synthetic output but left `sh` running in the
-//!    background — long-running, destructive, or runaway commands could keep executing
-//!    after the agent thought they were done.
+//! 2. **Timeout and cancellation kill the entire process tree, not just the direct
+//!    child**. The previous implementation flagged `[timed out]` / `[aborted]` in the
+//!    synthetic output but left `sh` running in the background — long-running,
+//!    destructive, or runaway commands could keep executing after the agent thought they
+//!    were done. We now place the child in its own process group on Unix via `setsid`
+//!    so a `killpg(pgid, SIGKILL)` reaches background jobs and detached descendants like
+//!    `(sleep 60) & wait`. Same pattern as `NativeEnv::exec` in `crates/agent` (PR #40).
 //! 3. **`kill_on_drop(true)` is the belt-and-braces backstop**. If any branch returns early
 //!    without an explicit `child.kill().await`, the destructor still reaps the child.
 
@@ -136,9 +139,32 @@ async fn run_with_kill_on_timeout_or_cancel(
         // Defense in depth: any early-return path between here and the explicit kill
         // branches below still destroys the child instead of leaving an orphan.
         .kill_on_drop(true);
+
+    #[cfg(unix)]
+    {
+        // SAFETY: this closure runs in the child between fork and exec on Unix. `setsid`
+        // is async-signal-safe per POSIX and has no Rust state to invalidate. The child
+        // becomes session and process-group leader; SIGKILL to `-pgid` then targets the
+        // whole tree we just spawned, so background jobs like `(sleep 60) & wait` die
+        // with their parent shell on timeout / cancel. `tokio::process::Command` exposes
+        // `pre_exec` as an inherent method (delegating to `std::os::unix::process::
+        // CommandExt`), so no trait import is needed here.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
     let mut child = cmd
         .spawn()
         .map_err(|e| AgentToolError::from(format!("spawn: {e}")))?;
+    // Snapshot the pid before any wait/select touches `child` so the kill path can target
+    // the process group even if tokio later loses the handle.
+    let child_pid = child.id();
 
     // Drain stdout and stderr concurrently on a background task. The task ends naturally
     // when the child closes both pipes (i.e. when it exits — whether voluntarily or from
@@ -206,11 +232,15 @@ async fn run_with_kill_on_timeout_or_cancel(
         exit_code = code;
     }
 
-    // If we exited via timeout/cancel, the child is still alive — kill it now and reap.
-    // `kill_on_drop` is the final fallback if even this reap times out.
+    // If we exited via timeout/cancel, the child (and any descendants it spawned) are
+    // still alive — tear down the whole process group now. On Unix the child sits at the
+    // head of its own group thanks to the `setsid` we ran in `pre_exec`, so a single
+    // `killpg(pgid, SIGKILL)` reaches background jobs and detached descendants. On
+    // non-Unix targets we fall back to `start_kill` (which only kills the direct child;
+    // proper Windows job-object support is a separate port story). `kill_on_drop` and
+    // the post-reap `wait` are the final fallbacks.
     if !matches!(kill_reason, KillReason::Finished) {
-        let _ = child.start_kill();
-        let _ = timeout(Duration::from_secs(2), child.wait()).await;
+        terminate_child_tree(&mut child, child_pid).await;
     }
 
     // The drain task should be done — pipes close when the child exits. Cap with a short
@@ -239,6 +269,29 @@ enum KillReason {
     Finished,
     TimedOut { secs: u64 },
     Cancelled,
+}
+
+/// Best-effort teardown of the child *and any descendants it spawned*. On Unix the child
+/// was placed in its own session/process group via `setsid()`, so a single
+/// `killpg(pid, SIGKILL)` reaches background jobs and detached children. On non-Unix
+/// targets we fall back to the direct `start_kill` path. The final `wait` reaps the
+/// zombie; both the kill and the wait are capped by the caller's surrounding 2-second
+/// drain window via `kill_on_drop`.
+async fn terminate_child_tree(child: &mut tokio::process::Child, pid: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        // SAFETY: `killpg` with SIGKILL on a known pgid is sound; the pid was just
+        // observed from `child.id()`. A zero / `ESRCH` return (child already gone) is
+        // benign and we don't assert on it.
+        unsafe {
+            libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+        }
+    }
+    // Cross-platform reaper request — on Unix this is redundant after killpg, but it
+    // marks the handle terminated on the tokio side; on non-Unix it's the only kill.
+    let _ = child.start_kill();
+    let _ = timeout(Duration::from_secs(2), child.wait()).await;
+    let _ = pid;
 }
 
 use once_cell::sync::Lazy;
@@ -314,6 +367,62 @@ mod tests {
             assert!(
                 buf.trim().is_empty(),
                 "found surviving `sleep 60` process(es) after timeout: pids={buf}"
+            );
+        }
+    }
+
+    /// Timeout must kill not just the direct `sh -c` child but any descendants the shell
+    /// spawned (background jobs, detached processes). The previous implementation killed
+    /// only the direct child, so `(sleep 60) & wait` left `sleep 60` running after the
+    /// tool returned. We solve it the same way `NativeEnv::exec` does (PR #40): run the
+    /// child in its own process group via `setsid` and `killpg` the whole group on
+    /// timeout. Unix-only because `setsid` / `killpg` are Unix primitives.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_kills_descendant_processes() {
+        let tool = BashTool;
+        // The pattern `(cmd) & wait` is the canonical shell-detached-child case: the
+        // background job inherits the shell's process group, so killing only the shell
+        // would leave the `sleep` running. Use a marker arg unique to this test so the
+        // `pgrep` check doesn't false-positive against other tests' sleeps.
+        let marker = "bash-tool-desc-kill-marker-7f3a9c";
+        let cmd = format!("(sleep 60 && echo {marker}) & wait");
+        let started = Instant::now();
+        let _result = tool
+            .execute(
+                "tdesc",
+                json!({ "command": cmd, "timeout": 1 }),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("bash tool execute should not error on timeout");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed.as_secs() < 5,
+            "timeout path took {elapsed:?}; descendant kill did not happen in time"
+        );
+
+        // Give the OS a beat to actually reap the descendant tree.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // No process should match the marker after teardown. We grep for the literal
+        // command string the shell would have launched.
+        let pgrep = tokio::process::Command::new("pgrep")
+            .arg("-f")
+            .arg(marker)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn();
+        if let Ok(mut child) = pgrep {
+            let mut buf = String::new();
+            if let Some(mut s) = child.stdout.take() {
+                let _ = s.read_to_string(&mut buf).await;
+            }
+            let _ = child.wait().await;
+            assert!(
+                buf.trim().is_empty(),
+                "found surviving descendant process(es) matching {marker:?}: pids={buf}"
             );
         }
     }
