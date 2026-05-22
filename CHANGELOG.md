@@ -12,7 +12,7 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
 - **#3** Slash-command registry with 21 builtins: `/help`, `/clear`, `/skills`, `/skill`,
   `/quit` (+ `/exit`, `/q`), `/model`, `/thinking`, `/cost`, `/diag`, `/template`,
   `/save`, `/compact`, `/undo`, `/bug-report`, `/name`, `/sessions`, `/share`, `/login`,
-  `/logout`, `/find`.
+  `/logout`, `/find`, `/history`.
 - **#25 PR B** `/skill <name>` attaches an already-loaded skill to the next prompt, and
   `/skills` now shows source and `disable_model_invocation` status without printing skill bodies.
 - **#4** Dangerous-bash detector wired through `before_tool_call`. 11-pattern corpus

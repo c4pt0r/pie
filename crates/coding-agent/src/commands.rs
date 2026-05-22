@@ -1067,4 +1067,16 @@ mod tests {
         assert!(r.find("exit").is_some());
         assert!(r.find("nope").is_none());
     }
+
+    #[test]
+    fn attach_skill_prompt_wraps_prompt_without_skill_body() {
+        let wrapped = attach_skill_prompt("review this change", Some("review-pr"));
+
+        assert!(wrapped.contains("Skill tool"));
+        assert!(wrapped.contains("review-pr"));
+        assert!(wrapped.contains("review this change"));
+        assert!(!wrapped.contains("SECRET SKILL BODY"));
+
+        assert_eq!(attach_skill_prompt("plain", None), "plain");
+    }
 }
