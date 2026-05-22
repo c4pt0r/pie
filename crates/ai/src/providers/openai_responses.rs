@@ -130,15 +130,14 @@ async fn run(
     options: StreamOptions,
     mut sender: AssistantMessageEventSender,
 ) {
-    let api_key = match options
-        .api_key
-        .clone()
-        .or_else(|| crate::env_api_keys::get_env_api_key(&model.provider.0))
-        .or_else(|| crate::env_api_keys::get_env_api_key("openai"))
-    {
+    let api_key = match resolve_openai_compatible_api_key(&model, &options) {
         Some(k) => k,
         None => {
-            push_error(&mut sender, &model, "OPENAI_API_KEY is not set".into());
+            push_error(
+                &mut sender,
+                &model,
+                missing_openai_compatible_api_key_message(&model),
+            );
             return;
         }
     };
@@ -710,6 +709,36 @@ pub(crate) fn build_responses_url(base: &str) -> String {
         format!("{trimmed}/responses")
     } else {
         format!("{trimmed}/v1/responses")
+    }
+}
+
+fn resolve_openai_compatible_api_key(model: &Model, options: &StreamOptions) -> Option<String> {
+    options
+        .api_key
+        .clone()
+        .or_else(|| crate::env_api_keys::get_env_api_key(&model.provider.0))
+        .or_else(|| {
+            if model.provider.0 == "openai" {
+                crate::env_api_keys::get_env_api_key("openai")
+            } else {
+                None
+            }
+        })
+}
+
+fn missing_openai_compatible_api_key_message(model: &Model) -> String {
+    let vars = crate::env_api_keys::env_var_names(&model.provider.0);
+    if vars.is_empty() {
+        format!(
+            "no API key for provider: {}; pass options.api_key or configure a provider-specific credential",
+            model.provider.0
+        )
+    } else {
+        format!(
+            "no API key for provider: {}; set {} or pass options.api_key",
+            model.provider.0,
+            vars.join(" or ")
+        )
     }
 }
 

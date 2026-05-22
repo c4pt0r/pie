@@ -219,11 +219,12 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
     let logging = logging::init(&session_id);
 
     // Build the harness.
+    let stream_fn = stream_fn_with_auth_store();
     let memory_dir = config::memory_dir();
     let mut tools = tools::default_tools(memory_dir.clone());
     // Task delegation tool (issue #11). Shares the parent's model + stream backend so its
     // subagents go through the same provider.
-    tools.push(tools::task_tool(model.clone(), None));
+    tools.push(tools::task_tool(model.clone(), Some(stream_fn.clone())));
     // Skill tool (issue #25). Needs to reach the live `AgentHarness::skills()` snapshot, but
     // the harness does not exist yet — we are still assembling the tool list that will be
     // passed to `AgentHarness::new`. Use a `OnceCell` that we'll fill immediately after the
@@ -275,6 +276,7 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
     opts.tools = tools;
     opts.skills = combined_skills.clone();
     opts.prompt_templates = loaded_templates.templates.clone();
+    opts.stream_fn = Some(stream_fn.clone());
     opts.before_tool_call =
         Some(PermissionPolicy::default_for_coding_agent().as_before_tool_call());
     // LSP feedback loop (issue #12): attach diagnostics to write/edit tool results when
@@ -657,6 +659,41 @@ Prefer running a tool over guessing. When making file changes, read the file fir
     )
 }
 
+fn stream_fn_with_auth_store() -> pie_agent_core::StreamFn {
+    std::sync::Arc::new(|model, context, options| {
+        let merged = apply_auth_to_simple_options(model, options, |provider| {
+            crate::auth::AuthStore::load()
+                .ok()
+                .and_then(|store| store.resolve_for_provider(provider))
+        });
+        pie_ai::stream_simple(model, context, Some(&merged))
+    })
+}
+
+fn apply_auth_to_simple_options<F>(
+    model: &pie_ai::Model,
+    options: Option<&pie_ai::SimpleStreamOptions>,
+    resolve_api_key: F,
+) -> pie_ai::SimpleStreamOptions
+where
+    F: FnOnce(&str) -> Option<String>,
+{
+    let mut merged = options.cloned().unwrap_or_default();
+    let needs_api_key = merged
+        .base
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .map(str::is_empty)
+        .unwrap_or(true);
+    if needs_api_key {
+        if let Some(api_key) = resolve_api_key(&model.provider.0).filter(|k| !k.trim().is_empty()) {
+            merged.base.api_key = Some(api_key);
+        }
+    }
+    merged
+}
+
 fn replay_transcript(ctx: &SessionContext, tui: &tui::Tui) {
     if ctx.messages.is_empty() {
         return;
@@ -695,4 +732,52 @@ async fn read_builtin_skills_config(base_dir: &std::path::Path) -> Vec<String> {
         return Vec::new();
     };
     builtin_skills::parse_builtin_skills_config(&text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn model(provider: &str) -> pie_ai::Model {
+        pie_ai::Model {
+            id: "deepseek-v4-flash".into(),
+            name: "DeepSeek V4 Flash".into(),
+            api: pie_ai::Api::from("openai-responses"),
+            provider: pie_ai::Provider::from(provider),
+            base_url: "http://127.0.0.1:8000/v1".into(),
+            reasoning: true,
+            thinking_level_map: None,
+            input: vec![pie_ai::InputModality::Text],
+            cost: pie_ai::ModelCost::default(),
+            context_window: 100_000,
+            max_tokens: 384_000,
+            headers: None,
+            compat: None,
+        }
+    }
+
+    #[test]
+    fn auth_wrapper_injects_provider_scoped_stored_key() {
+        let opts = apply_auth_to_simple_options(&model("ds4"), None, |provider| {
+            assert_eq!(provider, "ds4");
+            Some("stored-ds4-key".into())
+        });
+        assert_eq!(opts.base.api_key.as_deref(), Some("stored-ds4-key"));
+    }
+
+    #[test]
+    fn auth_wrapper_keeps_explicit_api_key() {
+        let mut existing = pie_ai::SimpleStreamOptions::default();
+        existing.base.api_key = Some("explicit-key".into());
+        let opts = apply_auth_to_simple_options(&model("ds4"), Some(&existing), |_| {
+            Some("stored-ds4-key".into())
+        });
+        assert_eq!(opts.base.api_key.as_deref(), Some("explicit-key"));
+    }
+
+    #[test]
+    fn auth_wrapper_fails_closed_without_provider_scoped_key() {
+        let opts = apply_auth_to_simple_options(&model("ds4"), None, |_| None);
+        assert_eq!(opts.base.api_key, None);
+    }
 }

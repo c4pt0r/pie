@@ -67,9 +67,45 @@ mod tests {
         AssistantMessageEvent, Context as AiContext, DoneReason, Message, Tool, UserContent,
         UserMessage, UserRole,
     };
+    use std::sync::OnceLock;
     use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use tokio::sync::{Mutex as TokioMutex, oneshot};
+
+    fn env_lock() -> &'static TokioMutex<()> {
+        static LOCK: OnceLock<TokioMutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| TokioMutex::new(()))
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        old: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let old = std::env::var(key).ok();
+            unsafe { std::env::set_var(key, value) };
+            Self { key, old }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let old = std::env::var(key).ok();
+            unsafe { std::env::remove_var(key) };
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(old) = &self.old {
+                unsafe { std::env::set_var(self.key, old) };
+            } else {
+                unsafe { std::env::remove_var(self.key) };
+            }
+        }
+    }
 
     fn model_json(provider: &str, id: &str, api: &str, base_url: &str) -> String {
         format!(
@@ -302,6 +338,88 @@ data: {"type":"response.completed","response":{"id":"resp_test","status":"comple
         pie_ai::unregister_custom_model(&pie_ai::Provider::from(provider), id);
     }
 
+    #[tokio::test]
+    async fn ds4_responses_model_uses_ds4_env_not_openai_env() {
+        let _lock = env_lock().lock().await;
+        let _openai = EnvGuard::set("OPENAI_API_KEY", "real-openai-should-not-leak");
+        let _ds4 = EnvGuard::set("DS4_API_KEY", "dsv4-local");
+
+        let body = r#"data: {"type":"response.created","response":{"id":"resp_test","model":"model","output":[]}}
+
+data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_test","type":"message","status":"in_progress","role":"assistant","content":[]}}
+
+data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"OK"}
+
+data: {"type":"response.completed","response":{"id":"resp_test","status":"completed","model":"model","output":[{"id":"msg_test","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"OK","annotations":[]}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}
+
+"#;
+        let (base_url, request_rx) = serve_once_capture_request(body).await;
+        let provider = "ds4";
+        let id = "deepseek-v4-flash";
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("models.json");
+        std::fs::write(
+            &path,
+            model_json(provider, id, "openai-responses", &base_url),
+        )
+        .unwrap();
+        load_all_from_paths(&[path]).unwrap();
+
+        let model = pie_ai::get_model(&pie_ai::Provider::from(provider), id).unwrap();
+        let mut stream = pie_ai::stream(&model, &context(None), None);
+        while let Some(event) = stream.next().await {
+            match event {
+                AssistantMessageEvent::Done { .. } => break,
+                AssistantMessageEvent::Error { error, .. } => {
+                    panic!("provider error: {:?}", error.error_message);
+                }
+                _ => {}
+            }
+        }
+        let request = request_rx.await.unwrap();
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer dsv4-local"),
+            "{request}"
+        );
+        assert!(!request.contains("real-openai-should-not-leak"));
+        pie_ai::unregister_custom_model(&pie_ai::Provider::from(provider), id);
+    }
+
+    #[tokio::test]
+    async fn ds4_responses_model_fails_closed_without_ds4_env_even_when_openai_env_exists() {
+        let _lock = env_lock().lock().await;
+        let _openai = EnvGuard::set("OPENAI_API_KEY", "real-openai-should-not-leak");
+        let _ds4 = EnvGuard::remove("DS4_API_KEY");
+
+        let provider = "ds4";
+        let id = "deepseek-v4-flash-missing-key";
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("models.json");
+        std::fs::write(
+            &path,
+            model_json(provider, id, "openai-responses", "http://127.0.0.1:9/v1"),
+        )
+        .unwrap();
+        load_all_from_paths(&[path]).unwrap();
+
+        let model = pie_ai::get_model(&pie_ai::Provider::from(provider), id).unwrap();
+        let mut stream = pie_ai::stream(&model, &context(None), None);
+        let mut error = None;
+        while let Some(event) = stream.next().await {
+            if let AssistantMessageEvent::Error { error: e, .. } = event {
+                error = e.error_message;
+                break;
+            }
+        }
+        let error = error.expect("expected provider error");
+        assert!(error.contains("DS4_API_KEY"), "{error}");
+        assert!(!error.contains("real-openai-should-not-leak"));
+        assert!(!error.contains("HTTP"), "{error}");
+        pie_ai::unregister_custom_model(&pie_ai::Provider::from(provider), id);
+    }
+
     fn context(tools: Option<Vec<Tool>>) -> AiContext {
         AiContext {
             system_prompt: Some("You are terse.".into()),
@@ -327,5 +445,23 @@ data: {"type":"response.completed","response":{"id":"resp_test","status":"comple
             socket.write_all(response.as_bytes()).await.unwrap();
         });
         format!("http://{addr}/v1")
+    }
+
+    async fn serve_once_capture_request(body: &'static str) -> (String, oneshot::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0; 8192];
+            let n = socket.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            let _ = tx.send(request);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{body}"
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        (format!("http://{addr}/v1"), rx)
     }
 }

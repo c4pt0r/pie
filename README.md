@@ -89,8 +89,9 @@ export DS4_API_KEY=dsv4-local
 ./target/release/pie --provider ds4 --model deepseek-v4-flash
 ```
 
-DS4 is local and accepts placeholder bearer tokens; using `DS4_API_KEY` keeps local model
-credentials separate from real `OPENAI_API_KEY` credentials.
+DS4 is local and accepts placeholder bearer tokens. You can also store the same
+local placeholder with `/login ds4 dsv4-local`. Using the `ds4` provider keeps
+local model credentials separate from real `OPENAI_API_KEY` credentials.
 
 ## Quick start
 
