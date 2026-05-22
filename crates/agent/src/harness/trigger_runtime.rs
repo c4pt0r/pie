@@ -12,9 +12,9 @@
 //!   window's collapse semantics).
 //! - **Cycle suppression**: when the same `trace_id` exceeds
 //!   [`TriggerRuntimeConfig::cycle_hop_limit`] (default 5) → forced
-//!   [`CycleOutcome::Suppress`]. Each accepted trigger bumps the per-trace hop counter; the
-//!   runtime calls [`TriggerRuntime::record_follow_up_hop`] before spawning sub-triggers
-//!   that share the parent's trace.
+//!   [`EvaluationOutcome::CycleSuppressed`]. Each accepted trigger bumps the per-trace hop
+//!   counter; the runtime calls [`TriggerRuntime::record_follow_up_hop`] before spawning
+//!   sub-triggers that share the parent's trace.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -32,7 +32,7 @@ pub struct TriggerRuntimeConfig {
     /// duplicate. RFC 1 §5 default: 5 minutes. Capped at 24h to bound memory.
     pub dedup_window: Duration,
     /// Maximum `trace_id` chain depth before the runtime forces
-    /// [`CycleOutcome::Suppress`]. RFC 1 §5 default: 5.
+    /// [`EvaluationOutcome::CycleSuppressed`]. RFC 1 §5 default: 5.
     pub cycle_hop_limit: u32,
 }
 

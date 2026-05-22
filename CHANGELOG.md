@@ -102,11 +102,12 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
   `LatestReplaces` / `Coalesce` / `Drop` uniformly), or `CycleSuppressed { hop_count }`.
   Harness-spawned follow-up triggers bump the same trace chain via
   `record_follow_up_hop(trace_id, now)` so the cycle counter is monotonic across the
-  whole reaction graph. Dedup keys derive from `(source_kind, source_id, dedup_key)`
-  when set, falling back to a deterministic content hash otherwise. **Pure logic — no
-  I/O, no session writes, no harness wiring yet**; the `AgentHarness::handle_trigger`
-  entrypoint that consumes this evaluator and persists the audit `Custom` entry lands
-  in sub-PR 2.
+  whole reaction graph. Dedup keys are the `Trigger.idempotency_key` field set by the
+  source adapter (per RFC 1 §3 the source is responsible for synthesizing a stable
+  key); the evaluator treats the field as opaque and does not synthesize one itself.
+  **Pure logic — no I/O, no session writes, no harness wiring yet**; the
+  `AgentHarness::handle_trigger` entrypoint that consumes this evaluator and persists
+  the audit `Custom` entry lands in sub-PR 2.
 
 ### Fixed
 
