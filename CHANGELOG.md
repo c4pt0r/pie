@@ -129,6 +129,11 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
   `ToolCall.arguments` object before `ToolCallEnd` / `Done`. Previously tool calls streamed
   their name and id correctly but ended with empty `{}` arguments, so downstream tools could
   be invoked without the model-provided parameters.
+- `get_api_provider()` handles now capture the provider `Arc` at lookup time, so
+  `unregister_api_providers()` / `clear_api_providers()` cannot make a previously returned
+  `RegisteredHandle` panic with `provider removed while handle was held`. In-flight handles
+  keep the TypeScript registry semantics: unregistering prevents future lookup while already
+  captured handles continue to stream or return the normal mismatch error stream.
 - **#48** `/share` no longer passes the removed `gh gist create --secret` flag. Secret
   gists are the GitHub CLI default; `/share --public` still passes `--public`, and errors
   continue to preserve the underlying `gh` stderr.

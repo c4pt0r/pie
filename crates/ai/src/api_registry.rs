@@ -5,7 +5,7 @@
 //! error stream (not a panic) — matching the TS `wrapStream` wrapper.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 
@@ -40,7 +40,7 @@ pub trait ApiProvider: Send + Sync {
 }
 
 struct RegisteredProvider {
-    provider: Box<dyn ApiProvider>,
+    provider: Arc<dyn ApiProvider>,
     source_id: Option<String>,
 }
 
@@ -59,8 +59,10 @@ fn registry() -> &'static Mutex<Registry> {
 
 pub fn register_api_provider(provider: Box<dyn ApiProvider>, source_id: Option<String>) {
     let mut reg = registry().lock().expect("registry poisoned");
+    let api = provider.api().to_string();
+    let provider: Arc<dyn ApiProvider> = Arc::from(provider);
     reg.entries.insert(
-        provider.api().to_string(),
+        api,
         RegisteredProvider {
             provider,
             source_id,
@@ -74,11 +76,10 @@ pub fn register_api_provider(provider: Box<dyn ApiProvider>, source_id: Option<S
 /// the Rust equivalent of TS returning the function reference directly.
 pub fn get_api_provider(api: &Api) -> Option<RegisteredHandle> {
     let reg = registry().lock().expect("registry poisoned");
-    if reg.entries.contains_key(&api.0) {
-        Some(RegisteredHandle { api: api.0.clone() })
-    } else {
-        None
-    }
+    let entry = reg.entries.get(&api.0)?;
+    Some(RegisteredHandle {
+        provider: entry.provider.clone(),
+    })
 }
 
 pub fn unregister_api_providers(source_id: &str) {
@@ -99,12 +100,11 @@ pub fn list_api_ids() -> Vec<String> {
     reg.entries.keys().cloned().collect()
 }
 
-/// Handle returned by [`get_api_provider`]. Operations re-acquire the registry lock; this
-/// matches the TS semantics where unregister-while-streaming is allowed (the in-flight stream
-/// keeps working off the captured function reference). Here we keep it simple: each call must
-/// re-resolve, panicking only if the provider has been removed between resolve and call.
+/// Handle returned by [`get_api_provider`]. The handle captures the provider `Arc`, matching
+/// TS semantics where unregister-while-streaming is allowed because the in-flight call keeps
+/// working off the captured function reference.
 pub struct RegisteredHandle {
-    api: String,
+    provider: Arc<dyn ApiProvider>,
 }
 
 impl RegisteredHandle {
@@ -114,20 +114,15 @@ impl RegisteredHandle {
         context: &Context,
         options: Option<&StreamOptions>,
     ) -> AssistantMessageEventStream {
-        let reg = registry().lock().expect("registry poisoned");
-        let entry = reg
-            .entries
-            .get(&self.api)
-            .expect("provider removed while handle was held");
         // Mismatch guard: same as TS `wrapStream`.
-        if model.api.0 != entry.provider.api() {
+        if model.api.0 != self.provider.api() {
             return error_stream(format!(
                 "Mismatched api: {} expected {}",
                 model.api.0,
-                entry.provider.api()
+                self.provider.api()
             ));
         }
-        entry.provider.stream(model, context, options)
+        self.provider.stream(model, context, options)
     }
 
     pub fn stream_simple(
@@ -136,19 +131,14 @@ impl RegisteredHandle {
         context: &Context,
         options: Option<&SimpleStreamOptions>,
     ) -> AssistantMessageEventStream {
-        let reg = registry().lock().expect("registry poisoned");
-        let entry = reg
-            .entries
-            .get(&self.api)
-            .expect("provider removed while handle was held");
-        if model.api.0 != entry.provider.api() {
+        if model.api.0 != self.provider.api() {
             return error_stream(format!(
                 "Mismatched api: {} expected {}",
                 model.api.0,
-                entry.provider.api()
+                self.provider.api()
             ));
         }
-        entry.provider.stream_simple(model, context, options)
+        self.provider.stream_simple(model, context, options)
     }
 }
 
@@ -176,4 +166,161 @@ pub(crate) fn error_stream(message: String) -> AssistantMessageEventStream {
         error: err,
     });
     stream
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{
+        AssistantMessage, AssistantMessageEvent, AssistantRole, Context, ErrorReason, Model,
+        ModelCost, Provider, SimpleStreamOptions, StopReason, StreamOptions, Usage,
+    };
+    use futures::StreamExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct CountingProvider {
+        stream_calls: AtomicUsize,
+        simple_calls: AtomicUsize,
+    }
+
+    impl CountingProvider {
+        fn event_stream(&self, label: &str) -> AssistantMessageEventStream {
+            let (stream, mut sender) = AssistantMessageEventStream::new();
+            let message = AssistantMessage {
+                role: AssistantRole::Assistant,
+                content: vec![],
+                api: Api::from("race-api"),
+                provider: Provider::from("race"),
+                model: label.to_string(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                timestamp: 0,
+            };
+            sender.push(AssistantMessageEvent::Done {
+                reason: crate::types::DoneReason::Stop,
+                message,
+            });
+            stream
+        }
+    }
+
+    #[async_trait]
+    impl ApiProvider for CountingProvider {
+        fn api(&self) -> &str {
+            "race-api"
+        }
+
+        fn stream(
+            &self,
+            _model: &Model,
+            _context: &Context,
+            _options: Option<&StreamOptions>,
+        ) -> AssistantMessageEventStream {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            self.event_stream("stream")
+        }
+
+        fn stream_simple(
+            &self,
+            _model: &Model,
+            _context: &Context,
+            _options: Option<&SimpleStreamOptions>,
+        ) -> AssistantMessageEventStream {
+            self.simple_calls.fetch_add(1, Ordering::SeqCst);
+            self.event_stream("simple")
+        }
+    }
+
+    fn race_model(api: &str) -> Model {
+        Model {
+            id: "race-model".into(),
+            name: "Race Model".into(),
+            api: Api::from(api),
+            provider: Provider::from("race"),
+            base_url: String::new(),
+            reasoning: false,
+            thinking_level_map: None,
+            input: vec![],
+            cost: ModelCost::default(),
+            context_window: 1,
+            max_tokens: 1,
+            headers: None,
+            compat: None,
+        }
+    }
+
+    fn empty_context() -> Context {
+        Context {
+            system_prompt: None,
+            messages: vec![],
+            tools: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_survives_unregister_after_lookup() {
+        clear_api_providers();
+        register_api_provider(
+            Box::new(CountingProvider::default()),
+            Some("race-source".into()),
+        );
+        let handle = get_api_provider(&Api::from("race-api")).expect("provider handle");
+
+        unregister_api_providers("race-source");
+        assert!(get_api_provider(&Api::from("race-api")).is_none());
+
+        let mut stream = handle.stream(&race_model("race-api"), &empty_context(), None);
+        let mut done_model = None;
+        while let Some(event) = stream.next().await {
+            if let AssistantMessageEvent::Done { message, .. } = event {
+                done_model = Some(message.model);
+            }
+        }
+        assert_eq!(done_model.as_deref(), Some("stream"));
+    }
+
+    #[tokio::test]
+    async fn handle_survives_clear_after_lookup_for_simple_stream() {
+        clear_api_providers();
+        register_api_provider(Box::new(CountingProvider::default()), None);
+        let handle = get_api_provider(&Api::from("race-api")).expect("provider handle");
+
+        clear_api_providers();
+        assert!(get_api_provider(&Api::from("race-api")).is_none());
+
+        let mut stream = handle.stream_simple(&race_model("race-api"), &empty_context(), None);
+        let mut done_model = None;
+        while let Some(event) = stream.next().await {
+            if let AssistantMessageEvent::Done { message, .. } = event {
+                done_model = Some(message.model);
+            }
+        }
+        assert_eq!(done_model.as_deref(), Some("simple"));
+    }
+
+    #[tokio::test]
+    async fn captured_handle_still_returns_mismatch_error_stream() {
+        clear_api_providers();
+        register_api_provider(Box::new(CountingProvider::default()), None);
+        let handle = get_api_provider(&Api::from("race-api")).expect("provider handle");
+        clear_api_providers();
+
+        let mut stream = handle.stream(&race_model("other-api"), &empty_context(), None);
+        let mut error_message = None;
+        while let Some(event) = stream.next().await {
+            if let AssistantMessageEvent::Error { reason, error } = event {
+                assert_eq!(reason, ErrorReason::Error);
+                error_message = error.error_message;
+            }
+        }
+        assert_eq!(
+            error_message.as_deref(),
+            Some("Mismatched api: other-api expected race-api")
+        );
+    }
 }
