@@ -177,6 +177,12 @@ mod tests {
     };
     use futures::StreamExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Mutex as TokioMutex;
+
+    fn registry_test_lock() -> &'static TokioMutex<()> {
+        static CELL: OnceLock<TokioMutex<()>> = OnceLock::new();
+        CELL.get_or_init(|| TokioMutex::new(()))
+    }
 
     #[derive(Default)]
     struct CountingProvider {
@@ -264,6 +270,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_survives_unregister_after_lookup() {
+        let _guard = registry_test_lock().lock().await;
         clear_api_providers();
         register_api_provider(
             Box::new(CountingProvider::default()),
@@ -286,6 +293,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_survives_clear_after_lookup_for_simple_stream() {
+        let _guard = registry_test_lock().lock().await;
         clear_api_providers();
         register_api_provider(Box::new(CountingProvider::default()), None);
         let handle = get_api_provider(&Api::from("race-api")).expect("provider handle");
@@ -305,6 +313,7 @@ mod tests {
 
     #[tokio::test]
     async fn captured_handle_still_returns_mismatch_error_stream() {
+        let _guard = registry_test_lock().lock().await;
         clear_api_providers();
         register_api_provider(Box::new(CountingProvider::default()), None);
         let handle = get_api_provider(&Api::from("race-api")).expect("provider handle");
