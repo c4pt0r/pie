@@ -3,6 +3,12 @@
 //!
 //! Guards: 15s timeout, 5 MiB body cap, plain GET only (no auth headers, no redirects beyond
 //! 10). Errors surface as tool errors so the LLM sees a clear message and can adjust.
+//!
+//! Body cap is enforced **streaming** via `Response::chunk` — we stop reading as soon as the
+//! accumulator passes `MAX_BODY_BYTES` and drop the response so the connection closes. The
+//! prior implementation called `resp.bytes().await`, which buffered the entire body in
+//! memory before checking the cap; a hostile or buggy server could OOM the agent with a
+//! single response.
 
 use std::time::Duration;
 
@@ -54,7 +60,7 @@ impl AgentTool for WebFetchTool {
             .map_err(|e| AgentToolError::Message(format!("http client init: {e}")))?;
 
         let fut = client.get(&url).send();
-        let resp = tokio::select! {
+        let mut resp = tokio::select! {
             r = fut => r.map_err(|e| AgentToolError::Message(format!("fetch failed: {e}")))?,
             _ = cancel.cancelled() => {
                 return Err(AgentToolError::Message("cancelled".into()));
@@ -69,17 +75,12 @@ impl AgentTool for WebFetchTool {
             .unwrap_or("")
             .to_string();
 
-        let bytes = match resp.bytes().await {
-            Ok(b) => b,
-            Err(e) => return Err(AgentToolError::Message(format!("read body: {e}"))),
-        };
-        let truncated = bytes.len() > MAX_BODY_BYTES;
-        let bytes = if truncated {
-            &bytes[..MAX_BODY_BYTES]
-        } else {
-            &bytes[..]
-        };
-        let text = String::from_utf8_lossy(bytes).to_string();
+        let (body, truncated) = read_body_capped(&mut resp, MAX_BODY_BYTES, &cancel).await?;
+        // Drop the response once we have what we need so the connection closes and the
+        // server stops streaming (matters most in the truncated branch).
+        drop(resp);
+
+        let text = String::from_utf8_lossy(&body).to_string();
         let rendered = if content_type.contains("html") {
             html_to_text(&text)
         } else {
@@ -88,7 +89,7 @@ impl AgentTool for WebFetchTool {
 
         let header = format!(
             "GET {url}\nstatus: {status}\ncontent-type: {content_type}\nbytes: {}{}\n\n",
-            bytes.len(),
+            body.len(),
             if truncated { " (truncated)" } else { "" }
         );
         Ok(AgentToolResult {
@@ -97,11 +98,48 @@ impl AgentTool for WebFetchTool {
                 "url": url,
                 "status": status.as_u16(),
                 "content_type": content_type,
-                "bytes": bytes.len(),
+                "bytes": body.len(),
                 "truncated": truncated,
             }),
             terminate: None,
         })
+    }
+}
+
+/// Stream-read the response body until either EOF or `cap` bytes have been accumulated.
+/// Returns the captured bytes and whether the body was longer than `cap`.
+///
+/// This is the core of the streaming cap: the previous `resp.bytes().await` buffered every
+/// byte the server sent before the caller could check the size. By draining via
+/// `Response::chunk` we cap memory at `cap + one chunk` and let the caller drop the response
+/// so the connection closes immediately when we have enough.
+async fn read_body_capped(
+    resp: &mut reqwest::Response,
+    cap: usize,
+    cancel: &CancellationToken,
+) -> Result<(Vec<u8>, bool), AgentToolError> {
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        let chunk_result = tokio::select! {
+            r = resp.chunk() => r,
+            _ = cancel.cancelled() => {
+                return Err(AgentToolError::Message("cancelled".into()));
+            }
+        };
+        match chunk_result {
+            Ok(Some(chunk)) => {
+                if buf.len() + chunk.len() > cap {
+                    // Take only what fits; flag truncation and stop reading. Caller drops
+                    // the response so the connection closes.
+                    let remaining = cap.saturating_sub(buf.len());
+                    buf.extend_from_slice(&chunk[..remaining]);
+                    return Ok((buf, true));
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            Ok(None) => return Ok((buf, false)),
+            Err(e) => return Err(AgentToolError::Message(format!("read body: {e}"))),
+        }
     }
 }
 
