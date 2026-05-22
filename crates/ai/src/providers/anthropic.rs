@@ -20,13 +20,13 @@
 //! - Fine-grained tool-streaming beta header negotiation
 
 use async_trait::async_trait;
-use futures::StreamExt;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 
 use crate::api_registry::ApiProvider;
 use crate::types::*;
+use crate::utils::abort::{self, AbortErrorOrReqwest, AbortableNext};
 use crate::utils::event_stream::{AssistantMessageEventSender, AssistantMessageEventStream};
 use crate::utils::sse::SseStream;
 
@@ -238,14 +238,25 @@ async fn run(
     let resp = match crate::utils::retry::send_with_retry(&options, req).await {
         Ok(r) => r,
         Err(e) => {
-            push_error(&mut sender, &model, format!("http error: {e}"));
+            if e.is_aborted() {
+                abort::push_aborted(&mut sender, &model);
+            } else {
+                push_error(&mut sender, &model, format!("http error: {e}"));
+            }
             return;
         }
     };
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let txt = resp.text().await.unwrap_or_default();
+        let txt = match abort::response_text_or_abort(resp, options.abort.as_ref()).await {
+            Ok(txt) => txt,
+            Err(AbortErrorOrReqwest::Aborted) => {
+                abort::push_aborted(&mut sender, &model);
+                return;
+            }
+            Err(AbortErrorOrReqwest::Reqwest(_)) => String::new(),
+        };
         push_error(&mut sender, &model, format!("HTTP {status}: {txt}"));
         return;
     }
@@ -257,10 +268,18 @@ async fn run(
     });
 
     let mut sse = SseStream::new(resp.bytes_stream());
-    while let Some(item) = sse.next().await {
+    loop {
         if sender.is_closed() {
             return; // consumer dropped — abort silently.
         }
+        let item = match abort::next_or_abort(&mut sse, options.abort.as_ref()).await {
+            AbortableNext::Item(item) => item,
+            AbortableNext::Eof => break,
+            AbortableNext::Aborted => {
+                abort::push_aborted(&mut sender, &model);
+                return;
+            }
+        };
         match item {
             Err(e) => {
                 push_error(&mut sender, &model, format!("sse: {e}"));

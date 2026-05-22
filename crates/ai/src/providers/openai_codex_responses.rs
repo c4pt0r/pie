@@ -22,6 +22,7 @@ use crate::providers::openai_responses::{
     consume_responses_sse, convert_messages, push_error, serialize_tools,
 };
 use crate::types::*;
+use crate::utils::abort::{self as abort_utils, AbortErrorOrReqwest};
 use crate::utils::event_stream::{AssistantMessageEventSender, AssistantMessageEventStream};
 
 const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
@@ -156,13 +157,24 @@ async fn run(
     let resp = match crate::utils::retry::send_with_retry(&options, req).await {
         Ok(r) => r,
         Err(e) => {
-            push_error(&mut sender, &model, format!("http error: {e}"));
+            if e.is_aborted() {
+                abort_utils::push_aborted(&mut sender, &model);
+            } else {
+                push_error(&mut sender, &model, format!("http error: {e}"));
+            }
             return;
         }
     };
     if !resp.status().is_success() {
         let status = resp.status();
-        let txt = resp.text().await.unwrap_or_default();
+        let txt = match abort_utils::response_text_or_abort(resp, options.abort.as_ref()).await {
+            Ok(txt) => txt,
+            Err(AbortErrorOrReqwest::Aborted) => {
+                abort_utils::push_aborted(&mut sender, &model);
+                return;
+            }
+            Err(AbortErrorOrReqwest::Reqwest(_)) => String::new(),
+        };
         push_error(
             &mut sender,
             &model,
@@ -171,7 +183,7 @@ async fn run(
         return;
     }
 
-    consume_responses_sse(resp, &model, &mut sender).await;
+    consume_responses_sse(resp, &model, &mut sender, options.abort.as_ref()).await;
 }
 
 fn build_request_body(model: &Model, context: &Context, options: &StreamOptions) -> Value {

@@ -12,6 +12,7 @@
 use std::time::Duration;
 
 use crate::types::StreamOptions;
+use crate::utils::abort::{self, AbortErrorOrReqwest};
 
 const DEFAULT_MAX_RETRIES: u32 = 2;
 const DEFAULT_BASE_DELAY_MS: u64 = 500;
@@ -23,8 +24,16 @@ pub enum RetrySendError {
     Status(String),
     #[error(transparent)]
     Reqwest(#[from] reqwest::Error),
+    #[error("aborted")]
+    Aborted,
     #[error("server requested {requested_ms}ms wait, exceeds cap {cap_ms}ms")]
     DelayTooLong { requested_ms: u64, cap_ms: u64 },
+}
+
+impl RetrySendError {
+    pub fn is_aborted(&self) -> bool {
+        matches!(self, Self::Aborted)
+    }
 }
 
 /// Send a `reqwest::RequestBuilder` with retries. Internally uses `try_clone` to rebuild the
@@ -41,7 +50,9 @@ pub async fn send_with_retry(
 
     let Some(template) = req.try_clone() else {
         // Streaming body — can't replay; single-shot.
-        return req.send().await.map_err(RetrySendError::Reqwest);
+        return abort::send_or_abort(req, options.abort.as_ref())
+            .await
+            .map_err(retry_send_error);
     };
     drop(req);
 
@@ -61,7 +72,7 @@ pub async fn send_with_retry(
                 ));
             }
         };
-        let result = attempt_req.send().await;
+        let result = abort::send_or_abort(attempt_req, options.abort.as_ref()).await;
         match result {
             Ok(resp) if !is_retryable_status(resp.status()) => return Ok(resp),
             Ok(resp) => {
@@ -84,12 +95,19 @@ pub async fn send_with_retry(
                     });
                 }
                 // Drain the body so the connection can be pooled.
-                let _ = resp.bytes().await;
-                tokio::time::sleep(delay).await;
+                abort::drain_bytes_or_abort(resp, options.abort.as_ref())
+                    .await
+                    .map_err(retry_send_error)?;
+                abort::sleep_or_abort(delay, options.abort.as_ref())
+                    .await
+                    .map_err(|_| RetrySendError::Aborted)?;
                 attempt += 1;
                 continue;
             }
             Err(e) => {
+                let AbortErrorOrReqwest::Reqwest(e) = e else {
+                    return Err(RetrySendError::Aborted);
+                };
                 if attempt >= max_retries || !is_retryable_reqwest_error(&e) {
                     return Err(RetrySendError::Reqwest(e));
                 }
@@ -101,11 +119,20 @@ pub async fn send_with_retry(
                     delay.as_millis(),
                     e
                 );
-                tokio::time::sleep(delay).await;
+                abort::sleep_or_abort(delay, options.abort.as_ref())
+                    .await
+                    .map_err(|_| RetrySendError::Aborted)?;
                 attempt += 1;
                 continue;
             }
         }
+    }
+}
+
+fn retry_send_error(error: AbortErrorOrReqwest) -> RetrySendError {
+    match error {
+        AbortErrorOrReqwest::Aborted => RetrySendError::Aborted,
+        AbortErrorOrReqwest::Reqwest(e) => RetrySendError::Reqwest(e),
     }
 }
 

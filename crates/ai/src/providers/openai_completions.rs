@@ -23,12 +23,12 @@
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
-use futures::StreamExt;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use crate::api_registry::ApiProvider;
 use crate::types::*;
+use crate::utils::abort::{self as abort_utils, AbortErrorOrReqwest, AbortableNext};
 use crate::utils::event_stream::{AssistantMessageEventSender, AssistantMessageEventStream};
 use crate::utils::sse::SseStream;
 
@@ -159,13 +159,24 @@ async fn run(
     let resp = match crate::utils::retry::send_with_retry(&options, req).await {
         Ok(r) => r,
         Err(e) => {
-            push_error(&mut sender, &model, format!("http error: {e}"));
+            if e.is_aborted() {
+                abort_utils::push_aborted(&mut sender, &model);
+            } else {
+                push_error(&mut sender, &model, format!("http error: {e}"));
+            }
             return;
         }
     };
     if !resp.status().is_success() {
         let status = resp.status();
-        let txt = resp.text().await.unwrap_or_default();
+        let txt = match abort_utils::response_text_or_abort(resp, options.abort.as_ref()).await {
+            Ok(txt) => txt,
+            Err(AbortErrorOrReqwest::Aborted) => {
+                abort_utils::push_aborted(&mut sender, &model);
+                return;
+            }
+            Err(AbortErrorOrReqwest::Reqwest(_)) => String::new(),
+        };
         push_error(&mut sender, &model, format!("HTTP {status}: {txt}"));
         return;
     }
@@ -182,10 +193,18 @@ async fn run(
     let mut finish_reason: Option<String> = None;
 
     let mut sse = SseStream::new(resp.bytes_stream());
-    while let Some(item) = sse.next().await {
+    loop {
         if sender.is_closed() {
             return;
         }
+        let item = match abort_utils::next_or_abort(&mut sse, options.abort.as_ref()).await {
+            AbortableNext::Item(item) => item,
+            AbortableNext::Eof => break,
+            AbortableNext::Aborted => {
+                abort_utils::push_aborted(&mut sender, &model);
+                return;
+            }
+        };
         let ev = match item {
             Ok(ev) => ev,
             Err(e) => {

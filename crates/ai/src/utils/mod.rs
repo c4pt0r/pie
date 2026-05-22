@@ -3,6 +3,7 @@
 //! These helpers are dependency-light on purpose — every provider imports from here, so adding
 //! a transitive SDK dep would balloon cold-start cost.
 
+pub mod abort;
 pub mod aws_eventstream;
 pub mod diagnostics;
 pub mod event_stream;

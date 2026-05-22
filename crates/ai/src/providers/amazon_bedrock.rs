@@ -16,11 +16,11 @@
 //! - image content blocks in tool results
 
 use async_trait::async_trait;
-use futures::StreamExt;
 use serde_json::{Map, Value, json};
 
 use crate::api_registry::ApiProvider;
 use crate::types::*;
+use crate::utils::abort::{self as abort_utils, AbortErrorOrReqwest, AbortableNext};
 use crate::utils::aws_eventstream::AwsEventStream;
 use crate::utils::event_stream::{AssistantMessageEventSender, AssistantMessageEventStream};
 
@@ -107,13 +107,24 @@ async fn run(
     let resp = match crate::utils::retry::send_with_retry(&options, req).await {
         Ok(r) => r,
         Err(e) => {
-            push_error(&mut sender, &model, format!("http error: {e}"));
+            if e.is_aborted() {
+                abort_utils::push_aborted(&mut sender, &model);
+            } else {
+                push_error(&mut sender, &model, format!("http error: {e}"));
+            }
             return;
         }
     };
     if !resp.status().is_success() {
         let status = resp.status();
-        let txt = resp.text().await.unwrap_or_default();
+        let txt = match abort_utils::response_text_or_abort(resp, options.abort.as_ref()).await {
+            Ok(txt) => txt,
+            Err(AbortErrorOrReqwest::Aborted) => {
+                abort_utils::push_aborted(&mut sender, &model);
+                return;
+            }
+            Err(AbortErrorOrReqwest::Reqwest(_)) => String::new(),
+        };
         push_error(
             &mut sender,
             &model,
@@ -122,10 +133,15 @@ async fn run(
         return;
     }
 
-    consume(resp, &model, sender).await;
+    consume(resp, &model, sender, options.abort.as_ref()).await;
 }
 
-async fn consume(resp: reqwest::Response, model: &Model, mut sender: AssistantMessageEventSender) {
+async fn consume(
+    resp: reqwest::Response,
+    model: &Model,
+    mut sender: AssistantMessageEventSender,
+    abort_token: Option<&tokio_util::sync::CancellationToken>,
+) {
     let mut partial = empty_partial(model);
     sender.push(AssistantMessageEvent::Start {
         partial: partial.clone(),
@@ -136,10 +152,18 @@ async fn consume(resp: reqwest::Response, model: &Model, mut sender: AssistantMe
     let mut index_map: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
 
     let mut es = AwsEventStream::new(resp.bytes_stream());
-    while let Some(item) = es.next().await {
+    loop {
         if sender.is_closed() {
             return;
         }
+        let item = match abort_utils::next_or_abort(&mut es, abort_token).await {
+            AbortableNext::Item(item) => item,
+            AbortableNext::Eof => break,
+            AbortableNext::Aborted => {
+                abort_utils::push_aborted(&mut sender, model);
+                return;
+            }
+        };
         let frame = match item {
             Ok(f) => f,
             Err(e) => {

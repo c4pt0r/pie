@@ -138,6 +138,10 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
   `RegisteredHandle` panic with `provider removed while handle was held`. In-flight handles
   keep the TypeScript registry semantics: unregistering prevents future lookup while already
   captured handles continue to stream or return the normal mismatch error stream.
+- Provider HTTP paths now honor `StreamOptions::abort` while sending requests, sleeping between
+  retries, draining retryable response bodies, reading error response text, and consuming SSE /
+  AWS event-stream bodies. Aborted streams emit an `ErrorReason::Aborted` terminal event instead
+  of waiting for provider I/O to finish.
 - **#48** `/share` no longer passes the removed `gh gist create --secret` flag. Secret
   gists are the GitHub CLI default; `/share --public` still passes `--public`, and errors
   continue to preserve the underlying `gh` stderr.

@@ -7,11 +7,14 @@
 
 use futures::StreamExt;
 use pie_ai::{
-    Api, AssistantMessageEvent, ContentBlock, Context, KnownApi, Message, Model, ModelCost,
-    Provider, StreamOptions, UserContent, UserMessage, UserRole, stream,
+    Api, AssistantMessageEvent, ContentBlock, Context, ErrorReason, KnownApi, Message, Model,
+    ModelCost, Provider, StopReason, StreamOptions, UserContent, UserMessage, UserRole, stream,
 };
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 
 /// Serve one canned HTTP/1.1 response carrying the given SSE body, then exit.
 async fn serve_once(body: &'static str) -> String {
@@ -253,4 +256,97 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
     }
     assert!(done);
     assert_eq!(text, "ok");
+}
+
+#[tokio::test]
+async fn abort_cancels_retry_sleep_before_second_request() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let token = CancellationToken::new();
+    let aborter = token.clone();
+
+    let server = tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = s.read(&mut buf).await;
+        let resp = "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 60\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        s.write_all(resp.as_bytes()).await.unwrap();
+        aborter.cancel();
+        tokio::time::timeout(std::time::Duration::from_millis(200), listener.accept())
+            .await
+            .is_ok()
+    });
+
+    let base = format!("http://{addr}");
+    let model = anthropic_model(base);
+    let opts = StreamOptions {
+        api_key: Some("test-key".into()),
+        max_retries: Some(2),
+        max_retry_delay_ms: Some(120_000),
+        abort: Some(token),
+        ..Default::default()
+    };
+
+    let mut s = stream(&model, &user_ctx("retry-me"), Some(&opts));
+    let mut aborted = false;
+    while let Some(ev) = s.next().await {
+        if let AssistantMessageEvent::Error { reason, error } = ev {
+            aborted = reason == ErrorReason::Aborted
+                && error.stop_reason == StopReason::Aborted
+                && error.error_message.as_deref() == Some("aborted");
+        }
+    }
+
+    assert!(aborted, "expected aborted error event");
+    assert!(
+        !server.await.unwrap(),
+        "aborted retry sleep should not send a second request"
+    );
+}
+
+#[tokio::test]
+async fn abort_cancels_pending_sse_drain() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let token = CancellationToken::new();
+    let wrote_prefix = Arc::new(AtomicBool::new(false));
+    let server_wrote_prefix = wrote_prefix.clone();
+
+    tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = s.read(&mut buf).await;
+        let prefix = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_abort\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n";
+        let headers =
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+        s.write_all(headers.as_bytes()).await.unwrap();
+        s.write_all(prefix.as_bytes()).await.unwrap();
+        s.flush().await.unwrap();
+        server_wrote_prefix.store(true, Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    });
+
+    let base = format!("http://{addr}");
+    let model = anthropic_model(base);
+    let opts = StreamOptions {
+        api_key: Some("test-key".into()),
+        abort: Some(token.clone()),
+        ..Default::default()
+    };
+
+    let mut s = stream(&model, &user_ctx("stream-me"), Some(&opts));
+    let mut aborted = false;
+    while !wrote_prefix.load(Ordering::SeqCst) {
+        tokio::task::yield_now().await;
+    }
+    token.cancel();
+    while let Some(ev) = s.next().await {
+        if let AssistantMessageEvent::Error { reason, error } = ev {
+            aborted = reason == ErrorReason::Aborted
+                && error.stop_reason == StopReason::Aborted
+                && error.error_message.as_deref() == Some("aborted");
+        }
+    }
+
+    assert!(aborted, "expected SSE drain to stop on abort");
 }
