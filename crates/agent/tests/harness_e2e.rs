@@ -1441,3 +1441,173 @@ async fn handle_trigger_persistence_failure_still_returns_outcome_and_emits_erro
         "TriggerHandled.audit_entry_id must be None when persistence failed"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────────────────
+// register_notification_hook — RFC 1 sub-PR 3 (hook supervisor)
+// ─────────────────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn register_notification_hook_drives_pump_into_handle_trigger() {
+    use pie_agent_core::{
+        DynNotificationHook, HookError, HookState, NotificationHook, NotificationHookStatus,
+        TriggerSink,
+    };
+
+    /// Mock hook: pushes a fixed number of triggers and then closes the sink so the pump
+    /// exits cleanly. Verifies that the harness's supervisor actually drives `run(sink)`
+    /// and routes everything to `handle_trigger`.
+    struct CountedHook {
+        label: String,
+        triggers: std::sync::Mutex<Vec<pie_agent_core::Trigger>>,
+    }
+    #[async_trait::async_trait]
+    impl NotificationHook for CountedHook {
+        fn label(&self) -> &str {
+            &self.label
+        }
+        async fn run(&self, sink: TriggerSink) -> Result<(), HookError> {
+            let triggers: Vec<_> = self.triggers.lock().unwrap().drain(..).collect();
+            for t in triggers {
+                sink.send(t).map_err(|_| HookError::SinkClosed)?;
+            }
+            Ok(())
+        }
+        fn status(&self) -> NotificationHookStatus {
+            NotificationHookStatus {
+                state: HookState::Connected,
+                last_event_at: None,
+                last_ack_at: None,
+                last_error: None,
+                queued_count: 0,
+                dropped_count: 0,
+                deduped_count: 0,
+                subscription_labels: vec![self.label.clone()],
+                requires_attention: None,
+            }
+        }
+    }
+
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage.clone() as Arc<dyn SessionStorage>);
+    let opts = AgentHarnessOptions::new(faux_model(), session.clone());
+    let harness = Arc::new(AgentHarness::new(opts));
+
+    let triggers = vec![
+        sample_trigger("hook-k1", "hook-trace-1"),
+        sample_trigger("hook-k2", "hook-trace-2"),
+        sample_trigger("hook-k1", "hook-trace-3"), // duplicate of k1 → dedup path
+    ];
+
+    let hook: DynNotificationHook = Arc::new(CountedHook {
+        label: "mock".into(),
+        triggers: std::sync::Mutex::new(triggers),
+    });
+
+    harness.register_notification_hook(hook);
+
+    // Wait for the pump to drain. The hook produces three triggers synchronously then
+    // closes the sink; the pump exits when rx.recv() returns None. We poll the snapshot
+    // counters as the completion signal; with a wide timeout to handle CI load.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let snap = loop {
+        let s = harness.notification_status_snapshot();
+        if s.runtime.accepted_total + s.runtime.deduped_total + s.runtime.cycle_suppressed_total
+            >= 3
+        {
+            break s;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!(
+                "pump did not process 3 triggers within 5s — snapshot: {:?}",
+                s
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+
+    assert_eq!(snap.runtime.accepted_total, 2);
+    assert_eq!(snap.runtime.deduped_total, 1);
+    assert_eq!(snap.runtime.cycle_suppressed_total, 0);
+    assert_eq!(snap.hooks.len(), 1, "hook must be tracked in snapshot");
+    assert_eq!(
+        snap.hooks[0].subscription_labels,
+        vec!["mock".to_string()],
+        "snapshot hook label must round-trip from hook.status()"
+    );
+
+    // Both accepted triggers must have produced audit Custom entries.
+    let entries = session.entries().await.unwrap();
+    let trigger_audit_count = entries
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                SessionTreeEntry::Custom { custom_type, .. }
+                    if custom_type == pie_agent_core::TriggerRecord::CUSTOM_TYPE
+            )
+        })
+        .count();
+    // 3 audit entries: Accepted (k1), Accepted (k2), Deduped (k1 again).
+    assert_eq!(trigger_audit_count, 3);
+}
+
+#[tokio::test]
+async fn register_notification_hook_snapshot_reflects_hook_status_state() {
+    use pie_agent_core::{
+        DynNotificationHook, HookError, HookState, NotificationHook, NotificationHookStatus,
+        TriggerSink,
+    };
+
+    /// Hook that immediately reports `Disconnected` and never sends anything. The supervisor
+    /// pump exits as soon as the hook's `run` future resolves and the sink is dropped.
+    struct DegradedHook;
+    #[async_trait::async_trait]
+    impl NotificationHook for DegradedHook {
+        fn label(&self) -> &str {
+            "degraded"
+        }
+        async fn run(&self, _sink: TriggerSink) -> Result<(), HookError> {
+            Ok(())
+        }
+        fn status(&self) -> NotificationHookStatus {
+            NotificationHookStatus {
+                state: HookState::Disconnected {
+                    reason: "transport closed at startup".into(),
+                },
+                last_event_at: None,
+                last_ack_at: None,
+                last_error: Some("transport closed at startup".into()),
+                queued_count: 0,
+                dropped_count: 0,
+                deduped_count: 0,
+                subscription_labels: vec!["degraded".into()],
+                requires_attention: Some("degraded: transport closed at startup".into()),
+            }
+        }
+    }
+
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage.clone() as Arc<dyn SessionStorage>);
+    let opts = AgentHarnessOptions::new(faux_model(), session.clone());
+    let harness = Arc::new(AgentHarness::new(opts));
+
+    let hook: DynNotificationHook = Arc::new(DegradedHook);
+    harness.register_notification_hook(hook);
+
+    // Give the driver/pump tasks a moment to schedule. The hook's run returns immediately
+    // so we mostly need to give the snapshot a chance to see the registered hook.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let snap = harness.notification_status_snapshot();
+    assert_eq!(snap.hooks.len(), 1);
+    assert!(
+        matches!(snap.hooks[0].state, HookState::Disconnected { .. }),
+        "snapshot must reflect the hook's reported state"
+    );
+    assert_eq!(
+        snap.hooks[0].requires_attention.as_deref(),
+        Some("degraded: transport closed at startup")
+    );
+    // Hook produced nothing so runtime counters stay at zero.
+    assert_eq!(snap.runtime.accepted_total, 0);
+}

@@ -100,7 +100,7 @@ use super::compaction::compaction::{
 };
 use super::cost::{CostSnapshot, CostTracker};
 use super::messages::compaction_summary;
-use super::notification_hook::NotificationHookStatus;
+use super::notification_hook::{DynNotificationHook, NotificationHookStatus};
 use super::prompt_templates::PromptTemplateRegistry;
 use super::session::session::{BranchSummaryInput, Session};
 use super::skills::format_skill_invocation;
@@ -116,10 +116,10 @@ use super::types::{PromptTemplate, Skill};
 /// renders this directly; `hooks` is intentionally a snapshot `Vec` (not a live view) so the
 /// caller cannot pin the hook registry against new registrations.
 ///
-/// Hook registry is currently empty in v1 of this PR — `register_notification_hook` lands
-/// alongside the hook supervisor in a follow-up. The shape is here so CLI/TUI can render
-/// `notifications: local mode (no hooks) — 0 waiting` against the real API today and not
-/// have to refactor when hooks become non-empty.
+/// `hooks` is filled from `hook.status()` of every hook registered via
+/// [`AgentHarness::register_notification_hook`]. Unregistered / hook-ended cases stay in the
+/// snapshot until the next registration cycle; consumers should treat `NotificationHookStatus.state`
+/// as the source of truth for whether a hook is currently usable.
 #[derive(Clone, Debug)]
 pub struct NotificationStatusSnapshot {
     pub hooks: Vec<NotificationHookStatus>,
@@ -194,6 +194,12 @@ pub struct AgentHarness {
     /// In-memory dedup + cycle evaluator shared with [`Self::handle_trigger`]. Exposed via
     /// [`Self::notification_status_snapshot`] for observability.
     trigger_runtime: TriggerRuntime,
+    /// Notification hooks registered via [`Self::register_notification_hook`]. Held under
+    /// an `Arc<Mutex<...>>` so [`Self::notification_status_snapshot`] can read and the
+    /// supervisor task can append independently of harness ownership. The hook driver +
+    /// pump tasks are detached (`tokio::spawn`); they tear down naturally when the hook's
+    /// `run` future completes or returns an error.
+    notification_hooks: Arc<Mutex<Vec<DynNotificationHook>>>,
 }
 
 impl AgentHarness {
@@ -230,6 +236,7 @@ impl AgentHarness {
             cost,
             budget_cap_usd: options.budget_cap_usd,
             trigger_runtime: TriggerRuntime::with_config(options.trigger_runtime),
+            notification_hooks: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -387,15 +394,72 @@ impl AgentHarness {
         outcome
     }
 
-    /// Point-in-time view of the harness's notification surface — currently the
-    /// [`TriggerRuntimeSnapshot`] plus an empty hook list. Hook registration + supervisor
-    /// land in a follow-up PR; the shape is here so CLI/TUI can render banners against the
-    /// real API today and not have to refactor when the registry becomes non-empty.
+    /// Point-in-time view of the harness's notification surface — the
+    /// [`TriggerRuntimeSnapshot`] plus a `Vec<NotificationHookStatus>` collected from each
+    /// registered hook via [`super::notification_hook::NotificationHook::status`]. The hook
+    /// vec is a snapshot, not a live view; new registrations after this call are not
+    /// reflected. Hook impls that have ended naturally still appear here until the next
+    /// registration cycle — consumers should treat `NotificationHookStatus.state` as the
+    /// source of truth for whether a hook is currently live.
     pub fn notification_status_snapshot(&self) -> NotificationStatusSnapshot {
+        let hooks: Vec<NotificationHookStatus> = self
+            .notification_hooks
+            .lock()
+            .iter()
+            .map(|h| h.status())
+            .collect();
         NotificationStatusSnapshot {
-            hooks: Vec::new(),
+            hooks,
             runtime: self.trigger_runtime.snapshot(),
         }
+    }
+
+    /// Register a [`super::notification_hook::NotificationHook`] with the harness. Spawns
+    /// two detached tokio tasks:
+    /// - **Driver**: calls `hook.run(sink)` and drives the hook's transport (MCP read
+    ///   pump, Cloudflare hub WebSocket, etc.). Triggers the hook produces flow through
+    ///   the `sink` (an `mpsc::UnboundedSender<Trigger>`).
+    /// - **Pump**: reads from the sink's receiver and calls
+    ///   [`Self::handle_trigger`] for each trigger. Exits naturally when the sender is
+    ///   dropped (e.g. when the hook's `run` future ends).
+    ///
+    /// The hook is stored for [`Self::notification_status_snapshot`] to read. There is no
+    /// unregister API in this PR — hooks live until the harness is dropped or the driver
+    /// task ends; the pump exits naturally when the sender closes. A later sub-PR may add
+    /// explicit shutdown handles if a use case requires them; for now the YAGNI surface is
+    /// "register and forget".
+    ///
+    /// `self: &Arc<Self>` because the pump task needs to clone the harness handle so
+    /// `handle_trigger` is reachable from a `'static` future. Callers already hold the
+    /// harness as `Arc<AgentHarness>` in `crates/coding-agent::main` so this is not a new
+    /// ergonomic ask.
+    pub fn register_notification_hook(self: &Arc<Self>, hook: DynNotificationHook) {
+        use super::notification_hook::TriggerSink;
+        let (sink, mut rx): (TriggerSink, _) = tokio::sync::mpsc::unbounded_channel();
+
+        // Track for status snapshot before spawning so a status read immediately after
+        // returning sees the new hook.
+        self.notification_hooks.lock().push(hook.clone());
+
+        // Driver task: the hook owns transport-side work; we only care about its
+        // completion to free task resources. Errors aren't surfaced to a HarnessEvent
+        // here (RFC 1 §4 puts that on the next sub-PR's HookStatusChanged event); the
+        // hook reflects them through its own `status()` call.
+        let hook_driver = hook.clone();
+        tokio::spawn(async move {
+            let _ = hook_driver.run(sink).await;
+        });
+
+        // Pump task: drain triggers into handle_trigger in order. We don't bound the
+        // queue here — the hook's own backpressure is the right place for that since
+        // it knows the transport's per-hook semantics (MCP push has no rate, hub frames
+        // have per-topic rate limits, cron has burst smoothing).
+        let harness = Arc::clone(self);
+        tokio::spawn(async move {
+            while let Some(trigger) = rx.recv().await {
+                let _ = harness.handle_trigger(trigger).await;
+            }
+        });
     }
 
     pub fn session(&self) -> &Session {

@@ -148,6 +148,19 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
   sub-PR 3 — `Accepted` is terminal for this slice. 5 new integration tests pin the
   audit shape, dedup state propagation, cycle suppression, snapshot counter
   monotonicity, and the persistence-failure reflux contract.
+- **#20 (hook supervisor)** `AgentHarness::register_notification_hook(self: &Arc<Self>,
+  hook: DynNotificationHook)` is the convenience wiring on top of `handle_trigger`. It
+  spawns two detached tokio tasks: a **driver** that runs `hook.run(sink)`, and a **pump**
+  that drains the sink's receiver and calls `handle_trigger` for each trigger in send
+  order. Tasks tear down naturally when the hook's `run` future ends and the sink drops.
+  Registered hooks are tracked in the harness so `notification_status_snapshot().hooks`
+  now reflects each hook's live `NotificationHook::status()`. There is no unregister API
+  in this slice — hooks live until the harness drops or the driver returns; YAGNI shape
+  for v1. 2 new integration tests exercise (a) a pump-and-dedup happy path with three
+  triggers (Accepted/Accepted/Deduped) ending in the expected audit + snapshot state,
+  and (b) a degraded hook reporting `HookState::Disconnected` to verify
+  `notification_status_snapshot` surfaces the hook's reported state and
+  `requires_attention` message without producing any triggers.
 
 ### Fixed
 
