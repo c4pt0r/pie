@@ -65,8 +65,8 @@ pub use harness::{
     skills::{LoadSkillsOutput, format_skill_invocation, load_skills, load_sourced_skills},
     system_prompt::format_skills_for_system_prompt,
     trigger::{
-        CredentialScope, PayloadVisibility, SourceKind, Trigger, TriggerAuthority, TriggerRecord,
-        TriggerSource, TriggerState,
+        CredentialScope, PayloadVisibility, ReplacementPolicy, SourceKind, Trigger,
+        TriggerAuthority, TriggerRecord, TriggerSource, TriggerState,
     },
     types::{
         ExecOptions, ExecOutput, ExecResult, ExecutionEnv, ExecutionError, ExecutionErrorCode,

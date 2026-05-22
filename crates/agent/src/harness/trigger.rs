@@ -47,6 +47,13 @@ pub struct Trigger {
     /// Required: dedup key. Runtime drops events with a duplicate key within the
     /// configured dedup window (default 5 minutes).
     pub idempotency_key: String,
+    /// How the dedup window collapses repeat events sharing this `idempotency_key`. Sources
+    /// declare per-event policy (RFC 1 §5 open decision #4 / §11). Required field — the
+    /// runtime does **not** default to `Drop` on missing field at deserialize time so an
+    /// adapter that forgot to set it surfaces immediately rather than silently dropping
+    /// real events. Adapters that want "no replacement" semantics set [`ReplacementPolicy::Drop`]
+    /// explicitly.
+    pub replacement_policy: ReplacementPolicy,
     /// Audit lineage. The same `trace_id` propagates to follow-up triggers spawned by the
     /// agent so cycle suppression can fire after a configurable hop count.
     pub trace_id: String,
@@ -127,6 +134,38 @@ pub struct TriggerAuthority {
     pub expires_at: Option<DateTime<Utc>>,
 }
 
+/// How the runtime dedup window collapses repeat events sharing the same
+/// `idempotency_key`. Declared per-event by the source adapter; the runtime applies the
+/// declared policy when it sees a duplicate within the dedup window (default 5 minutes per
+/// RFC 1 §5).
+///
+/// RFC 1 §5 + RFC 1 §11 open decision #4: the field is **required** on the wire — the
+/// runtime does not coerce a missing field into `Drop` so adapters that forgot to set it
+/// fail loud at deserialize time. Adapters that want "ignore subsequent duplicates"
+/// semantics set [`Self::Drop`] explicitly.
+///
+/// Recommended choice per source family:
+/// - MCP `notifications/tools/listChanged` / `notifications/resources/listChanged` →
+///   [`Self::LatestReplaces`] (the latest catalog snapshot supersedes earlier ones).
+/// - MCP `notifications/resources/updated` per resource URI → [`Self::LatestReplaces`].
+/// - Custom MCP notifications without a `_pie_dedup_key` agreement → [`Self::Drop`].
+/// - Hub webhook events where every occurrence matters (e.g. PR comments) →
+///   [`Self::Drop`] keyed by per-event id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplacementPolicy {
+    /// Replace the in-flight / queued trigger with the latest occurrence. Useful for
+    /// "snapshot of current state" events.
+    LatestReplaces,
+    /// Combine duplicates into one trigger, preserving merged context for the rule layer.
+    /// The runtime treats this identically to [`Self::LatestReplaces`] for v1 (audit
+    /// records both arrivals); future RFC 4 rule actions may use the distinction.
+    Coalesce,
+    /// Drop duplicate occurrences during the dedup window; only the first event in the
+    /// window fires the rule. Default for sources that did not explicitly opt in.
+    Drop,
+}
+
 /// Audit/authorization summary enum shared with provider/auth credential resolution. v1
 /// values match `docs/issues/29-rfc4...` table. The runtime treats this as opaque and
 /// passes it through to the evaluator and the session audit record.
@@ -203,6 +242,7 @@ pub struct TriggerRecord {
     pub trace_id: String,
     pub authority: TriggerAuthority,
     pub idempotency_key: String,
+    pub replacement_policy: ReplacementPolicy,
     pub received_at: DateTime<Utc>,
     pub state: TriggerState,
     pub payload_visibility: PayloadVisibility,
@@ -240,6 +280,7 @@ impl TriggerRecord {
             trace_id: trigger.trace_id.clone(),
             authority: trigger.authority.clone(),
             idempotency_key: trigger.idempotency_key.clone(),
+            replacement_policy: trigger.replacement_policy,
             received_at: trigger.received_at,
             state: TriggerState::Received,
             payload_visibility: trigger.payload_visibility,
@@ -272,6 +313,7 @@ mod tests {
             payload_summary: Some("PR #42 merged by alice".into()),
             payload: None,
             idempotency_key: "github:repo:c4pt0r/pie:pr:42:merged".into(),
+            replacement_policy: ReplacementPolicy::Drop,
             trace_id: "trace-abc".into(),
             authority: TriggerAuthority {
                 principal_id: "github:user:alice".into(),
@@ -391,5 +433,56 @@ mod tests {
         // Locks the stable string used by Issue #19 / RFC 1 skip-fold logic and the
         // session jsonl reader. Renaming this constant in isolation would break both.
         assert_eq!(TriggerRecord::CUSTOM_TYPE, "trigger");
+    }
+
+    #[test]
+    fn replacement_policy_serializes_snake_case() {
+        // Pin the wire spelling; RFC 1 §5 / RFC 4 §2.3 rule files reference these strings.
+        for (variant, expected) in [
+            (ReplacementPolicy::LatestReplaces, "\"latest_replaces\""),
+            (ReplacementPolicy::Coalesce, "\"coalesce\""),
+            (ReplacementPolicy::Drop, "\"drop\""),
+        ] {
+            assert_eq!(serde_json::to_string(&variant).unwrap(), expected);
+            let decoded: ReplacementPolicy = serde_json::from_str(expected).unwrap();
+            assert_eq!(decoded, variant);
+        }
+    }
+
+    #[test]
+    fn trigger_envelope_replacement_policy_is_required_field() {
+        // RFC 1 §5 + RFC 1 §11 open decision #4: missing `replacement_policy` MUST be a
+        // hard deserialize error so adapters fail loud rather than silently dropping real
+        // events. We do not want a `#[serde(default)]` here. Construct a JSON without the
+        // field and assert it does not deserialize.
+        let trigger = sample_trigger();
+        let mut json: serde_json::Value = serde_json::to_value(&trigger).unwrap();
+        json.as_object_mut().unwrap().remove("replacement_policy");
+        let result: Result<Trigger, _> = serde_json::from_value(json);
+        assert!(
+            result.is_err(),
+            "missing replacement_policy MUST fail deserialization, but parse succeeded"
+        );
+    }
+
+    #[test]
+    fn trigger_record_preserves_replacement_policy_round_trip() {
+        // The audit record must carry the per-event replacement policy so post-hoc analysis
+        // ("why didn't this event fire?") can distinguish dedup-by-Drop from
+        // latest-replaces collapses.
+        let mut trigger = sample_trigger();
+        trigger.replacement_policy = ReplacementPolicy::LatestReplaces;
+        let record = TriggerRecord::received_from(&trigger);
+        assert_eq!(record.replacement_policy, ReplacementPolicy::LatestReplaces);
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(
+            json.contains("\"replacement_policy\":\"latest_replaces\""),
+            "audit record must serialize replacement_policy in snake_case; got {json}"
+        );
+        let decoded: TriggerRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            decoded.replacement_policy,
+            ReplacementPolicy::LatestReplaces
+        );
     }
 }
