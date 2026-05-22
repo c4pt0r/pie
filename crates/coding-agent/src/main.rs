@@ -34,6 +34,7 @@ mod templates;
 mod tools;
 mod tui;
 
+use std::io::IsTerminal as _;
 use std::io::Write as _;
 use std::time::{Duration, Instant};
 
@@ -519,6 +520,24 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
                 commands::CommandOutcome::AttachSkill { name } => {
                     pending_skill = Some(name);
                 }
+                commands::CommandOutcome::LoginSecret { provider } => {
+                    match prompt_for_api_key(&provider).await {
+                        Ok(token) => {
+                            if token.trim().is_empty() {
+                                tui.error_line("empty api key; login cancelled");
+                            } else {
+                                match commands::save_api_key(&provider, &token) {
+                                    Ok(path) => tui.system_line(&format!(
+                                        "saved api key for `{provider}` to {}",
+                                        path.display()
+                                    )),
+                                    Err(e) => tui.error_line(&e),
+                                }
+                            }
+                        }
+                        Err(e) => tui.error_line(&e.to_string()),
+                    }
+                }
                 commands::CommandOutcome::Handled => {}
             }
             continue;
@@ -618,6 +637,21 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
         }
     }
     Ok(())
+}
+
+async fn prompt_for_api_key(provider: &str) -> Result<String> {
+    let provider = provider.to_string();
+    tokio::task::spawn_blocking(move || {
+        if !std::io::stdin().is_terminal() {
+            anyhow::bail!(
+                "/login requires an interactive terminal so the API key is not echoed; run pie in a TTY and use `/login {provider}`"
+            );
+        }
+        rpassword::prompt_password(format!("api key for `{provider}`: "))
+            .context("read api key without echo")
+    })
+    .await
+    .context("login prompt task")?
 }
 
 /// Predicate for spinner cancellation. The spinner should remain visible during the gap

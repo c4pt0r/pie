@@ -25,6 +25,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
 rustyline = { version = "14", default-features = false, features = ["with-file-history"] }
+rpassword = "7"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "stream"] }
 base64 = "0.22"
 toml = "0.8"

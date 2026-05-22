@@ -16,6 +16,7 @@ pub const THINKING_LEVEL_VALUES: [&str; 6] = ["off", "minimal", "low", "medium",
 pub const THINKING_LEVEL_USAGE: &str = "[off|minimal|low|medium|high|xhigh]";
 
 /// Outcome of running a command. Drives the REPL's next action.
+#[cfg_attr(test, allow(dead_code))]
 #[derive(Debug)]
 pub enum CommandOutcome {
     /// Continue the REPL loop normally.
@@ -29,6 +30,8 @@ pub enum CommandOutcome {
     /// Attach the named skill to the next user prompt. The REPL owns prompt assembly, so this
     /// stays explicit instead of going through the agent steering queue.
     AttachSkill { name: String },
+    /// Prompt for a provider credential without echoing the secret in the terminal input line.
+    LoginSecret { provider: String },
 }
 
 /// Context handed to a command at runtime. Kept narrow so each command's dependencies are
@@ -847,33 +850,37 @@ impl SlashCommand for LoginCommand {
         "store an API key for a provider in ~/.pie/auth.json"
     }
     fn usage(&self) -> &'static str {
-        "<provider> <api-key>"
+        "<provider>"
     }
     async fn run(&self, argv: &[String], _ctx: &CommandCtx<'_>) -> CommandOutcome {
-        if argv.len() < 2 {
+        if argv.len() != 1 {
             return CommandOutcome::Error(
-                "usage: /login <provider> <api-key>  (e.g. /login anthropic sk-ant-…)".into(),
+                "usage: /login <provider>  (pie will prompt for the API key without echoing it)"
+                    .into(),
             );
         }
-        let provider = argv[0].clone();
-        let token = argv[1..].join(" ");
-        let mut store = match crate::auth::AuthStore::load() {
-            Ok(s) => s,
-            Err(e) => return CommandOutcome::Error(format!("load auth store: {e}")),
-        };
-        store.set(
-            provider.clone(),
-            crate::auth::ProviderCredential::ApiKey { value: token },
-        );
-        if let Err(e) = store.save() {
-            return CommandOutcome::Error(format!("save auth store: {e}"));
+        CommandOutcome::LoginSecret {
+            provider: argv[0].clone(),
         }
-        println!(
-            "saved api key for `{provider}` to {}",
-            crate::auth::auth_path().display()
-        );
-        CommandOutcome::Handled
     }
+}
+
+#[cfg_attr(test, allow(dead_code))]
+pub fn save_api_key(provider: &str, token: &str) -> Result<PathBuf, String> {
+    let mut store = match crate::auth::AuthStore::load() {
+        Ok(s) => s,
+        Err(e) => return Err(format!("load auth store: {e}")),
+    };
+    store.set(
+        provider.to_string(),
+        crate::auth::ProviderCredential::ApiKey {
+            value: token.to_string(),
+        },
+    );
+    if let Err(e) = store.save() {
+        return Err(format!("save auth store: {e}"));
+    }
+    Ok(crate::auth::auth_path())
 }
 
 struct LogoutCommand;

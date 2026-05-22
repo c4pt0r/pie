@@ -13,6 +13,7 @@ use pie_agent_core::{
 };
 
 static PATH_ENV_LOCK: Mutex<()> = Mutex::new(());
+static PIE_DIR_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 // The binary crate doesn't expose `commands` — pull it in via path-include so this test
 // exercises the actual code path without restructuring the crate as a [lib]. `commands.rs`
@@ -243,6 +244,78 @@ async fn dispatch_quit_returns_quit_outcome() {
             matches!(outcome, commands::CommandOutcome::Quit),
             "{input} should map to Quit"
         );
+    }
+}
+
+#[tokio::test]
+async fn dispatch_login_prompts_for_secret_instead_of_accepting_inline_key() {
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage as Arc<dyn SessionStorage>);
+    let opts = AgentHarnessOptions::new(faux_model(), session);
+    let harness = Arc::new(AgentHarness::new(opts));
+
+    let registry = commands::Registry::with_builtins();
+    let cwd = std::env::current_dir().unwrap();
+    let ctx = commands::CommandCtx {
+        harness: &harness,
+        session_id: "test",
+        log_path: None,
+        tool_count: 0,
+        cwd: &cwd,
+    };
+
+    let outcome = commands::dispatch("/login ds4", &registry, &ctx).await;
+    match outcome {
+        commands::CommandOutcome::LoginSecret { provider } => assert_eq!(provider, "ds4"),
+        other => panic!("expected LoginSecret outcome, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn dispatch_login_rejects_inline_secret_material() {
+    let secret = "sk-inline-secret-should-not-be-accepted";
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage as Arc<dyn SessionStorage>);
+    let opts = AgentHarnessOptions::new(faux_model(), session);
+    let harness = Arc::new(AgentHarness::new(opts));
+
+    let registry = commands::Registry::with_builtins();
+    let cwd = std::env::current_dir().unwrap();
+    let ctx = commands::CommandCtx {
+        harness: &harness,
+        session_id: "test",
+        log_path: None,
+        tool_count: 0,
+        cwd: &cwd,
+    };
+
+    let outcome = commands::dispatch(&format!("/login ds4 {secret}"), &registry, &ctx).await;
+    match outcome {
+        commands::CommandOutcome::Error(message) => {
+            assert!(message.contains("usage: /login <provider>"), "{message}");
+            assert!(
+                !message.contains(secret),
+                "error must not repeat inline secret: {message}"
+            );
+        }
+        other => panic!("expected Error outcome, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn save_api_key_persists_without_printing_secret_material() {
+    let _guard = PIE_DIR_ENV_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let _pie_dir = EnvGuard::set("PIE_DIR", temp.path());
+    let secret = "sk-sentinel-login-secret-should-not-leak";
+
+    let path = commands::save_api_key("ds4", secret).expect("save api key");
+    assert_eq!(path, temp.path().join("auth.json"));
+
+    let stored = auth::AuthStore::load_from(&path).expect("load auth store");
+    match stored.get("ds4").expect("stored ds4 credential") {
+        auth::ProviderCredential::ApiKey { value } => assert_eq!(value, secret),
+        other => panic!("unexpected credential kind: {other:?}"),
     }
 }
 
@@ -503,4 +576,26 @@ fn prepend_path(dir: &Path) -> PathGuard {
     let joined = std::env::join_paths(paths).unwrap();
     unsafe { std::env::set_var("PATH", joined) };
     PathGuard { original }
+}
+
+struct EnvGuard {
+    key: &'static str,
+    original: Option<std::ffi::OsString>,
+}
+
+impl EnvGuard {
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let original = std::env::var_os(key);
+        unsafe { std::env::set_var(key, value) };
+        Self { key, original }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match self.original.take() {
+            Some(value) => unsafe { std::env::set_var(self.key, value) },
+            None => unsafe { std::env::remove_var(self.key) },
+        }
+    }
 }
