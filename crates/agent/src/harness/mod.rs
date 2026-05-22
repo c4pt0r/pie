@@ -6,11 +6,13 @@ pub mod agent_harness;
 pub mod compaction;
 pub mod cost;
 pub mod messages;
+pub mod notification_hook;
 pub mod permission;
 pub mod prompt_templates;
 pub mod session;
 pub mod skills;
 pub mod system_prompt;
+pub mod trigger;
 pub mod types;
 pub mod utils;
 

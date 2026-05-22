@@ -41,6 +41,10 @@ pub use harness::{
         one_line_summary as cost_one_line_summary,
     },
     messages,
+    notification_hook::{
+        DynNotificationHook, HookError, HookFuture, HookState, NotificationHook,
+        NotificationHookStatus, TriggerSink,
+    },
     permission::{PermissionDecision, PermissionPolicy},
     prompt_templates::{LoadTemplatesOutput, PromptTemplateRegistry, load_templates},
     session::{
@@ -60,6 +64,10 @@ pub use harness::{
     },
     skills::{LoadSkillsOutput, format_skill_invocation, load_skills, load_sourced_skills},
     system_prompt::format_skills_for_system_prompt,
+    trigger::{
+        CredentialScope, PayloadVisibility, SourceKind, Trigger, TriggerAuthority, TriggerRecord,
+        TriggerSource, TriggerState,
+    },
     types::{
         ExecOptions, ExecOutput, ExecResult, ExecutionEnv, ExecutionError, ExecutionErrorCode,
         FileError, FileErrorCode, FileInfo, FileKind, FsResult, PromptTemplate, SessionError,

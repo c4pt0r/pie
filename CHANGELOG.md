@@ -70,6 +70,19 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
   Branch). Prompt-template file loader (`<cwd>/.pie/templates/` overrides
   `~/.pie/templates/`) + `/template <name> [k=v ...]` slash command.
   `AgentHarness::after_tool_call` hook slot, paired with the existing `before_tool_call`.
+- **#20 (skeleton)** Public types for RFC 1 trigger runtime: `Trigger` envelope,
+  `TriggerSource` enum, `SourceKind`, `PayloadVisibility`, `TriggerAuthority`,
+  `CredentialScope`, `TriggerState` (`received` → `accepted | deduped | cycle_suppressed
+  | permission_denied | needs_approval | running | failed | completed`), and
+  `TriggerRecord` (v=1 schema, additive-only, persisted as
+  `SessionTreeEntry::Custom { custom_type: "trigger" }`). Plus the `NotificationHook`
+  trait, `NotificationHookStatus`, `HookState` (`Connected / Reconnecting /
+  Disconnected { reason } / Disabled / AuthFailed { reason }`, with `AuthFailed`
+  reserved for credential failures and protocol mismatches mapping to `Disconnected`),
+  `HookError`, and the `TriggerSink = mpsc::UnboundedSender<Trigger>` alias. **Types
+  only — no agent loop entrypoint yet**; the supervisor + state machine wiring + the
+  `AgentHarness::handle_trigger` API land in a follow-up PR. Adapter authors (MCP read
+  pump, Cloudflare hub WebSocket hook) can build against the trait in parallel.
 
 ### Fixed
 
