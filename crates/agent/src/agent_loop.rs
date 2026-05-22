@@ -371,7 +371,19 @@ async fn execute_tools(
     for tc in &tool_calls {
         let tool_id = tc.id.clone();
         let tool_name = tc.name.clone();
-        let args = serde_json::Value::Object(tc.arguments.clone());
+        let raw_args = serde_json::Value::Object(tc.arguments.clone());
+
+        // Resolve the tool BEFORE normalizing args so we can run its `prepare_arguments`
+        // compatibility shim. Unknown tools keep raw args (the dispatcher will produce a
+        // "no such tool" error result downstream).
+        let tool = tools_snapshot
+            .iter()
+            .find(|t| t.definition().name == tool_name)
+            .cloned();
+        let args = match &tool {
+            Some(t) => t.prepare_arguments(raw_args),
+            None => raw_args,
+        };
 
         emit(
             inner,
@@ -384,11 +396,18 @@ async fn execute_tools(
         )
         .await;
 
-        // before_tool_call hook can veto.
+        // before_tool_call hook can veto. The hook sees the prepared args on BOTH
+        // `ctx.args` and `ctx.tool_call.arguments` — there is no reason to expose two
+        // shapes of the same call (a hook reading `tool_call.arguments` would otherwise
+        // miss any normalization the tool's `prepare_arguments` applied).
         if let Some(hook) = inner.options.before_tool_call.clone() {
+            let mut hook_tc = (*tc).clone();
+            if let serde_json::Value::Object(map) = &args {
+                hook_tc.arguments = map.clone();
+            }
             let ctx = BeforeToolCallContext {
                 assistant_message: assistant.clone(),
-                tool_call: (*tc).clone(),
+                tool_call: hook_tc,
                 args: args.clone(),
                 context: agent_context.clone(),
             };
@@ -412,10 +431,6 @@ async fn execute_tools(
             }
         }
 
-        let tool = tools_snapshot
-            .iter()
-            .find(|t| t.definition().name == tool_name)
-            .cloned();
         prepared.push(PreparedCall::Run {
             id: tool_id,
             name: tool_name,
@@ -429,7 +444,7 @@ async fn execute_tools(
         ToolExecutionMode::Sequential => {
             let mut out = Vec::with_capacity(prepared.len());
             for call in prepared {
-                out.push(run_one(call, cancel.clone()).await);
+                out.push(run_one(inner.clone(), call, cancel.clone()).await);
             }
             out
         }
@@ -438,7 +453,8 @@ async fn execute_tools(
                 .into_iter()
                 .map(|call| {
                     let cancel = cancel.clone();
-                    tokio::spawn(async move { run_one(call, cancel).await })
+                    let inner = inner.clone();
+                    tokio::spawn(async move { run_one(inner, call, cancel).await })
                 })
                 .collect();
             let mut out = Vec::with_capacity(handles.len());
@@ -554,7 +570,11 @@ struct ToolOutcome {
     is_error: bool,
 }
 
-async fn run_one(call: PreparedCall, cancel: CancellationToken) -> ToolOutcome {
+async fn run_one(
+    inner: Arc<AgentInner>,
+    call: PreparedCall,
+    cancel: CancellationToken,
+) -> ToolOutcome {
     match call {
         PreparedCall::Blocked {
             id,
@@ -574,26 +594,69 @@ async fn run_one(call: PreparedCall, cancel: CancellationToken) -> ToolOutcome {
             args,
             tool,
         } => match tool {
-            Some(t) => match t.execute(&id, args.clone(), cancel, None).await {
-                Ok(r) => ToolOutcome {
-                    id,
-                    name,
-                    args,
-                    result: r,
-                    is_error: false,
-                },
-                Err(e) => ToolOutcome {
-                    id,
-                    name,
-                    args,
-                    result: AgentToolResult {
-                        content: vec![UserContentBlock::text(format!("{e}"))],
-                        details: serde_json::Value::Null,
-                        terminate: None,
+            Some(t) => {
+                // Bridge the sync `AgentToolUpdate` callback to the async listener bus via a
+                // bounded mpsc channel + dedicated pump task. The pump emits
+                // `ToolExecutionUpdate` events in send order; the sync callback never blocks
+                // (UnboundedSender::send is non-async and just enqueues). Channel closes when
+                // the `on_update` Arc is dropped (typically when `execute` returns), at
+                // which point the pump joins and we proceed to the outcome.
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentToolResult>();
+                let pump_inner = inner.clone();
+                let pump_id = id.clone();
+                let pump_name = name.clone();
+                let pump_args = args.clone();
+                let pump_cancel = cancel.clone();
+                let pump_handle = tokio::spawn(async move {
+                    while let Some(partial) = rx.recv().await {
+                        emit(
+                            &pump_inner,
+                            AgentEvent::ToolExecutionUpdate {
+                                tool_call_id: pump_id.clone(),
+                                tool_name: pump_name.clone(),
+                                args: pump_args.clone(),
+                                partial_result: partial,
+                            },
+                            &pump_cancel,
+                        )
+                        .await;
+                    }
+                });
+                let on_update: AgentToolUpdate = {
+                    let tx = tx.clone();
+                    Arc::new(move |partial: AgentToolResult| {
+                        // Best-effort: if the pump has closed (cancel/early exit), drop the
+                        // update rather than panicking — tool authors should treat the
+                        // callback as fire-and-forget.
+                        let _ = tx.send(partial);
+                    })
+                };
+                let exec_result = t.execute(&id, args.clone(), cancel, Some(on_update)).await;
+                // Drop the outer-scope sender so the pump can finish even if the tool kept
+                // its `on_update` Arc alive past the await (rare, but defensive).
+                drop(tx);
+                let _ = pump_handle.await;
+                match exec_result {
+                    Ok(r) => ToolOutcome {
+                        id,
+                        name,
+                        args,
+                        result: r,
+                        is_error: false,
                     },
-                    is_error: true,
-                },
-            },
+                    Err(e) => ToolOutcome {
+                        id,
+                        name,
+                        args,
+                        result: AgentToolResult {
+                            content: vec![UserContentBlock::text(format!("{e}"))],
+                            details: serde_json::Value::Null,
+                            terminate: None,
+                        },
+                        is_error: true,
+                    },
+                }
+            }
             None => ToolOutcome {
                 id,
                 name: name.clone(),

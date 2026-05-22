@@ -157,6 +157,31 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
   long / separated / mixed flag combination, leading-path `/bin/rm`, pipelined `rm`,
   and 8 quoted/`${HOME}` operand shapes) plus 4 near-miss cases verifying the classifier
   does not over-block (e.g. `rm -r` alone, `rm -f` alone, relative-path `rm -rf ./build`).
+- **#39 (PR-B)** `AgentTool::prepare_arguments` is now actually invoked. The agent loop
+  used to dispatch `t.execute(raw_args, ...)` straight from the assistant tool call,
+  so tools relying on the documented "raw tool-call arguments compatibility shim"
+  silently got the unnormalized payload. `execute_tools` now resolves the matched tool
+  before constructing the call site, runs `prepare_arguments` once, and threads the
+  result through both the `before_tool_call` hook (on `ctx.args` and
+  `ctx.tool_call.arguments`) and `execute()`. When `prepare_arguments` returns a
+  non-Object shape we clear `ctx.tool_call.arguments` to an empty map so hook authors
+  have a single truthy source. Unknown tools keep raw args so the dispatcher's
+  "no such tool" error message still references what the model sent. New
+  `prepare_arguments_normalizes_args_for_hook_and_execute` integration test pins
+  the contract with a tool whose `prepare_arguments` upper-cases a field.
+- **#39 (PR-B)** `AgentToolUpdate` callbacks now flow through to subscribers as
+  `AgentEvent::ToolExecutionUpdate`. Previously `run_one()` always passed `None` for
+  the update callback, so the event variant was unreachable even though the type
+  was public. The new wiring builds a per-tool-call `mpsc::unbounded_channel` and
+  spawns a pump task that emits each `partial_result` as a `ToolExecutionUpdate` in
+  send order; the sync callback never blocks (just enqueues). The channel and pump
+  are torn down when `execute()` returns; if the tool misbehaves and retains the
+  `Arc<on_update>` past return, a 2-second pump-join timeout + `abort()` caps the
+  shutdown so the agent loop cannot hang. `AgentTool::execute` rustdoc spells out
+  the contract: do not retain `on_update` past return. Two new integration tests
+  (`tool_execution_update_callback_emits_listener_events_in_order` and
+  `run_one_does_not_hang_when_tool_retains_on_update_past_return`) pin delivery order,
+  `tool_call_id` correlation, and the hang-bound respectively.
 - **#18** Biased select against stream stalls so Ctrl-C unblocks the in-flight prompt
   within 500ms regardless of LLM stream state.
 - **#19** `AgentHarness` compaction now sources entries from the real session jsonl

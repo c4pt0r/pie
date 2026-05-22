@@ -403,3 +403,217 @@ async fn parallel_tools_execute_concurrently() {
         elapsed
     );
 }
+
+#[tokio::test]
+async fn prepare_arguments_normalizes_args_for_hook_and_execute() {
+    use pie_agent_core::{BeforeToolCallContext, BeforeToolCallResult};
+
+    let mut raw = serde_json::Map::new();
+    raw.insert("payload".into(), serde_json::json!("hello"));
+    let responses = Arc::new(Mutex::new(vec![
+        assistant_with(
+            vec![ContentBlock::ToolCall(ToolCall {
+                id: "call_1".into(),
+                name: "uppercaser".into(),
+                arguments: raw,
+                thought_signature: None,
+            })],
+            StopReason::ToolUse,
+        ),
+        assistant_with(vec![ContentBlock::text("done")], StopReason::Stop),
+    ]));
+
+    /// Tool whose `prepare_arguments` upper-cases `payload`. If the agent loop forgot to
+    /// invoke `prepare_arguments`, both the hook and execute paths would see "hello".
+    struct UppercaserTool {
+        def: pie_ai::Tool,
+        execute_args: Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+    }
+    #[async_trait::async_trait]
+    impl pie_agent_core::AgentTool for UppercaserTool {
+        fn definition(&self) -> &pie_ai::Tool {
+            &self.def
+        }
+        fn label(&self) -> &str {
+            "uppercaser"
+        }
+        fn prepare_arguments(&self, args: serde_json::Value) -> serde_json::Value {
+            let mut map = args.as_object().cloned().unwrap_or_default();
+            if let Some(v) = map.get("payload").and_then(|v| v.as_str()) {
+                map.insert(
+                    "payload".into(),
+                    serde_json::Value::String(v.to_uppercase()),
+                );
+            }
+            serde_json::Value::Object(map)
+        }
+        async fn execute(
+            &self,
+            _id: &str,
+            params: serde_json::Value,
+            _cancel: CancellationToken,
+            _on_update: Option<pie_agent_core::AgentToolUpdate>,
+        ) -> Result<pie_agent_core::AgentToolResult, pie_agent_core::AgentToolError> {
+            *self.execute_args.lock().unwrap() = Some(params);
+            Ok(pie_agent_core::AgentToolResult::default())
+        }
+    }
+
+    let hook_args = Arc::new(std::sync::Mutex::new(None));
+    let execute_args = Arc::new(std::sync::Mutex::new(None));
+
+    let tool = Arc::new(UppercaserTool {
+        def: pie_ai::Tool {
+            name: "uppercaser".into(),
+            description: "uppercase payload".into(),
+            parameters: serde_json::json!({ "type": "object" }),
+        },
+        execute_args: execute_args.clone(),
+    });
+
+    let hook_sink = hook_args.clone();
+    let observing_hook: pie_agent_core::BeforeToolCallHook = Arc::new(
+        move |ctx: BeforeToolCallContext, _cancel: CancellationToken| {
+            let sink = hook_sink.clone();
+            Box::pin(async move {
+                *sink.lock().unwrap() = Some(ctx.args);
+                BeforeToolCallResult::default()
+            })
+        },
+    );
+
+    let mut state = pie_agent_core::AgentState::default();
+    state.model = Some(faux_model());
+    state.tools = vec![tool];
+
+    let agent = Agent::new(AgentOptions {
+        initial_state: Some(state),
+        stream_fn: Some(faux_stream_fn_with(responses)),
+        before_tool_call: Some(observing_hook),
+        ..Default::default()
+    });
+
+    let user = AgentMessage::Llm(pie_ai::Message::User(pie_ai::UserMessage {
+        role: pie_ai::UserRole::User,
+        content: pie_ai::UserContent::Text("go".into()),
+        timestamp: 0,
+    }));
+    agent.prompt(user).await.unwrap();
+
+    let hook_seen = hook_args.lock().unwrap().clone().expect("hook fired");
+    let exec_seen = execute_args.lock().unwrap().clone().expect("execute ran");
+    assert_eq!(
+        hook_seen.get("payload").and_then(|v| v.as_str()),
+        Some("HELLO"),
+        "before_tool_call hook must see prepared args, got {hook_seen:?}"
+    );
+    assert_eq!(
+        exec_seen.get("payload").and_then(|v| v.as_str()),
+        Some("HELLO"),
+        "execute() must see prepared args, got {exec_seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn tool_execution_update_callback_emits_listener_events_in_order() {
+    let args = serde_json::Map::new();
+    let responses = Arc::new(Mutex::new(vec![
+        assistant_with(
+            vec![ContentBlock::ToolCall(ToolCall {
+                id: "call_1".into(),
+                name: "progress".into(),
+                arguments: args,
+                thought_signature: None,
+            })],
+            StopReason::ToolUse,
+        ),
+        assistant_with(vec![ContentBlock::text("done")], StopReason::Stop),
+    ]));
+
+    /// Tool that fires three partial updates via `on_update` before returning. Verifies the
+    /// callback Some/None plumbing reaches subscribers as `ToolExecutionUpdate` events.
+    struct ProgressTool {
+        def: pie_ai::Tool,
+    }
+    #[async_trait::async_trait]
+    impl pie_agent_core::AgentTool for ProgressTool {
+        fn definition(&self) -> &pie_ai::Tool {
+            &self.def
+        }
+        fn label(&self) -> &str {
+            "progress"
+        }
+        async fn execute(
+            &self,
+            _id: &str,
+            _params: serde_json::Value,
+            _cancel: CancellationToken,
+            on_update: Option<pie_agent_core::AgentToolUpdate>,
+        ) -> Result<pie_agent_core::AgentToolResult, pie_agent_core::AgentToolError> {
+            let cb = on_update.expect(
+                "agent loop must supply a real on_update callback — previously always None",
+            );
+            for label in ["step-1", "step-2", "step-3"] {
+                cb(pie_agent_core::AgentToolResult {
+                    content: vec![pie_ai::UserContentBlock::text(label.to_string())],
+                    details: serde_json::Value::Null,
+                    terminate: None,
+                });
+            }
+            Ok(pie_agent_core::AgentToolResult::default())
+        }
+    }
+    let tool = Arc::new(ProgressTool {
+        def: pie_ai::Tool {
+            name: "progress".into(),
+            description: "emits partial updates".into(),
+            parameters: serde_json::json!({ "type": "object" }),
+        },
+    });
+
+    let mut state = pie_agent_core::AgentState::default();
+    state.model = Some(faux_model());
+    state.tools = vec![tool];
+
+    let agent = Agent::new(AgentOptions {
+        initial_state: Some(state),
+        stream_fn: Some(faux_stream_fn_with(responses)),
+        ..Default::default()
+    });
+
+    let captured_updates = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+    let sink = captured_updates.clone();
+    let _unsub = agent.subscribe(Arc::new(move |ev, _| {
+        let sink = sink.clone();
+        Box::pin(async move {
+            if let AgentEvent::ToolExecutionUpdate {
+                tool_call_id,
+                partial_result,
+                ..
+            } = ev
+            {
+                if let Some(pie_ai::UserContentBlock::Text(t)) = partial_result.content.first() {
+                    sink.lock().unwrap().push((tool_call_id, t.text.clone()));
+                }
+            }
+        })
+    }));
+
+    let user = AgentMessage::Llm(pie_ai::Message::User(pie_ai::UserMessage {
+        role: pie_ai::UserRole::User,
+        content: pie_ai::UserContent::Text("go".into()),
+        timestamp: 0,
+    }));
+    agent.prompt(user).await.unwrap();
+
+    let updates = captured_updates.lock().unwrap().clone();
+    assert_eq!(
+        updates,
+        vec![
+            ("call_1".to_string(), "step-1".to_string()),
+            ("call_1".to_string(), "step-2".to_string()),
+            ("call_1".to_string(), "step-3".to_string()),
+        ],
+        "ToolExecutionUpdate events must be delivered in send order with the correct tool_call_id"
+    );
+}
