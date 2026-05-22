@@ -15,6 +15,15 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
   `/logout`, `/find`, `/history`.
 - **#25 PR B** `/skill <name>` attaches an already-loaded skill to the next prompt, and
   `/skills` now shows source and `disable_model_invocation` status without printing skill bodies.
+- **#32** Optional bundled `karpathy-guidelines` built-in skill. Off by default; enable
+  per-run with `--builtin-skill karpathy-guidelines` or persistently via
+  `~/.pie/config.toml` `[builtin_skills] enabled = ["karpathy-guidelines"]`. CLI and config
+  inputs are unioned and de-duplicated. Unknown names from `--builtin-skill` hard-fail with
+  the available list; unknown names in config produce a startup diagnostic but never
+  silently enable anything. User and project skills with the same name still win over the
+  built-in. Skill source (verbatim `SKILL.md` from
+  [`multica-ai/andrej-karpathy-skills`](https://github.com/multica-ai/andrej-karpathy-skills))
+  is vendored under `crates/coding-agent/skills/karpathy-guidelines/` with MIT attribution.
 - **#4** Dangerous-bash detector wired through `before_tool_call`. 11-pattern corpus
   (`rm -rf /`, `sudo`, `curl|sh`, etc.) returns deny reason as the synthesized tool result.
 - **#5** `@file` mention injection. Files are read, capped at 64 KiB, prepended to the

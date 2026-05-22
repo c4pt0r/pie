@@ -8,6 +8,7 @@
 mod agent_session;
 mod auth;
 mod bug_report;
+mod builtin_skills;
 mod commands;
 mod config;
 mod export;
@@ -91,6 +92,14 @@ struct Cli {
     /// PNG, JPEG, WebP, GIF. Each image is capped at 10 MiB; max 10 per message.
     #[arg(long = "image", value_name = "PATH")]
     image: Vec<std::path::PathBuf>,
+
+    /// Enable a built-in skill bundled with this `pie` binary, by name. Repeatable. Unknown
+    /// names hard-fail with a list of available built-ins. Built-in skills are the lowest
+    /// precedence — user (`~/.pie/skills/`) and project (`<cwd>/.pie/skills/`) skills of the
+    /// same name still override. Persistent enable is via `~/.pie/config.toml`
+    /// `[builtin_skills] enabled = [...]`; CLI + config are unioned and de-duplicated.
+    #[arg(long = "builtin-skill", value_name = "NAME")]
+    builtin_skill: Vec<String>,
 }
 
 #[tokio::main]
@@ -236,11 +245,38 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
     let loaded_skills = skills::load_all(&cwd).await;
     let loaded_templates = templates::load_all(&cwd).await;
 
+    // Built-in skill resolution (issue #32). The CLI flag `--builtin-skill <name>` is the
+    // one-time enable path; `~/.pie/config.toml [builtin_skills] enabled = [...]` is the
+    // persistent path. Unknown names from the CLI hard-fail with a non-zero exit; unknown
+    // names in the config produce a startup diagnostic but do not block. Both inputs are
+    // unioned and de-duplicated. Built-in skills are appended *first* so the later user /
+    // project layers (already in `loaded_skills.skills`) can shadow on name collision via
+    // the same precedence rule the harness already uses.
+    let config_enabled_builtins = read_builtin_skills_config(&config::base_dir()).await;
+    let resolved_builtins =
+        match builtin_skills::resolve_builtins(&cli.builtin_skill, &config_enabled_builtins) {
+            Ok(r) => r,
+            Err(e) => {
+                // Hard fail on unknown CLI name — non-zero exit with the available list.
+                eprintln!("error: {e}");
+                std::process::exit(2);
+            }
+        };
+    let mut combined_skills = resolved_builtins.skills.clone();
+    for skill in loaded_skills.skills.iter() {
+        if let Some(slot) = combined_skills.iter_mut().find(|s| s.name == skill.name) {
+            // User / project skill of the same name shadows the built-in.
+            *slot = skill.clone();
+        } else {
+            combined_skills.push(skill.clone());
+        }
+    }
+
     let mut opts = AgentHarnessOptions::new(model.clone(), session.clone());
     opts.system_prompt = system_prompt;
     opts.thinking_level = thinking;
     opts.tools = tools;
-    opts.skills = loaded_skills.skills.clone();
+    opts.skills = combined_skills.clone();
     opts.prompt_templates = loaded_templates.templates.clone();
     opts.before_tool_call =
         Some(PermissionPolicy::default_for_coding_agent().as_before_tool_call());
@@ -279,12 +315,18 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
         .clone()
         .unwrap_or_else(|| model.clone());
     tui.banner(&display_model, &session_id, resumed, &tool_names);
-    if !loaded_skills.skills.is_empty() {
+    // Surface built-in skill resolution diagnostics (e.g. unknown names in config). The CLI
+    // hard-fail path returns early before reaching here, so anything we have at this point is
+    // a soft warning. Print one line per diagnostic so the user can see what the config
+    // ignored.
+    for diag in &resolved_builtins.diagnostics {
+        tui.system_line(diag);
+    }
+    if !combined_skills.is_empty() {
         tui.system_line(&format!(
             "loaded {} skill(s): {}",
-            loaded_skills.skills.len(),
-            loaded_skills
-                .skills
+            combined_skills.len(),
+            combined_skills
                 .iter()
                 .map(|s| s.name.as_str())
                 .collect::<Vec<_>>()
@@ -632,4 +674,30 @@ pub fn user_message(text: &str) -> AgentMessage {
         content: pie_ai::UserContent::Text(text.into()),
         timestamp: chrono::Utc::now().timestamp_millis(),
     }))
+}
+
+/// Read the `[builtin_skills] enabled = [...]` list from `<base_dir>/config.toml`. Missing
+/// file, missing section, or parse errors all degrade to an empty list — this is the
+/// "soft fail-closed" path from issue #32: unknown names later produce a startup diagnostic
+/// but never block startup.
+async fn read_builtin_skills_config(base_dir: &std::path::Path) -> Vec<String> {
+    let path = base_dir.join("config.toml");
+    let Ok(text) = tokio::fs::read_to_string(&path).await else {
+        return Vec::new();
+    };
+    let Ok(parsed) = toml::from_str::<BuiltinSkillsConfigFile>(&text) else {
+        return Vec::new();
+    };
+    parsed.builtin_skills.unwrap_or_default().enabled
+}
+
+#[derive(Default, serde::Deserialize)]
+struct BuiltinSkillsConfigFile {
+    builtin_skills: Option<BuiltinSkillsConfigSection>,
+}
+
+#[derive(Default, serde::Deserialize)]
+struct BuiltinSkillsConfigSection {
+    #[serde(default)]
+    enabled: Vec<String>,
 }
