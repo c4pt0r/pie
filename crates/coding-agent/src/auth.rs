@@ -137,6 +137,7 @@ impl AuthStore {
             "groq" => "GROQ_API_KEY",
             "mistral" => "MISTRAL_API_KEY",
             "google" => "GEMINI_API_KEY",
+            "ds4" => "DS4_API_KEY",
             _ => "",
         };
         if !env_var.is_empty() {

@@ -24,6 +24,13 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
   built-in. Skill source (verbatim `SKILL.md` from
   [`multica-ai/andrej-karpathy-skills`](https://github.com/multica-ai/andrej-karpathy-skills))
   is vendored under `crates/coding-agent/skills/karpathy-guidelines/` with MIT attribution.
+- **#37** Local OpenAI-compatible model configs. `pie` now loads
+  `~/.pie/models.json` and `<cwd>/.pie/models.json`, registers those entries through
+  `pie_ai::register_custom_model`, and lets users select them with
+  `--provider <local-provider> --model <model-id>`. This enables local servers such as
+  DS4 (`deepseek-v4-flash` at `http://127.0.0.1:8000/v1`) without adding a one-off
+  provider implementation. Project-local model entries override user-global entries with
+  the same provider/model id.
 - **#4** Dangerous-bash detector wired through `before_tool_call`. 11-pattern corpus
   (`rm -rf /`, `sudo`, `curl|sh`, etc.) returns deny reason as the synthesized tool result.
 - **#5** `@file` mention injection. Files are read, capped at 64 KiB, prepended to the

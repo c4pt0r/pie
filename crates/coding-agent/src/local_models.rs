@@ -1,0 +1,323 @@
+//! Local/custom model definitions loaded by the CLI before model resolution.
+//!
+//! This is intentionally a `coding-agent` concern: `pie-ai` already has the in-process custom
+//! registry, while the CLI owns user/project configuration and user-visible diagnostics.
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use pie_ai::Model;
+use serde::Deserialize;
+
+#[derive(Debug, Clone)]
+pub struct LoadedLocalModels {
+    pub models: Vec<Model>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelsFile {
+    #[serde(default)]
+    models: Vec<Model>,
+}
+
+pub async fn load_all(cwd: &Path) -> Result<LoadedLocalModels> {
+    let paths = [
+        crate::config::base_dir().join("models.json"),
+        cwd.join(".pie").join("models.json"),
+    ];
+    load_all_from_paths(&paths)
+}
+
+pub fn load_all_from_paths(paths: &[PathBuf]) -> Result<LoadedLocalModels> {
+    let mut models = Vec::<Model>::new();
+    for path in paths {
+        if !path.exists() {
+            continue;
+        }
+        let file = load_file(path)?;
+        for model in file.models {
+            if let Some(existing) = models
+                .iter()
+                .position(|m| m.provider == model.provider && m.id == model.id)
+            {
+                models[existing] = model;
+            } else {
+                models.push(model);
+            }
+        }
+    }
+    for model in &models {
+        pie_ai::register_custom_model(model.clone());
+    }
+    Ok(LoadedLocalModels { models })
+}
+
+fn load_file(path: &Path) -> Result<ModelsFile> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let file: ModelsFile =
+        serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+    Ok(file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+    use pie_ai::{
+        AssistantMessageEvent, Context as AiContext, DoneReason, Message, Tool, UserContent,
+        UserMessage, UserRole,
+    };
+    use tempfile::TempDir;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    fn model_json(provider: &str, id: &str, api: &str, base_url: &str) -> String {
+        format!(
+            r#"{{
+  "models": [
+    {{
+      "id": "{id}",
+      "name": "Local {id}",
+      "api": "{api}",
+      "provider": "{provider}",
+      "baseUrl": "{base_url}",
+      "reasoning": true,
+      "input": ["text"],
+      "cost": {{ "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }},
+      "contextWindow": 100000,
+      "maxTokens": 100000,
+      "compat": {{
+        "supportsStore": false,
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": true,
+        "supportsUsageInStreaming": true,
+        "maxTokensField": "max_tokens",
+        "supportsStrictMode": false,
+        "thinkingFormat": "deepseek",
+        "requiresReasoningContentOnAssistantMessages": true
+      }}
+    }}
+  ]
+}}"#
+        )
+    }
+
+    #[test]
+    fn loads_and_registers_custom_model() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("models.json");
+        std::fs::write(
+            &path,
+            model_json(
+                "local-test-register",
+                "deepseek-v4-flash",
+                "openai-responses",
+                "http://127.0.0.1:9999/v1",
+            ),
+        )
+        .unwrap();
+
+        let loaded = load_all_from_paths(&[path]).unwrap();
+        assert_eq!(loaded.models.len(), 1);
+        let resolved = pie_ai::get_model(
+            &pie_ai::Provider::from("local-test-register"),
+            "deepseek-v4-flash",
+        )
+        .unwrap();
+        assert_eq!(resolved.api.0, "openai-responses");
+        pie_ai::unregister_custom_model(
+            &pie_ai::Provider::from("local-test-register"),
+            "deepseek-v4-flash",
+        );
+    }
+
+    #[test]
+    fn project_model_overrides_user_model_with_same_provider_and_id() {
+        let dir = TempDir::new().unwrap();
+        let user = dir.path().join("user.json");
+        let project = dir.path().join("project.json");
+        std::fs::write(
+            &user,
+            model_json(
+                "local-test-override",
+                "same",
+                "openai-completions",
+                "http://127.0.0.1:1/v1",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &project,
+            model_json(
+                "local-test-override",
+                "same",
+                "openai-responses",
+                "http://127.0.0.1:2/v1",
+            ),
+        )
+        .unwrap();
+
+        let loaded = load_all_from_paths(&[user, project]).unwrap();
+        assert_eq!(loaded.models.len(), 1);
+        assert_eq!(loaded.models[0].api.0, "openai-responses");
+        assert_eq!(loaded.models[0].base_url, "http://127.0.0.1:2/v1");
+        pie_ai::unregister_custom_model(&pie_ai::Provider::from("local-test-override"), "same");
+    }
+
+    #[test]
+    fn malformed_config_fails_closed_without_registering() {
+        let dir = TempDir::new().unwrap();
+        let bad = dir.path().join("bad.json");
+        std::fs::write(&bad, r#"{ "models": [ { "provider": "broken" } ] }"#).unwrap();
+
+        let err = load_all_from_paths(&[bad]).unwrap_err().to_string();
+        assert!(err.contains("parse"));
+        assert!(pie_ai::get_model(&pie_ai::Provider::from("broken"), "").is_none());
+    }
+
+    #[tokio::test]
+    async fn loaded_openai_responses_model_streams_text_from_local_fixture() {
+        let body = r#"data: {"type":"response.created","response":{"id":"resp_test","model":"model","output":[]}}
+
+data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_test","type":"message","status":"in_progress","role":"assistant","content":[]}}
+
+data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"OK"}
+
+data: {"type":"response.output_text.done","output_index":0,"content_index":0,"text":"OK"}
+
+data: {"type":"response.completed","response":{"id":"resp_test","status":"completed","model":"model","output":[{"id":"msg_test","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"OK","annotations":[]}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}
+
+"#;
+        let base_url = serve_once(body).await;
+        let provider = "local-test-text";
+        let id = "text";
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("models.json");
+        std::fs::write(
+            &path,
+            model_json(provider, id, "openai-responses", &base_url),
+        )
+        .unwrap();
+        load_all_from_paths(&[path]).unwrap();
+
+        let model = pie_ai::get_model(&pie_ai::Provider::from(provider), id).unwrap();
+        let mut stream = pie_ai::stream(
+            &model,
+            &context(None),
+            Some(&pie_ai::StreamOptions {
+                api_key: Some("local".into()),
+                max_tokens: Some(8),
+                ..Default::default()
+            }),
+        );
+        let mut text = String::new();
+        while let Some(event) = stream.next().await {
+            match event {
+                AssistantMessageEvent::TextDelta { delta, .. } => text.push_str(&delta),
+                AssistantMessageEvent::Done { .. } => break,
+                AssistantMessageEvent::Error { error, .. } => {
+                    panic!("provider error: {:?}", error.error_message);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(text, "OK");
+        pie_ai::unregister_custom_model(&pie_ai::Provider::from(provider), id);
+    }
+
+    #[tokio::test]
+    async fn loaded_openai_responses_model_streams_tool_call_from_local_fixture() {
+        let body = r#"data: {"type":"response.created","response":{"id":"resp_test","model":"model","output":[]}}
+
+data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_test","type":"function_call","call_id":"call_1","name":"get_weather","arguments":""}}
+
+data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"city\":\"Paris\"}"}
+
+data: {"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\"city\":\"Paris\"}"}
+
+data: {"type":"response.completed","response":{"id":"resp_test","status":"completed","model":"model","output":[{"id":"fc_test","type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{\"city\":\"Paris\"}"}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}
+
+"#;
+        let base_url = serve_once(body).await;
+        let provider = "local-test-tool";
+        let id = "tool";
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("models.json");
+        std::fs::write(
+            &path,
+            model_json(provider, id, "openai-responses", &base_url),
+        )
+        .unwrap();
+        load_all_from_paths(&[path]).unwrap();
+
+        let model = pie_ai::get_model(&pie_ai::Provider::from(provider), id).unwrap();
+        let mut stream = pie_ai::stream(
+            &model,
+            &context(Some(vec![Tool {
+                name: "get_weather".into(),
+                description: "Get weather".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": { "city": { "type": "string" } },
+                    "required": ["city"]
+                }),
+            }])),
+            Some(&pie_ai::StreamOptions {
+                api_key: Some("local".into()),
+                max_tokens: Some(32),
+                ..Default::default()
+            }),
+        );
+        let mut tool_name = None;
+        let mut done_reason = None;
+        while let Some(event) = stream.next().await {
+            match event {
+                AssistantMessageEvent::ToolCallEnd { tool_call, .. } => {
+                    tool_name = Some(tool_call.name);
+                    assert_eq!(
+                        tool_call.arguments.get("city").and_then(|v| v.as_str()),
+                        Some("Paris")
+                    );
+                }
+                AssistantMessageEvent::Done { reason, .. } => {
+                    done_reason = Some(reason);
+                    break;
+                }
+                AssistantMessageEvent::Error { error, .. } => {
+                    panic!("provider error: {:?}", error.error_message);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(tool_name.as_deref(), Some("get_weather"));
+        assert_eq!(done_reason, Some(DoneReason::ToolUse));
+        pie_ai::unregister_custom_model(&pie_ai::Provider::from(provider), id);
+    }
+
+    fn context(tools: Option<Vec<Tool>>) -> AiContext {
+        AiContext {
+            system_prompt: Some("You are terse.".into()),
+            messages: vec![Message::User(UserMessage {
+                role: UserRole::User,
+                content: UserContent::Text("Use the tool or reply OK.".into()),
+                timestamp: 0,
+            })],
+            tools,
+        }
+    }
+
+    async fn serve_once(body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0; 4096];
+            let _ = socket.read(&mut buf).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{body}"
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        format!("http://{addr}/v1")
+    }
+}

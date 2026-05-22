@@ -16,6 +16,7 @@ mod extensions;
 mod history;
 mod hooks;
 mod images;
+mod local_models;
 mod logging;
 mod lsp;
 mod lsp_supervisor;
@@ -192,6 +193,7 @@ async fn delete_session_cmd(repo: &JsonlSessionRepo, id: &str) -> Result<()> {
 }
 
 async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo) -> Result<()> {
+    let local_models = local_models::load_all(&cwd).await?;
     let model = model::auto_detect_model(cli.provider.as_deref(), cli.model.as_deref())?;
     let thinking = parse_thinking(&cli.thinking)?;
 
@@ -310,6 +312,18 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
         .clone()
         .unwrap_or_else(|| model.clone());
     tui.banner(&display_model, &session_id, resumed, &tool_names);
+    if !local_models.models.is_empty() {
+        tui.system_line(&format!(
+            "loaded {} local model(s): {}",
+            local_models.models.len(),
+            local_models
+                .models
+                .iter()
+                .map(|m| format!("{}:{}", m.provider.0, m.id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
     // Surface built-in skill resolution diagnostics (e.g. unknown names in config). The CLI
     // hard-fail path returns early before reaching here, so anything we have at this point is
     // a soft warning. Print one line per diagnostic so the user can see what the config

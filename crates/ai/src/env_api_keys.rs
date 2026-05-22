@@ -19,6 +19,7 @@ const ENTRIES: &[(&str, &[&str])] = &[
     ("vercel-ai-gateway", &["AI_GATEWAY_API_KEY"]),
     ("zai", &["ZAI_API_KEY"]),
     ("deepseek", &["DEEPSEEK_API_KEY"]),
+    ("ds4", &["DS4_API_KEY"]),
     ("fireworks", &["FIREWORKS_API_KEY"]),
     ("together", &["TOGETHER_API_KEY"]),
     ("github-copilot", &["GITHUB_COPILOT_TOKEN"]),
@@ -48,4 +49,12 @@ pub fn env_var_names(provider: &str) -> Vec<&'static str> {
         }
     }
     vec![]
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn ds4_uses_dedicated_local_env_var() {
+        assert_eq!(super::env_var_names("ds4"), vec!["DS4_API_KEY"]);
+    }
 }
