@@ -35,6 +35,9 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
   now lists commands and aliases from the same registry used for dispatch; prefixes such
   as `/thi` complete to `/thinking`, while normal prompts and command arguments are left
   untouched.
+- **#47** CLI help now advertises accepted values for finite-set options. `--thinking`
+  uses clap possible values (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`), so
+  `pie --help` and invalid-value errors both show the supported set.
 - **#4** Dangerous-bash detector wired through `before_tool_call`. 11-pattern corpus
   (`rm -rf /`, `sudo`, `curl|sh`, etc.) returns deny reason as the synthesized tool result.
 - **#5** `@file` mention injection. Files are read, capped at 64 KiB, prepended to the

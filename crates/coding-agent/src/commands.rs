@@ -11,6 +11,10 @@ use async_trait::async_trait;
 use pie_agent_core::{AgentHarness, Skill, ThinkingLevel};
 use pie_ai::{Provider, get_model};
 
+#[cfg_attr(test, allow(dead_code))]
+pub const THINKING_LEVEL_VALUES: [&str; 6] = ["off", "minimal", "low", "medium", "high", "xhigh"];
+pub const THINKING_LEVEL_USAGE: &str = "[off|minimal|low|medium|high|xhigh]";
+
 /// Outcome of running a command. Drives the REPL's next action.
 #[derive(Debug)]
 pub enum CommandOutcome {
@@ -378,7 +382,7 @@ impl SlashCommand for ThinkingCommand {
         "show or set the thinking level"
     }
     fn usage(&self) -> &'static str {
-        "[off|minimal|low|medium|high|xhigh]"
+        THINKING_LEVEL_USAGE
     }
     async fn run(&self, argv: &[String], ctx: &CommandCtx<'_>) -> CommandOutcome {
         if argv.is_empty() {

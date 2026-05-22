@@ -67,7 +67,11 @@ struct Cli {
     #[arg(long)]
     model: Option<String>,
     /// Thinking level (off | minimal | low | medium | high | xhigh).
-    #[arg(long, default_value = "off")]
+    #[arg(
+        long,
+        default_value = "off",
+        value_parser = clap::builder::PossibleValuesParser::new(commands::THINKING_LEVEL_VALUES)
+    )]
     thinking: String,
 
     /// Resume the most recent session for this cwd (or pass --resume-id for a specific one).
