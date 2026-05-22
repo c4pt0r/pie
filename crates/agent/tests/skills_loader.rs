@@ -141,3 +141,79 @@ async fn disable_model_invocation_accepts_both_kebab_and_snake() {
         );
     }
 }
+
+/// Issue #25 PR C: prove the `<skills>` block in the system prompt is fully reconstructable
+/// from disk. A user who closes pie and resumes (or restarts the daemon) must see the same
+/// skill catalog, regardless of when the harness was built. The block is a pure function of
+/// `format_skills_for_system_prompt(loaded_skills)`, so this asserts that two independent
+/// `load_skills` runs against the same tempdir produce byte-identical output.
+#[tokio::test]
+async fn resume_rebuilds_skill_block_byte_identical_from_same_directory() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+
+    // Write three skills into the tempdir so the block has non-trivial ordering.
+    for (name, description, body, disabled) in [
+        ("alpha", "first skill", "alpha body", false),
+        ("beta", "second skill", "beta body", true),
+        ("gamma", "third skill", "gamma body", false),
+    ] {
+        let skill_dir = root.join(name);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let mut frontmatter = format!("name: {name}\ndescription: {description}\n");
+        if disabled {
+            frontmatter.push_str("disable_model_invocation: true\n");
+        }
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("---\n{frontmatter}---\n{body}"),
+        )
+        .unwrap();
+    }
+
+    let env = NativeEnv::new(root.to_string_lossy().to_string());
+
+    // First load (initial session start).
+    let first = load_skills(&env, &[root.to_str().unwrap()], CancellationToken::new()).await;
+    assert!(
+        first.diagnostics.is_empty(),
+        "unexpected diagnostics on first load: {:?}",
+        first.diagnostics
+    );
+    let first_block = format_skills_for_system_prompt(&first.skills);
+
+    // Second load (simulates `--resume` / daemon restart against the same directory).
+    let second = load_skills(&env, &[root.to_str().unwrap()], CancellationToken::new()).await;
+    assert!(
+        second.diagnostics.is_empty(),
+        "unexpected diagnostics on resume load: {:?}",
+        second.diagnostics
+    );
+    let second_block = format_skills_for_system_prompt(&second.skills);
+
+    // Byte-identical reconstruction is the actual acceptance: any divergence (ordering
+    // jitter, frontmatter rewrite, etc.) would cause the resumed session to see a different
+    // system prompt than the original, breaking conversation determinism for the LLM.
+    assert_eq!(
+        first_block, second_block,
+        "skill block diverged across reloads"
+    );
+
+    // Sanity: the block actually contains all three skills in a stable order.
+    assert!(first_block.starts_with("<skills>\n"));
+    assert!(first_block.contains("- name: alpha\n"));
+    assert!(first_block.contains("- name: beta\n"));
+    assert!(first_block.contains("- name: gamma\n"));
+    assert!(first_block.ends_with("</skills>"));
+
+    // disable_model_invocation does not affect the system-prompt block (per issue #25 v3:
+    // the flag is enforced at Skill-tool execute time, not in the catalog rendering). The
+    // block must still list `beta` even though it's disabled.
+    assert!(
+        second
+            .skills
+            .iter()
+            .any(|s| s.name == "beta" && s.disable_model_invocation),
+        "loaded skills must include the disabled beta with disable_model_invocation=true"
+    );
+}

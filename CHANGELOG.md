@@ -90,6 +90,12 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
   RFC 1 (issue #20) trigger audit work. Session-side read failures during compaction now
   emit a `HarnessEvent::Compaction` with a `compaction skipped: ...` summary and leave both
   the session jsonl and agent state untouched rather than crashing.
+- **#25 (PR C)** Regression test (`resume_rebuilds_skill_block_byte_identical_from_same_directory`)
+  asserting that the `<skills>` block in the system prompt is byte-identical across two
+  independent `load_skills` runs against the same skills directory. Resume / daemon restart
+  scenarios must reconstruct the catalog deterministically; the test pins this so future
+  refactors of `load_skills` ordering or `format_skills_for_system_prompt` rendering cannot
+  silently break the resumed system prompt. Test-only PR — no production code change.
 - **#25 (PR A)** Register the `Skill` builtin tool the system prompt already advertises.
   Before this fix the model would call `Skill { name: "..." }` and receive
   `no tool named 'Skill'` because the tool was never wired into `default_tools`. On hit
