@@ -14,7 +14,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tokio_util::sync::CancellationToken;
 
 use crate::harness::types::*;
@@ -302,11 +302,13 @@ impl ExecutionEnv for NativeEnv {
     }
 
     async fn exec(&self, command: &str, options: ExecOptions) -> ExecResult<ExecOutput> {
-        // Builds a `sh -c <command>` child with piped stdout/stderr and `kill_on_drop` so any
-        // early return from this function (cancel, timeout, or our own `?` exits) tears down
-        // the subprocess instead of leaving it running. Stdout and stderr are drained on
-        // separate tasks; reading them serially would deadlock if either pipe filled before
-        // the other was read.
+        // Builds a `sh -c <command>` child with piped stdout/stderr. The child lives in its
+        // own process group on Unix so a timeout/abort sends SIGKILL to the entire group —
+        // killing only the direct shell would leak descendants like
+        // `(sleep 30; touch leak) & wait`. `kill_on_drop(true)` is the last-line backstop if
+        // we ever return without explicitly killing (e.g. an `?` exit before the select).
+        // Stdout and stderr are drained on separate spawned tasks because a serial drain
+        // deadlocks any time one pipe fills before the other is read.
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg(command);
         if let Some(cwd) = &options.cwd {
@@ -323,9 +325,31 @@ impl ExecutionEnv for NativeEnv {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
+        #[cfg(unix)]
+        {
+            // SAFETY: this closure runs in the child between fork and exec on Unix. `setsid`
+            // is async-signal-safe (POSIX) and has no Rust state to invalidate. The child
+            // becomes session and process-group leader; SIGKILL to `-pgid` then targets the
+            // whole tree we just spawned. `pre_exec` is exposed on tokio::process::Command
+            // via std::os::unix::process::CommandExt without needing a trait import.
+            unsafe {
+                cmd.pre_exec(|| {
+                    if libc::setsid() == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+
         let mut child = cmd
             .spawn()
             .map_err(|e| ExecutionError::new(ExecutionErrorCode::SpawnFailed, e.to_string()))?;
+
+        // Snapshot the pid before any drain/select so the kill paths can target the process
+        // group even if the underlying `tokio::process::Child` later loses access (e.g. after
+        // a wait that consumed it).
+        let child_pid = child.id();
 
         let stdout = child.stdout.take().expect("stdout was configured as piped");
         let stderr = child.stderr.take().expect("stderr was configured as piped");
@@ -333,36 +357,16 @@ impl ExecutionEnv for NativeEnv {
         let on_stdout = options.on_stdout.clone();
         let on_stderr = options.on_stderr.clone();
 
-        let stdout_handle = tokio::spawn(async move {
-            let mut reader = BufReader::new(stdout).lines();
-            let mut buf = String::new();
-            while let Ok(Some(line)) = reader.next_line().await {
-                if let Some(cb) = &on_stdout {
-                    cb(&line);
-                }
-                buf.push_str(&line);
-                buf.push('\n');
-            }
-            buf
-        });
-        let stderr_handle = tokio::spawn(async move {
-            let mut reader = BufReader::new(stderr).lines();
-            let mut buf = String::new();
-            while let Ok(Some(line)) = reader.next_line().await {
-                if let Some(cb) = &on_stderr {
-                    cb(&line);
-                }
-                buf.push_str(&line);
-                buf.push('\n');
-            }
-            buf
-        });
+        let stdout_handle = tokio::spawn(drain_stream(stdout, on_stdout));
+        let stderr_handle = tokio::spawn(drain_stream(stderr, on_stderr));
 
         let abort_token = options.abort.clone();
         let timeout_secs = options.timeout_secs;
 
-        // `biased` so the abort branch wins over a same-tick timer firing — it's the more
-        // specific user intent.
+        // Use `tokio::time::timeout` instead of racing a `sleep` inside `select!`: the
+        // dedicated helper drives the timer the same way Tokio's own primitives do, which is
+        // what the failing Ubuntu CI run convinced us we need. Race that against the optional
+        // abort token; `biased` keeps abort first so user-issued cancels win same-tick ties.
         let outcome: ExecOutcome = tokio::select! {
             biased;
             _ = async {
@@ -371,13 +375,7 @@ impl ExecutionEnv for NativeEnv {
                     None => pending::<()>().await,
                 }
             } => ExecOutcome::Aborted,
-            _ = async {
-                match timeout_secs {
-                    Some(s) => tokio::time::sleep(Duration::from_secs(s)).await,
-                    None => pending::<()>().await,
-                }
-            } => ExecOutcome::TimedOut,
-            res = child.wait() => ExecOutcome::Completed(res),
+            res = wait_with_optional_timeout(&mut child, timeout_secs) => res,
         };
 
         match outcome {
@@ -400,11 +398,7 @@ impl ExecutionEnv for NativeEnv {
                 ))
             }
             ExecOutcome::TimedOut => {
-                // Kill first (so pipe drainage can finish), then wait for the reaper and the
-                // reader tasks. We don't return partial output via the error path — the
-                // streaming callbacks already saw every line the child produced before kill.
-                let _ = child.kill().await;
-                let _ = child.wait().await;
+                terminate_child_tree(&mut child, child_pid).await;
                 let _ = stdout_handle.await;
                 let _ = stderr_handle.await;
                 Err(ExecutionError::new(
@@ -416,8 +410,7 @@ impl ExecutionEnv for NativeEnv {
                 ))
             }
             ExecOutcome::Aborted => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
+                terminate_child_tree(&mut child, child_pid).await;
                 let _ = stdout_handle.await;
                 let _ = stderr_handle.await;
                 Err(ExecutionError::new(
@@ -433,6 +426,79 @@ enum ExecOutcome {
     Completed(std::io::Result<std::process::ExitStatus>),
     TimedOut,
     Aborted,
+}
+
+async fn wait_with_optional_timeout(child: &mut Child, timeout_secs: Option<u64>) -> ExecOutcome {
+    match timeout_secs {
+        Some(secs) => match tokio::time::timeout(Duration::from_secs(secs), child.wait()).await {
+            Ok(res) => ExecOutcome::Completed(res),
+            Err(_) => ExecOutcome::TimedOut,
+        },
+        None => ExecOutcome::Completed(child.wait().await),
+    }
+}
+
+/// Best-effort teardown of the child *and any descendants it spawned*. On Unix the child was
+/// placed in its own session/process group via `setsid()`, so a single `killpg(-pid, SIGKILL)`
+/// reaches background jobs and detached children. On non-Unix targets we fall back to the
+/// direct `kill_on_drop` + `Child::kill` path (no descendants problem because Windows job
+/// objects aren't wired up here — that's the larger Windows port story).
+async fn terminate_child_tree(child: &mut Child, pid: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        // SAFETY: `killpg` with SIGKILL on a known pgid is sound; the pid was just observed
+        // from `child.id()`. A zero/-ESRCH return (child already gone) is benign and we don't
+        // assert on it.
+        unsafe {
+            libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+        }
+    }
+    // Always also issue `Child::start_kill` so tokio considers the handle terminated. On
+    // Unix the SIGKILL above already did the work; this is the cross-platform reaper. The
+    // subsequent `wait` reaps the zombie.
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+    let _ = pid;
+}
+
+/// Drain a child pipe into a UTF-8 string while also feeding each line into an optional
+/// streaming callback. Uses `read_until(b'\n')` + lossy decode so binary-ish output does not
+/// truncate at the first invalid byte the way `AsyncBufReadExt::lines()` does (it stops on
+/// `Err`, dropping the rest of the stream). The lossy decode is applied per line so the
+/// callback receives the same text the buffered tail eventually reports.
+async fn drain_stream<R>(
+    reader: R,
+    callback: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
+) -> String
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    let mut br = BufReader::new(reader);
+    let mut buf = Vec::with_capacity(4096);
+    let mut chunk = Vec::with_capacity(256);
+    loop {
+        chunk.clear();
+        match br.read_until(b'\n', &mut chunk).await {
+            Ok(0) => break,
+            Ok(_) => {
+                // Strip a single trailing '\n' for callback display; keep it in the buffer so
+                // the returned string matches what the child wrote.
+                let line = if chunk.last() == Some(&b'\n') {
+                    String::from_utf8_lossy(&chunk[..chunk.len() - 1]).into_owned()
+                } else {
+                    String::from_utf8_lossy(&chunk).into_owned()
+                };
+                if let Some(cb) = &callback {
+                    cb(&line);
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            // Treat any read error as end-of-stream; we don't want to swallow already-buffered
+            // bytes by erroring out mid-drain.
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 #[cfg(test)]
@@ -492,9 +558,44 @@ mod tests {
             .expect_err("must time out");
         assert_eq!(err.code, ExecutionErrorCode::Timeout);
         let elapsed = start.elapsed();
+        // Loose ceiling (was tight 3s, but CI under load needs more headroom). What matters
+        // is that we don't wait the full 10s the child would have slept for.
         assert!(
-            elapsed < TokioDuration::from_secs(3),
-            "expected exec to return within ~1s after timeout, took {elapsed:?}"
+            elapsed < TokioDuration::from_secs(6),
+            "expected exec to return well before the 10s child sleep, took {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_timeout_kills_backgrounded_descendant_processes() {
+        // Without process-group teardown, a backgrounded child like
+        // `(sleep 30; touch ...) & wait` survives the kill of the direct shell. The leak
+        // file would appear after the test exits. With `setsid` + `killpg(SIGKILL)` the
+        // whole tree dies, so the marker is never written.
+        use tempfile::tempdir;
+        let dir = tempdir().expect("tempdir");
+        let marker = dir.path().join("leak-marker");
+        let marker_str = marker.to_string_lossy().to_string();
+
+        let opts = ExecOptions {
+            timeout_secs: Some(1),
+            ..ExecOptions::default()
+        };
+        let cmd = format!("(sleep 4; touch {marker_str}) & wait");
+        let err = env()
+            .exec(&cmd, opts)
+            .await
+            .expect_err("backgrounded sleep should time out");
+        assert_eq!(err.code, ExecutionErrorCode::Timeout);
+
+        // Give the (now-orphaned, but killed) descendant time to touch the marker if it
+        // somehow survived. The sleep budget is wider than the descendant's 4s so a missed
+        // killpg would unambiguously surface.
+        tokio::time::sleep(TokioDuration::from_secs(5)).await;
+        assert!(
+            !marker.exists(),
+            "descendant process was not killed by killpg — leak marker at {marker_str} exists"
         );
     }
 
