@@ -82,10 +82,18 @@ mod tests {
       "provider": "{provider}",
       "baseUrl": "{base_url}",
       "reasoning": true,
+      "thinkingLevelMap": {{
+        "off": null,
+        "minimal": "low",
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "xhigh"
+      }},
       "input": ["text"],
       "cost": {{ "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }},
       "contextWindow": 100000,
-      "maxTokens": 100000,
+      "maxTokens": 384000,
       "compat": {{
         "supportsStore": false,
         "supportsDeveloperRole": false,

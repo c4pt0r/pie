@@ -35,11 +35,14 @@ You can also store a key from inside `pie`:
 `~/.pie/models.json` (user-global) or `<project>/.pie/models.json` (project-local, higher
 precedence), then select it with `--provider` and `--model`.
 
-Example for [DS4](https://github.com/c4pt0r/ds4)-style local servers:
+Example for [DS4](https://github.com/antirez/ds4), the DeepSeek V4 Flash local
+server. The Responses endpoint is the preferred OpenAI-compatible API for
+Codex-style clients; chat completions also works for simpler integrations.
 
 ```bash
 # In the DS4 checkout:
 ./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
+# If launching from another directory, add: --chdir /path/to/ds4
 ```
 
 ```json
@@ -52,10 +55,18 @@ Example for [DS4](https://github.com/c4pt0r/ds4)-style local servers:
       "provider": "ds4",
       "baseUrl": "http://127.0.0.1:8000/v1",
       "reasoning": true,
+      "thinkingLevelMap": {
+        "off": null,
+        "minimal": "low",
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "xhigh"
+      },
       "input": ["text"],
       "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
       "contextWindow": 100000,
-      "maxTokens": 100000,
+      "maxTokens": 384000,
       "compat": {
         "supportsStore": false,
         "supportsDeveloperRole": false,
