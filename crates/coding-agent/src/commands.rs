@@ -1,14 +1,14 @@
 //! Slash-command registry. Tracks a small set of REPL builtins and dispatches by name.
 //!
-//! Built-in commands today: `/help`, `/clear`, `/skills`, `/quit` (and aliases), `/model`,
-//! `/thinking`. The trait is shaped so future extensions (issue #10 Part B) can register
-//! additional commands without touching this file.
+//! Built-in commands today: `/help`, `/clear`, `/skills`, `/skill`, `/quit` (and aliases),
+//! `/model`, `/thinking`. The trait is shaped so future extensions (issue #10 Part B) can
+//! register additional commands without touching this file.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use pie_agent_core::{AgentHarness, ThinkingLevel};
+use pie_agent_core::{AgentHarness, Skill, ThinkingLevel};
 use pie_ai::{Provider, get_model};
 
 /// Outcome of running a command. Drives the REPL's next action.
@@ -22,6 +22,9 @@ pub enum CommandOutcome {
     ClearScreen,
     /// Command surfaced an error message; REPL renders it via `tui.error_line`.
     Error(String),
+    /// Attach the named skill to the next user prompt. The REPL owns prompt assembly, so this
+    /// stays explicit instead of going through the agent steering queue.
+    AttachSkill { name: String },
 }
 
 /// Context handed to a command at runtime. Kept narrow so each command's dependencies are
@@ -67,6 +70,7 @@ impl Registry {
         r.register(Arc::new(HelpCommand));
         r.register(Arc::new(ClearCommand));
         r.register(Arc::new(SkillsCommand));
+        r.register(Arc::new(SkillCommand));
         r.register(Arc::new(QuitCommand));
         r.register(Arc::new(ModelCommand));
         r.register(Arc::new(ThinkingCommand));
@@ -196,14 +200,101 @@ impl SlashCommand for SkillsCommand {
         } else {
             println!("Loaded skills ({}):", skills.len());
             for s in &skills {
-                println!("  - {}  ({})", s.name, s.file_path);
+                let disabled = if s.disable_model_invocation {
+                    "  [disabled: disable_model_invocation=true]"
+                } else {
+                    ""
+                };
+                println!(
+                    "  - {}  ({}){}",
+                    s.name,
+                    skill_source_label(s, ctx.cwd),
+                    disabled
+                );
                 if !s.description.is_empty() {
                     println!("      {}", s.description);
                 }
+                println!("      path: {}", s.file_path);
             }
         }
         CommandOutcome::Handled
     }
+}
+
+struct SkillCommand;
+
+#[async_trait]
+impl SlashCommand for SkillCommand {
+    fn name(&self) -> &'static str {
+        "skill"
+    }
+    fn description(&self) -> &'static str {
+        "attach a loaded skill to the next prompt"
+    }
+    fn usage(&self) -> &'static str {
+        "<name>"
+    }
+    async fn run(&self, argv: &[String], ctx: &CommandCtx<'_>) -> CommandOutcome {
+        if argv.len() != 1 {
+            return CommandOutcome::Error("usage: /skill <name>".into());
+        }
+        let name = &argv[0];
+        let skills = ctx.harness.skills();
+        let Some(skill) = skills.iter().find(|s| s.name == *name) else {
+            let mut matches = skills
+                .iter()
+                .filter(|s| s.name.starts_with(name))
+                .map(|s| s.name.as_str())
+                .take(5)
+                .collect::<Vec<_>>();
+            if matches.is_empty() {
+                matches = skills
+                    .iter()
+                    .filter(|s| s.name.contains(name))
+                    .map(|s| s.name.as_str())
+                    .take(5)
+                    .collect::<Vec<_>>();
+            }
+            let hint = if matches.is_empty() {
+                "".to_string()
+            } else {
+                format!(" Did you mean: {}?", matches.join(", "))
+            };
+            return CommandOutcome::Error(format!(
+                "no skill named '{name}'. Run /skills to list loaded skills.{hint}"
+            ));
+        };
+        if skill.disable_model_invocation {
+            return CommandOutcome::Error(format!(
+                "skill '{name}' is disabled (disable_model_invocation=true); edit the skill frontmatter to enable it"
+            ));
+        }
+        println!("attached skill: {name} for next turn");
+        CommandOutcome::AttachSkill { name: name.clone() }
+    }
+}
+
+fn skill_source_label(skill: &Skill, cwd: &std::path::Path) -> String {
+    let path = std::path::Path::new(&skill.file_path);
+    if path.starts_with(cwd.join(".pie").join("skills")) {
+        "project".into()
+    } else if skill.file_path.contains("/.pie/skills/")
+        || skill.file_path.contains("/.pie/skills\\")
+    {
+        "user".into()
+    } else {
+        "source path".into()
+    }
+}
+
+pub fn attach_skill_prompt(text: impl Into<String>, skill_name: Option<&str>) -> String {
+    let text = text.into();
+    let Some(skill_name) = skill_name else {
+        return text;
+    };
+    format!(
+        "Before answering, invoke the Skill tool with name \"{skill_name}\" and use that skill's instructions for this turn.\n\nUser request:\n{text}"
+    )
 }
 
 struct QuitCommand;

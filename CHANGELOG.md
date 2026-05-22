@@ -9,10 +9,12 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
 
 - **#2** Mid-stream Ctrl-C abort with double-Ctrl-C exit. Biased select against stalled
   streams (closes #18).
-- **#3** Slash-command registry with 20 builtins: `/help`, `/clear`, `/skills`, `/quit`
-  (+ `/exit`, `/q`), `/model`, `/thinking`, `/cost`, `/diag`, `/template`, `/save`,
-  `/compact`, `/undo`, `/bug-report`, `/name`, `/sessions`, `/share`, `/login`, `/logout`,
-  `/find`.
+- **#3** Slash-command registry with 21 builtins: `/help`, `/clear`, `/skills`, `/skill`,
+  `/quit` (+ `/exit`, `/q`), `/model`, `/thinking`, `/cost`, `/diag`, `/template`,
+  `/save`, `/compact`, `/undo`, `/bug-report`, `/name`, `/sessions`, `/share`, `/login`,
+  `/logout`, `/find`.
+- **#25 PR B** `/skill <name>` attaches an already-loaded skill to the next prompt, and
+  `/skills` now shows source and `disable_model_invocation` status without printing skill bodies.
 - **#4** Dangerous-bash detector wired through `before_tool_call`. 11-pattern corpus
   (`rm -rf /`, `sudo`, `curl|sh`, etc.) returns deny reason as the synthesized tool result.
 - **#5** `@file` mention injection. Files are read, capped at 64 KiB, prepended to the

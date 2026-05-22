@@ -356,6 +356,7 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
     // Persistent input history (issue #2). Loaded once at startup; each successful prompt
     // submission appends + persists.
     let mut history = history::HistoryStore::load();
+    let mut pending_skill: Option<String> = None;
 
     // Use rustyline for the readline phase — gives us proper unicode-width-aware editing
     // (CJK chars correctly consume one logical character per backspace), ↑/↓ recall,
@@ -448,6 +449,9 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
                 commands::CommandOutcome::Error(e) => {
                     tui.error_line(&e);
                 }
+                commands::CommandOutcome::AttachSkill { name } => {
+                    pending_skill = Some(name);
+                }
                 commands::CommandOutcome::Handled => {}
             }
             continue;
@@ -456,6 +460,7 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
         // Expand `@file` mentions before sending. The original `@path` token stays in the
         // user's text; the file content is prepended in a small attachment block.
         let (expanded, _resolved) = mentions::expand(input, &cwd).await;
+        let prompt_text = commands::attach_skill_prompt(expanded, pending_skill.take().as_deref());
 
         // Attach `--image` payloads to the first prompt only (issue #16 first slice).
         // Subsequent prompts in the same session can mention files via @path or re-launch
@@ -505,9 +510,11 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
         // describe-this-image flow.
         let prompt_fut = async {
             if has_images {
-                harness.prompt_with_images(expanded, pending_images).await
+                harness
+                    .prompt_with_images(prompt_text, pending_images)
+                    .await
             } else {
-                session_runner.prompt(expanded).await
+                session_runner.prompt(prompt_text).await
             }
         };
         tokio::pin!(prompt_fut);

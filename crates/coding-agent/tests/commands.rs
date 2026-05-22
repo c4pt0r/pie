@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use pie_agent_core::{
     AgentHarness, AgentHarnessOptions, MemorySessionStorage, Session, SessionStorage,
-    SessionTreeEntry, ThinkingLevel,
+    SessionTreeEntry, Skill, ThinkingLevel,
 };
 
 // The binary crate doesn't expose `commands` — pull it in via path-include so this test
@@ -51,6 +51,16 @@ fn faux_model() -> pie_ai::Model {
         max_tokens: 0,
         headers: None,
         compat: None,
+    }
+}
+
+fn skill(name: &str, content: &str, disabled: bool) -> Skill {
+    Skill {
+        name: name.into(),
+        description: format!("description for {name}"),
+        file_path: format!("/tmp/project/.pie/skills/{name}/SKILL.md"),
+        content: content.into(),
+        disable_model_invocation: disabled,
     }
 }
 
@@ -230,6 +240,98 @@ async fn dispatch_quit_returns_quit_outcome() {
             matches!(outcome, commands::CommandOutcome::Quit),
             "{input} should map to Quit"
         );
+    }
+}
+
+#[tokio::test]
+async fn dispatch_skill_attaches_loaded_skill_without_exposing_body() {
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage as Arc<dyn SessionStorage>);
+    let mut opts = AgentHarnessOptions::new(faux_model(), session);
+    opts.skills = vec![skill("review-pr", "SECRET SKILL BODY", false)];
+    let harness = Arc::new(AgentHarness::new(opts));
+
+    let registry = commands::Registry::with_builtins();
+    let cwd = std::env::current_dir().unwrap();
+    let ctx = commands::CommandCtx {
+        harness: &harness,
+        session_id: "test",
+        log_path: None,
+        tool_count: 0,
+        cwd: &cwd,
+    };
+
+    let outcome = commands::dispatch("/skill review-pr", &registry, &ctx).await;
+    match outcome {
+        commands::CommandOutcome::AttachSkill { name } => assert_eq!(name, "review-pr"),
+        other => panic!("expected AttachSkill outcome, got {other:?}"),
+    }
+
+    let prompt = commands::attach_skill_prompt("summarize the diff", Some("review-pr"));
+    assert!(prompt.contains("Skill tool"));
+    assert!(prompt.contains("review-pr"));
+    assert!(prompt.contains("summarize the diff"));
+    assert!(
+        !prompt.contains("SECRET SKILL BODY"),
+        "slash command must not inline skill body into the user-visible prompt"
+    );
+}
+
+#[tokio::test]
+async fn dispatch_skill_refuses_disabled_skill() {
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage as Arc<dyn SessionStorage>);
+    let mut opts = AgentHarnessOptions::new(faux_model(), session);
+    opts.skills = vec![skill("disabled-skill", "SECRET SKILL BODY", true)];
+    let harness = Arc::new(AgentHarness::new(opts));
+
+    let registry = commands::Registry::with_builtins();
+    let cwd = std::env::current_dir().unwrap();
+    let ctx = commands::CommandCtx {
+        harness: &harness,
+        session_id: "test",
+        log_path: None,
+        tool_count: 0,
+        cwd: &cwd,
+    };
+
+    let outcome = commands::dispatch("/skill disabled-skill", &registry, &ctx).await;
+    match outcome {
+        commands::CommandOutcome::Error(msg) => {
+            assert!(msg.contains("disabled-skill"));
+            assert!(msg.contains("disable_model_invocation=true"));
+            assert!(!msg.contains("SECRET SKILL BODY"));
+        }
+        other => panic!("expected Error outcome, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn dispatch_skill_unknown_name_suggests_prefix_matches() {
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage as Arc<dyn SessionStorage>);
+    let mut opts = AgentHarnessOptions::new(faux_model(), session);
+    opts.skills = vec![skill("review-pr", "SECRET SKILL BODY", false)];
+    let harness = Arc::new(AgentHarness::new(opts));
+
+    let registry = commands::Registry::with_builtins();
+    let cwd = std::env::current_dir().unwrap();
+    let ctx = commands::CommandCtx {
+        harness: &harness,
+        session_id: "test",
+        log_path: None,
+        tool_count: 0,
+        cwd: &cwd,
+    };
+
+    let outcome = commands::dispatch("/skill rev", &registry, &ctx).await;
+    match outcome {
+        commands::CommandOutcome::Error(msg) => {
+            assert!(msg.contains("no skill named 'rev'"));
+            assert!(msg.contains("Did you mean: review-pr"));
+            assert!(!msg.contains("SECRET SKILL BODY"));
+        }
+        other => panic!("expected Error outcome, got {other:?}"),
     }
 }
 
