@@ -104,3 +104,40 @@ async fn system_prompt_block_lists_each_skill() {
     assert!(block.contains("- name: beta"));
     assert!(block.ends_with("</skills>"));
 }
+
+#[tokio::test]
+async fn disable_model_invocation_accepts_both_kebab_and_snake() {
+    // Issue #25 PR A locks in `disable_model_invocation=true` as the contract refused by the
+    // `Skill` builtin tool. The frontmatter accepts both `disable-model-invocation` (the
+    // existing kebab-case key) AND `disable_model_invocation` (the snake-case spelling used
+    // in the issue body, the PR description, and the `Skill` tool's error message). Users
+    // following either spelling must end up with `Skill.disable_model_invocation = true`.
+    for (label, frontmatter_key) in [
+        ("kebab", "disable-model-invocation"),
+        ("snake", "disable_model_invocation"),
+    ] {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let skill_dir = root.join("locked");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!(
+                "---\nname: locked\ndescription: refuses model invocation\n{frontmatter_key}: true\n---\nBody body."
+            ),
+        )
+        .unwrap();
+        let env = NativeEnv::new(root.to_string_lossy().to_string());
+        let out = load_skills(&env, &[root.to_str().unwrap()], CancellationToken::new()).await;
+        assert!(
+            out.diagnostics.is_empty(),
+            "[{label}] unexpected diagnostics: {:?}",
+            out.diagnostics
+        );
+        assert_eq!(out.skills.len(), 1, "[{label}] expected one skill");
+        assert!(
+            out.skills[0].disable_model_invocation,
+            "[{label}] frontmatter key {frontmatter_key} must set disable_model_invocation=true"
+        );
+    }
+}

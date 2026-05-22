@@ -251,11 +251,21 @@ pub struct Skill {
 }
 
 /// Frontmatter shape parsed off the `SKILL.md` head.
+///
+/// `disable-model-invocation` is the canonical YAML key (kebab-case, matching the existing
+/// frontmatter style). Issue #25 v3 documentation and the `Skill` builtin tool also surface
+/// this flag using `disable_model_invocation` (snake_case) — to make sure users following
+/// either spelling get the safety enforcement they asked for, both forms are accepted at
+/// parse time via `serde(alias = ...)`.
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct SkillFrontmatter {
     pub name: Option<String>,
     pub description: Option<String>,
-    #[serde(default, rename = "disable-model-invocation")]
+    #[serde(
+        default,
+        rename = "disable-model-invocation",
+        alias = "disable_model_invocation"
+    )]
     pub disable_model_invocation: bool,
 }
 
