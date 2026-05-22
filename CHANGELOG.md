@@ -92,6 +92,21 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
   only — no agent loop entrypoint yet**; the supervisor + state machine wiring + the
   `AgentHarness::handle_trigger` API land in a follow-up PR. Adapter authors (MCP read
   pump, Cloudflare hub WebSocket hook) can build against the trait in parallel.
+- **#20 (dedup + cycle engine)** Pure-logic `TriggerRuntime` evaluator that decides
+  whether an incoming `Trigger` should be admitted, deduplicated against a prior trigger
+  within a configurable window, or suppressed because its trace chain has exceeded the
+  follow-up hop limit. `TriggerRuntimeConfig { dedup_window, cycle_hop_limit }` defaults
+  to a 5-minute dedup window (clamped to 24h) and 5 hops. `evaluate(&Trigger)` returns
+  `EvaluationOutcome::Accept`, `Deduped { replacement_policy, previous_trace_id }`
+  (carrying the first arrival's `ReplacementPolicy` so callers can implement
+  `LatestReplaces` / `Coalesce` / `Drop` uniformly), or `CycleSuppressed { hop_count }`.
+  Harness-spawned follow-up triggers bump the same trace chain via
+  `record_follow_up_hop(trace_id, now)` so the cycle counter is monotonic across the
+  whole reaction graph. Dedup keys derive from `(source_kind, source_id, dedup_key)`
+  when set, falling back to a deterministic content hash otherwise. **Pure logic — no
+  I/O, no session writes, no harness wiring yet**; the `AgentHarness::handle_trigger`
+  entrypoint that consumes this evaluator and persists the audit `Custom` entry lands
+  in sub-PR 2.
 
 ### Fixed
 

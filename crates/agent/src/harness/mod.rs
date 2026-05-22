@@ -13,6 +13,7 @@ pub mod session;
 pub mod skills;
 pub mod system_prompt;
 pub mod trigger;
+pub mod trigger_runtime;
 pub mod types;
 pub mod utils;
 

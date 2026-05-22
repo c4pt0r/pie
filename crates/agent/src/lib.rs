@@ -68,6 +68,7 @@ pub use harness::{
         CredentialScope, PayloadVisibility, ReplacementPolicy, SourceKind, Trigger,
         TriggerAuthority, TriggerRecord, TriggerSource, TriggerState,
     },
+    trigger_runtime::{EvaluationOutcome, TriggerRuntime, TriggerRuntimeConfig},
     types::{
         ExecOptions, ExecOutput, ExecResult, ExecutionEnv, ExecutionError, ExecutionErrorCode,
         FileError, FileErrorCode, FileInfo, FileKind, FsResult, PromptTemplate, SessionError,
