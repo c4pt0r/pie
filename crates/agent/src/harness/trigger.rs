@@ -145,8 +145,8 @@ pub enum CredentialScope {
 /// `deduped` / `cycle_suppressed` / `permission_denied` / `needs_approval` / `running` /
 /// `failed` / `completed` set from RFC 1 §2.7.
 ///
-/// `received` and `running` are transitional; the rest are terminal for the purposes of
-/// `TriggerRecord.state`.
+/// `received`, `accepted`, and `running` are transitional; the rest are terminal for the
+/// purposes of `TriggerRecord.state`. See [`Self::is_terminal`] for the canonical predicate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TriggerState {
