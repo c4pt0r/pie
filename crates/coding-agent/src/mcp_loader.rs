@@ -63,25 +63,50 @@ pub async fn load_all(cwd: &Path) -> LoadedMcp {
         }
     }
 
+    let (tools, notification_hooks, connect_diagnostics, client_count) =
+        connect_all(&configs).await;
+    diagnostics.extend(connect_diagnostics);
+    LoadedMcp {
+        tools,
+        diagnostics,
+        client_count,
+        notification_hooks,
+    }
+}
+
+/// Connect to each configured server. Returns the tools collected, the
+/// `McpNotificationHook` per successful connection, per-server failure diagnostics, and
+/// the number of servers that actually connected.
+///
+/// `client_count` reports **successful** connections, not attempted ones. The TUI startup
+/// banner prints "connected to N server(s)" using this field; previously it reported
+/// `configs.len()`, so the user saw "connected to 3" alongside two error diagnostics when
+/// 2 of 3 servers failed to start. See code-review item #9 (2026-05-22).
+async fn connect_all(
+    configs: &[ServerConfig],
+) -> (
+    Vec<Arc<dyn AgentTool>>,
+    Vec<Arc<McpNotificationHook>>,
+    Vec<String>,
+    usize,
+) {
     let mut tools: Vec<Arc<dyn AgentTool>> = Vec::new();
     let mut notification_hooks: Vec<Arc<McpNotificationHook>> = Vec::new();
+    let mut diagnostics: Vec<String> = Vec::new();
+    let mut client_count = 0usize;
     for s in configs.iter() {
         match connect_one(s).await {
             Ok((server_tools, hook)) => {
                 tools.extend(server_tools);
                 notification_hooks.push(hook);
+                client_count += 1;
             }
             Err(e) => {
                 diagnostics.push(format!("mcp server '{}' failed: {e}", s.name));
             }
         }
     }
-    LoadedMcp {
-        tools,
-        diagnostics,
-        client_count: configs.len(),
-        notification_hooks,
-    }
+    (tools, notification_hooks, diagnostics, client_count)
 }
 
 async fn read_config(path: &Path, diagnostics: &mut Vec<String>, label: &str) -> Option<McpConfig> {
@@ -134,4 +159,59 @@ async fn connect_one(
         out.push(Arc::new(adapter));
     }
     Ok((out, hook))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two configured servers both fail to start (executable does not exist). Verify
+    /// `client_count` reports 0 (not 2), and each failure surfaces a diagnostic. Pinned
+    /// behavior for code-review item #9: the TUI startup banner reads from this field.
+    #[tokio::test]
+    async fn client_count_reflects_successful_connections_not_attempts() {
+        let configs = vec![
+            ServerConfig {
+                name: "broken-a".into(),
+                command: "/definitely/not/a/real/path/for/mcp/test-a".into(),
+                args: vec![],
+            },
+            ServerConfig {
+                name: "broken-b".into(),
+                command: "/definitely/not/a/real/path/for/mcp/test-b".into(),
+                args: vec![],
+            },
+        ];
+        let (tools, hooks, diagnostics, client_count) = connect_all(&configs).await;
+        assert_eq!(client_count, 0, "no server should be reported as connected");
+        assert!(tools.is_empty(), "no tools should load from failed servers");
+        assert!(
+            hooks.is_empty(),
+            "no notification hooks should be created for failed servers"
+        );
+        assert_eq!(
+            diagnostics.len(),
+            2,
+            "each failed server should emit a diagnostic, got: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics.iter().any(|d| d.contains("broken-a")),
+            "diagnostic should mention server name 'broken-a': {diagnostics:?}"
+        );
+        assert!(
+            diagnostics.iter().any(|d| d.contains("broken-b")),
+            "diagnostic should mention server name 'broken-b': {diagnostics:?}"
+        );
+    }
+
+    /// Empty config list ⇒ zero attempts, zero connections, zero diagnostics. Sanity check
+    /// the helper doesn't crash on the empty path.
+    #[tokio::test]
+    async fn empty_configs_reports_zero() {
+        let (tools, hooks, diagnostics, client_count) = connect_all(&[]).await;
+        assert!(tools.is_empty());
+        assert!(hooks.is_empty());
+        assert!(diagnostics.is_empty());
+        assert_eq!(client_count, 0);
+    }
 }
