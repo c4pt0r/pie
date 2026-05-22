@@ -298,27 +298,33 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
     }
     let harness = std::sync::Arc::new(AgentHarness::new(opts));
 
-    // Wire each MCP server's `McpNotificationHook` into the harness now that we have an
-    // `Arc<AgentHarness>`. `register_notification_hook` spawns a driver task that runs
-    // `hook.run(sink)` and a pump task that drains the sink into `handle_trigger`; both
-    // tear down naturally when the MCP transport closes or the harness drops. Order
-    // matters for the Skill tool below: this block must precede `skill_harness_cell.set`
-    // only because the trigger pipeline is independent of skill state — flipping these
-    // around is fine; we keep them in this order so the trigger surface is live before
-    // the REPL accepts input.
-    for hook in mcp_notification_hooks {
-        harness.register_notification_hook(hook);
-    }
-
     // Resolve the Skill tool's chicken-and-egg harness reference (issue #25). The cell was
     // handed to the tool at construction time; we set it now, before the REPL accepts any
     // input. The `is_ok()` assert is a double-init guard: any future refactor that
     // accidentally reaches this line twice will surface as a test/CI failure rather than as a
     // runtime panic on the second set.
+    //
+    // This must happen BEFORE `register_notification_hook` below — RFC 1 sub-PR 5 will
+    // make accepted triggers spawn agent-loop tasks, and one of those could land on the
+    // Skill tool before the REPL ever runs. If we registered hooks first, a fast MCP push
+    // (server emits `tools/listChanged` mid-handshake) could race the Skill cell set and
+    // hit an unset `OnceCell`. Today the trigger pipeline only persists audit + emits
+    // `TriggerHandled` so the race is benign, but keeping the order locked here means the
+    // tool surface is fully initialized the moment the trigger surface goes live.
     assert!(
         skill_harness_cell.set(harness.clone()).is_ok(),
         "Skill tool harness cell was set twice; main.rs wiring is the only setter"
     );
+
+    // Wire each MCP server's `McpNotificationHook` into the harness now that all
+    // tool-initialized state (including the Skill cell above) is in place.
+    // `register_notification_hook` spawns a driver task that runs `hook.run(sink)` and a
+    // pump task that drains the sink into `handle_trigger`; both tear down naturally when
+    // the MCP transport closes or the harness drops.
+    for hook in mcp_notification_hooks {
+        harness.register_notification_hook(hook);
+    }
+
     let session_runner =
         agent_session::AgentSession::new(harness.clone(), agent_session::RetrySettings::default());
 
