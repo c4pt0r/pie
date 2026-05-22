@@ -977,3 +977,151 @@ async fn cut_point_anchors_on_user_message_even_around_trigger_custom() {
         ),
     }
 }
+
+/// `session.branch(None)` failure during compaction must short-circuit cleanly: no
+/// `Compaction` entry appended, no agent state mutation, no panic, and the harness emits a
+/// diagnostic `HarnessEvent::Compaction` whose summary starts with `compaction skipped:` so
+/// observers know why. This is the issue #19 acceptance item for runtime fallback.
+#[tokio::test]
+async fn force_compact_fallback_when_session_branch_read_fails() {
+    use async_trait::async_trait;
+    use parking_lot::Mutex as PlMutex;
+    use pie_agent_core::SessionError;
+    use serde_json::Value;
+
+    /// Wraps `MemorySessionStorage`; lets the test toggle `get_path_to_root` into an error
+    /// state to simulate disk read failure mid-compaction.
+    struct FailingBranchStorage {
+        inner: MemorySessionStorage,
+        fail_branch: PlMutex<bool>,
+    }
+
+    impl FailingBranchStorage {
+        fn new() -> Self {
+            Self {
+                inner: MemorySessionStorage::new(),
+                fail_branch: PlMutex::new(false),
+            }
+        }
+        fn arm(&self) {
+            *self.fail_branch.lock() = true;
+        }
+    }
+
+    #[async_trait]
+    impl SessionStorage for FailingBranchStorage {
+        async fn get_metadata_json(&self) -> Result<Value, SessionError> {
+            self.inner.get_metadata_json().await
+        }
+        async fn get_leaf_id(&self) -> Result<Option<String>, SessionError> {
+            self.inner.get_leaf_id().await
+        }
+        async fn set_leaf_id(&self, id: Option<String>) -> Result<(), SessionError> {
+            self.inner.set_leaf_id(id).await
+        }
+        async fn create_entry_id(&self) -> Result<String, SessionError> {
+            self.inner.create_entry_id().await
+        }
+        async fn append_entry(&self, entry: SessionTreeEntry) -> Result<(), SessionError> {
+            self.inner.append_entry(entry).await
+        }
+        async fn get_entry(&self, id: &str) -> Result<Option<SessionTreeEntry>, SessionError> {
+            self.inner.get_entry(id).await
+        }
+        async fn get_entries(&self) -> Result<Vec<SessionTreeEntry>, SessionError> {
+            self.inner.get_entries().await
+        }
+        async fn get_path_to_root(
+            &self,
+            leaf_id: Option<&str>,
+        ) -> Result<Vec<SessionTreeEntry>, SessionError> {
+            if *self.fail_branch.lock() {
+                return Err(SessionError {
+                    code: SessionErrorCode::StorageFailure,
+                    message: "simulated branch read failure".into(),
+                });
+            }
+            self.inner.get_path_to_root(leaf_id).await
+        }
+        async fn find_entries(
+            &self,
+            entry_type: &str,
+        ) -> Result<Vec<SessionTreeEntry>, SessionError> {
+            self.inner.find_entries(entry_type).await
+        }
+        async fn get_label(&self, id: &str) -> Result<Option<String>, SessionError> {
+            self.inner.get_label(id).await
+        }
+    }
+
+    let storage = Arc::new(FailingBranchStorage::new());
+    let session = Session::new(storage.clone() as Arc<dyn SessionStorage>);
+
+    let mut opts = AgentHarnessOptions::new(faux_model(), session.clone());
+    opts.stream_fn = Some(faux_stream_fn("would-be summary"));
+    opts.compaction = CompactionSettings {
+        enabled: true,
+        reserve_tokens: 0,
+        keep_recent_tokens: 4,
+    };
+    let harness = AgentHarness::new(opts);
+
+    // Drive one normal prompt so we have a non-empty session before failure.
+    harness.prompt("first").await.unwrap();
+    let pre_entries = storage.inner.get_entries().await.unwrap();
+    let pre_state_len = harness.agent().state().messages.len();
+
+    // Collect HarnessEvent::Compaction emissions.
+    let events: Arc<PlMutex<Vec<HarnessEvent>>> = Arc::new(PlMutex::new(Vec::new()));
+    let events_clone = events.clone();
+    let _unsub = harness.subscribe_harness(Arc::new(move |ev: HarnessEvent| {
+        events_clone.lock().push(ev);
+    }) as HarnessListener);
+
+    // Arm the failure and force compaction. Must not panic, must return Ok(false).
+    storage.arm();
+    let ran = harness.force_compact(None).await.unwrap();
+    assert!(
+        !ran,
+        "force_compact must return Ok(false) when session branch read fails"
+    );
+
+    // Session must NOT have a new Compaction entry.
+    let post_entries = storage.inner.get_entries().await.unwrap();
+    assert_eq!(
+        post_entries.len(),
+        pre_entries.len(),
+        "session must not gain entries when compaction is aborted by branch read failure"
+    );
+    let added_compaction = post_entries[pre_entries.len()..]
+        .iter()
+        .any(|e| matches!(e, SessionTreeEntry::Compaction { .. }));
+    assert!(
+        !added_compaction,
+        "no Compaction entry must be appended on branch read failure"
+    );
+
+    // Agent state must be unchanged (same message count, same prefix).
+    assert_eq!(
+        harness.agent().state().messages.len(),
+        pre_state_len,
+        "agent state.messages must not be mutated when compaction is aborted"
+    );
+
+    // A diagnostic Compaction event must have been emitted with the `compaction skipped:`
+    // prefix so observers can tell why.
+    let events_snapshot = events.lock().clone();
+    let saw_diagnostic = events_snapshot.iter().any(|ev| match ev {
+        HarnessEvent::Compaction {
+            summary,
+            tokens_before,
+            ..
+        } => summary.starts_with("compaction skipped:") && *tokens_before == 0,
+        _ => false,
+    });
+    assert!(
+        saw_diagnostic,
+        "expected a diagnostic HarnessEvent::Compaction (summary starts with 'compaction skipped:') — events: {:?}",
+        events_snapshot
+    );
+}
