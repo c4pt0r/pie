@@ -26,6 +26,7 @@ mod mentions;
 mod model;
 mod oauth;
 mod otlp;
+mod readline;
 mod session;
 mod skills;
 mod spinner;
@@ -405,6 +406,7 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
     let _unsub_harness_hooks = harness.subscribe_harness(hooks.runner.harness_listener());
 
     let registry = commands::Registry::with_builtins();
+    let slash_completion = readline::SlashCommandHelper::from_registry(&registry);
 
     // Persistent input history (issue #2). Loaded once at startup; each successful prompt
     // submission appends + persists.
@@ -423,9 +425,17 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
         // issues with the blocking task. The editor loads existing history on construction.
         let prompt_marker = "you> ".to_string();
         let history_path_clone = history_path.clone();
+        let slash_completion_clone = slash_completion.clone();
         let read =
             tokio::task::spawn_blocking(move || -> Result<ReadlineOutcome, anyhow::Error> {
-                let mut editor = rustyline::DefaultEditor::new()?;
+                let config = rustyline::Config::builder()
+                    .completion_type(rustyline::config::CompletionType::List)
+                    .build();
+                let mut editor = rustyline::Editor::<
+                    readline::SlashCommandHelper,
+                    rustyline::history::DefaultHistory,
+                >::with_config(config)?;
+                editor.set_helper(Some(slash_completion_clone));
                 if history_path_clone.exists() {
                     let _ = editor.load_history(&history_path_clone);
                 }

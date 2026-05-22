@@ -31,6 +31,10 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
   DS4 (`deepseek-v4-flash` at `http://127.0.0.1:8000/v1`) without adding a one-off
   provider implementation. Project-local model entries override user-global entries with
   the same provider/model id.
+- **#43** Slash-command completion in the interactive prompt. Typing `/` and pressing Tab
+  now lists commands and aliases from the same registry used for dispatch; prefixes such
+  as `/thi` complete to `/thinking`, while normal prompts and command arguments are left
+  untouched.
 - **#4** Dangerous-bash detector wired through `before_tool_call`. 11-pattern corpus
   (`rm -rf /`, `sudo`, `curl|sh`, etc.) returns deny reason as the synthesized tool result.
 - **#5** `@file` mention injection. Files are read, capped at 64 KiB, prepended to the
