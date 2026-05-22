@@ -183,6 +183,52 @@ fn strip_frontmatter(content: &str) -> &str {
     content
 }
 
+/// Merge the resolved built-in skills with the user/project skills the existing dual-root
+/// loader returned. Same-name precedence is **user/project wins over built-in** (built-in is
+/// the lowest tier per #32). The returned `Vec<Skill>` preserves built-in skills first, then
+/// any user/project skills not already shadowing a built-in. Repeated names within
+/// `user_project` follow the loader's existing project-over-user policy and arrive here
+/// already collapsed.
+///
+/// This is extracted out of `main.rs` so the wiring path can be unit-tested without spinning
+/// up the full binary (per @CLI-TUI-Dev-Lead's review on PR #34).
+pub fn merge_with_user_project(mut builtins: Vec<Skill>, user_project: &[Skill]) -> Vec<Skill> {
+    for skill in user_project.iter() {
+        if let Some(slot) = builtins.iter_mut().find(|s| s.name == skill.name) {
+            // User / project skill of the same name shadows the built-in.
+            *slot = skill.clone();
+        } else {
+            builtins.push(skill.clone());
+        }
+    }
+    builtins
+}
+
+/// Parse the contents of `~/.pie/config.toml` and extract the
+/// `[builtin_skills] enabled = [...]` list. Missing section / missing key / parse failure all
+/// degrade to an empty list — the soft fail-closed posture from #32: the caller treats
+/// unknown names as a startup diagnostic, but a malformed config never prevents `pie` from
+/// running at all.
+///
+/// Extracted from `main.rs` so the parser can be unit-tested directly.
+pub fn parse_builtin_skills_config(toml_text: &str) -> Vec<String> {
+    let Ok(parsed) = toml::from_str::<ConfigFile>(toml_text) else {
+        return Vec::new();
+    };
+    parsed.builtin_skills.map(|s| s.enabled).unwrap_or_default()
+}
+
+#[derive(Default, serde::Deserialize)]
+struct ConfigFile {
+    builtin_skills: Option<ConfigSection>,
+}
+
+#[derive(Default, serde::Deserialize)]
+struct ConfigSection {
+    #[serde(default)]
+    enabled: Vec<String>,
+}
+
 /// Error returned when the CLI enabled a built-in skill name that this binary does not
 /// recognise. The caller is expected to print the message and exit with a non-zero status
 /// (hard fail, per #32's CLI-side acceptance).
@@ -334,6 +380,129 @@ mod tests {
         )
         .expect("repeated --builtin-skill should be idempotent");
         assert_eq!(resolved.skills.len(), 1);
+    }
+
+    fn fake_skill(name: &str, file_path: &str) -> Skill {
+        Skill {
+            name: name.into(),
+            description: format!("desc for {name}"),
+            file_path: file_path.into(),
+            content: format!("body of {name}"),
+            disable_model_invocation: false,
+        }
+    }
+
+    #[test]
+    fn merge_no_user_project_returns_builtins_unchanged() {
+        let builtins = vec![fake_skill(
+            "karpathy-guidelines",
+            "<builtin>/karpathy-guidelines/SKILL.md",
+        )];
+        let merged = merge_with_user_project(builtins.clone(), &[]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].name, "karpathy-guidelines");
+        assert_eq!(
+            merged[0].file_path,
+            "<builtin>/karpathy-guidelines/SKILL.md"
+        );
+    }
+
+    #[test]
+    fn merge_user_project_skill_shadows_builtin_same_name() {
+        // Same-name precedence acceptance from #32: user / project skill of the same name
+        // wins over the built-in. The combined catalog still has exactly one entry; the
+        // built-in entry is replaced in place, not appended.
+        let builtins = vec![fake_skill(
+            "karpathy-guidelines",
+            "<builtin>/karpathy-guidelines/SKILL.md",
+        )];
+        let user_project = vec![fake_skill(
+            "karpathy-guidelines",
+            "/home/me/.pie/skills/karpathy-guidelines/SKILL.md",
+        )];
+        let merged = merge_with_user_project(builtins, &user_project);
+        assert_eq!(merged.len(), 1, "same name must collapse to one entry");
+        assert_eq!(merged[0].name, "karpathy-guidelines");
+        assert_eq!(
+            merged[0].file_path, "/home/me/.pie/skills/karpathy-guidelines/SKILL.md",
+            "user / project entry must shadow the built-in"
+        );
+    }
+
+    #[test]
+    fn merge_unrelated_user_project_skills_appended_after_builtins() {
+        let builtins = vec![fake_skill(
+            "karpathy-guidelines",
+            "<builtin>/karpathy-guidelines/SKILL.md",
+        )];
+        let user_project = vec![fake_skill(
+            "my-personal-skill",
+            "/home/me/.pie/skills/my-personal-skill/SKILL.md",
+        )];
+        let merged = merge_with_user_project(builtins, &user_project);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].name, "karpathy-guidelines");
+        assert_eq!(merged[1].name, "my-personal-skill");
+    }
+
+    #[test]
+    fn merge_handles_empty_builtins_with_user_project() {
+        let user_project = vec![fake_skill(
+            "my-personal-skill",
+            "/home/me/.pie/skills/my-personal-skill/SKILL.md",
+        )];
+        let merged = merge_with_user_project(Vec::new(), &user_project);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].name, "my-personal-skill");
+    }
+
+    #[test]
+    fn parse_config_extracts_enabled_list() {
+        let text = r#"
+[builtin_skills]
+enabled = ["karpathy-guidelines", "future-other-skill"]
+"#;
+        let enabled = parse_builtin_skills_config(text);
+        assert_eq!(
+            enabled,
+            vec![
+                "karpathy-guidelines".to_string(),
+                "future-other-skill".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_config_missing_section_is_empty_list() {
+        let text = r#"
+[some_other_section]
+key = "value"
+"#;
+        let enabled = parse_builtin_skills_config(text);
+        assert!(enabled.is_empty());
+    }
+
+    #[test]
+    fn parse_config_missing_enabled_key_is_empty_list() {
+        let text = r#"
+[builtin_skills]
+"#;
+        let enabled = parse_builtin_skills_config(text);
+        assert!(enabled.is_empty());
+    }
+
+    #[test]
+    fn parse_config_malformed_toml_degrades_to_empty_not_panic() {
+        // Soft fail-closed: a typo in the config never blocks startup.
+        let text = "this is not valid toml [ [ [";
+        let enabled = parse_builtin_skills_config(text);
+        assert!(enabled.is_empty());
+    }
+
+    #[test]
+    fn parse_config_empty_string_is_empty_list() {
+        let enabled = parse_builtin_skills_config("");
+        assert!(enabled.is_empty());
     }
 
     #[test]

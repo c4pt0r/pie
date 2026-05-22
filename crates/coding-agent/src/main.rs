@@ -262,15 +262,10 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
                 std::process::exit(2);
             }
         };
-    let mut combined_skills = resolved_builtins.skills.clone();
-    for skill in loaded_skills.skills.iter() {
-        if let Some(slot) = combined_skills.iter_mut().find(|s| s.name == skill.name) {
-            // User / project skill of the same name shadows the built-in.
-            *slot = skill.clone();
-        } else {
-            combined_skills.push(skill.clone());
-        }
-    }
+    let combined_skills = builtin_skills::merge_with_user_project(
+        resolved_builtins.skills.clone(),
+        &loaded_skills.skills,
+    );
 
     let mut opts = AgentHarnessOptions::new(model.clone(), session.clone());
     opts.system_prompt = system_prompt;
@@ -676,28 +671,14 @@ pub fn user_message(text: &str) -> AgentMessage {
     }))
 }
 
-/// Read the `[builtin_skills] enabled = [...]` list from `<base_dir>/config.toml`. Missing
-/// file, missing section, or parse errors all degrade to an empty list — this is the
-/// "soft fail-closed" path from issue #32: unknown names later produce a startup diagnostic
-/// but never block startup.
+/// Read `<base_dir>/config.toml` and extract the `[builtin_skills] enabled = [...]` list.
+/// Missing file → empty list. Parse error / missing section → empty list (the parser itself
+/// returns empty per #32's soft fail-closed posture; see
+/// [`builtin_skills::parse_builtin_skills_config`]).
 async fn read_builtin_skills_config(base_dir: &std::path::Path) -> Vec<String> {
     let path = base_dir.join("config.toml");
     let Ok(text) = tokio::fs::read_to_string(&path).await else {
         return Vec::new();
     };
-    let Ok(parsed) = toml::from_str::<BuiltinSkillsConfigFile>(&text) else {
-        return Vec::new();
-    };
-    parsed.builtin_skills.unwrap_or_default().enabled
-}
-
-#[derive(Default, serde::Deserialize)]
-struct BuiltinSkillsConfigFile {
-    builtin_skills: Option<BuiltinSkillsConfigSection>,
-}
-
-#[derive(Default, serde::Deserialize)]
-struct BuiltinSkillsConfigSection {
-    #[serde(default)]
-    enabled: Vec<String>,
+    builtin_skills::parse_builtin_skills_config(&text)
 }

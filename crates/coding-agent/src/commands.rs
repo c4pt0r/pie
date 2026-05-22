@@ -275,6 +275,12 @@ impl SlashCommand for SkillCommand {
 }
 
 fn skill_source_label(skill: &Skill, cwd: &std::path::Path) -> String {
+    // Built-in skills are bundled into the `pie` binary and surface a synthetic
+    // `<builtin>/<name>/SKILL.md` path. Detect that before falling through to the disk-path
+    // checks below.
+    if skill.file_path.starts_with("<builtin>/") {
+        return "builtin".into();
+    }
     let path = std::path::Path::new(&skill.file_path);
     if path.starts_with(cwd.join(".pie").join("skills")) {
         "project".into()
@@ -1078,5 +1084,44 @@ mod tests {
         assert!(!wrapped.contains("SECRET SKILL BODY"));
 
         assert_eq!(attach_skill_prompt("plain", None), "plain");
+    }
+
+    /// Helper: build a Skill record only filling the fields `skill_source_label` reads.
+    fn skill_with_path(name: &str, file_path: &str) -> Skill {
+        Skill {
+            name: name.into(),
+            description: String::new(),
+            file_path: file_path.into(),
+            content: String::new(),
+            disable_model_invocation: false,
+        }
+    }
+
+    #[test]
+    fn skill_source_label_recognizes_builtin_synthetic_path() {
+        // Built-in skills (#32) carry a synthetic `<builtin>/<name>/SKILL.md` path. `/skills`
+        // must classify these as `builtin`, not fall through to the `source path` catch-all.
+        let s = skill_with_path(
+            "karpathy-guidelines",
+            "<builtin>/karpathy-guidelines/SKILL.md",
+        );
+        let cwd = std::path::PathBuf::from("/tmp/some-project");
+        assert_eq!(skill_source_label(&s, &cwd), "builtin");
+    }
+
+    #[test]
+    fn skill_source_label_distinguishes_builtin_from_project_and_user() {
+        // Round out the test by confirming the new builtin branch doesn't shadow the existing
+        // project / user paths. This locks `/skills` source classification across all three
+        // tiers in one place.
+        let cwd = std::path::PathBuf::from("/repo");
+        let project = skill_with_path("p", "/repo/.pie/skills/p/SKILL.md");
+        assert_eq!(skill_source_label(&project, &cwd), "project");
+        let user = skill_with_path("u", "/home/me/.pie/skills/u/SKILL.md");
+        assert_eq!(skill_source_label(&user, &cwd), "user");
+        let builtin = skill_with_path("b", "<builtin>/b/SKILL.md");
+        assert_eq!(skill_source_label(&builtin, &cwd), "builtin");
+        let unknown = skill_with_path("x", "/some/weird/place/x/SKILL.md");
+        assert_eq!(skill_source_label(&unknown, &cwd), "source path");
     }
 }
