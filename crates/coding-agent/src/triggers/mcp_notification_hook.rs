@@ -8,21 +8,33 @@
 //! exists so unit tests pin the per-method dedup / replacement-policy contract from
 //! RFC 1 §4.2.3 and the follow-up notes left on PR #35.
 //!
-//! Mapping rules (RFC 1 §4.2.3 + PR #35 QA notes):
+//! Mapping rules (RFC 1 §4.2.3 + PR #35 / PR #56 QA notes):
 //!
-//! | MCP method                            | idempotency key            | replacement      |
-//! |---------------------------------------|----------------------------|------------------|
-//! | `notifications/tools/listChanged`     | `"tools"`                  | `LatestReplaces` |
-//! | `notifications/resources/listChanged` | `"resources"`              | `LatestReplaces` |
-//! | `notifications/resources/updated`     | `"resources:{uri}"`        | `LatestReplaces` |
-//! | `notifications/prompts/listChanged`   | `"prompts"`                | `LatestReplaces` |
-//! | custom `notifications/*`              | `_meta.pie_dedup_key` else | `Drop`           |
-//! |                                       | `_pie_dedup_key`           |                  |
+//! | MCP method                            | idempotency key (raw)                | replacement      |
+//! |---------------------------------------|--------------------------------------|------------------|
+//! | `notifications/tools/listChanged`     | `tools`                              | `LatestReplaces` |
+//! | `notifications/resources/listChanged` | `resources`                          | `LatestReplaces` |
+//! | `notifications/resources/updated`     | `resources:{uri}`                    | `LatestReplaces` |
+//! | `notifications/prompts/listChanged`   | `prompts`                            | `LatestReplaces` |
+//! | custom `notifications/*`              | `_meta.pie_dedup_key` (or legacy `_pie_dedup_key`) | `Drop` |
 //!
-//! A custom notification that provides neither dedup key is dropped at the adapter with
-//! `dropped_count += 1`; runtime never sees it. Adapters do **not** dedup themselves — the
-//! runtime owns the dedup window. We surface a stable idempotency key per source/method so
-//! the runtime can do its job.
+//! Every raw key above is then **namespaced** with `mcp:{server_name}:` before it reaches
+//! the runtime, so two MCP servers that legitimately produce the same intrinsic key
+//! (`tools/listChanged`, identical custom dedup keys, etc.) do not dedup-cancel each other
+//! in the runtime's global dedup window (PR #56 QA blocker).
+//!
+//! A custom notification that provides neither dedup key form is dropped at the adapter
+//! with `dropped_count += 1`; the runtime never sees it. Adapters do **not** dedup
+//! themselves — the runtime owns the dedup window. We surface a stable, server-scoped key
+//! per source/method so the runtime can do its job.
+//!
+//! Privacy contract: `payload_visibility = Local` means the full `params` blob is dropped
+//! before persistence; only `payload_summary` survives into the audit. The summary is
+//! method-name-only for custom / unknown notifications (PR #56 QA blocker) — a sentinel
+//! secret tucked into a custom notification's params must never end up in the persisted
+//! `Custom { custom_type: "trigger" }` audit entry. Adapters that genuinely need
+//! human-readable per-event detail can opt in via `_meta.pie_summary: "<text>"`, capped at
+//! 200 chars; the server is asserting that string is safe to persist.
 
 use std::sync::Arc;
 
@@ -160,7 +172,7 @@ impl NotificationHook for McpNotificationHook {
 /// Pure function so the test suite can pin every row of the §4.2.3 table without spinning
 /// up a real `McpClient`.
 fn map_notification(server_name: &str, n: &McpServerNotification) -> Option<Trigger> {
-    let (idempotency_key, replacement_policy) = idempotency_for(&n.method, &n.params)?;
+    let (idempotency_key, replacement_policy) = idempotency_for(server_name, &n.method, &n.params)?;
     let payload_summary = render_summary(&n.method, &n.params);
     Some(Trigger {
         source: TriggerSource::Mcp {
@@ -192,20 +204,30 @@ fn map_notification(server_name: &str, n: &McpServerNotification) -> Option<Trig
 /// Derive `(idempotency_key, replacement_policy)` for a given method + params per RFC 1
 /// §4.2.3 / PR #35 QA follow-up. Returns `None` for custom methods that don't supply a
 /// dedup key — the caller drops those at the adapter with diagnostics.
+///
+/// Every key is namespaced with `mcp:{server_name}:` so two MCP servers that legitimately
+/// emit the same intrinsic key (both `tools/listChanged`, both with the same custom
+/// `_meta.pie_dedup_key`) do not dedup each other in the runtime. The runtime dedup window
+/// is global per harness; namespacing at the adapter is the only place we can prevent
+/// cross-server collisions.
 fn idempotency_for(
+    server_name: &str,
     method: &str,
     params: &serde_json::Value,
 ) -> Option<(String, ReplacementPolicy)> {
+    let prefix = format!("mcp:{server_name}:");
     match method {
         "notifications/tools/listChanged" => {
-            Some(("tools".to_string(), ReplacementPolicy::LatestReplaces))
+            Some((format!("{prefix}tools"), ReplacementPolicy::LatestReplaces))
         }
-        "notifications/resources/listChanged" => {
-            Some(("resources".to_string(), ReplacementPolicy::LatestReplaces))
-        }
-        "notifications/prompts/listChanged" => {
-            Some(("prompts".to_string(), ReplacementPolicy::LatestReplaces))
-        }
+        "notifications/resources/listChanged" => Some((
+            format!("{prefix}resources"),
+            ReplacementPolicy::LatestReplaces,
+        )),
+        "notifications/prompts/listChanged" => Some((
+            format!("{prefix}prompts"),
+            ReplacementPolicy::LatestReplaces,
+        )),
         "notifications/resources/updated" => {
             // Per-URI keying so multiple updates to different resources don't collapse into
             // one event. If the server omitted `uri` (shouldn't happen per MCP spec but
@@ -215,7 +237,7 @@ fn idempotency_for(
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
             Some((
-                format!("resources:{uri}"),
+                format!("{prefix}resources:{uri}"),
                 ReplacementPolicy::LatestReplaces,
             ))
         }
@@ -223,8 +245,9 @@ fn idempotency_for(
             // Custom notification — require an explicit dedup key. Prefer `_meta.pie_dedup_key`
             // (canonical going forward) over `_pie_dedup_key` (legacy, kept for adapters
             // already in the wild). Either form is treated as `Drop` semantics: every
-            // explicit key represents one logical event, no replacement.
-            extract_dedup_key(params).map(|k| (k, ReplacementPolicy::Drop))
+            // explicit key represents one logical event, no replacement. The server-name
+            // prefix still applies so two servers using the same external key don't collide.
+            extract_dedup_key(params).map(|k| (format!("{prefix}{k}"), ReplacementPolicy::Drop))
         }
     }
 }
@@ -248,21 +271,48 @@ fn extract_dedup_key(params: &serde_json::Value) -> Option<String> {
 /// Render a short human-readable summary for `payload_summary`. Capped well below the
 /// runtime 4 KiB persistence cap; the runtime will still re-truncate if a future caller
 /// emits more.
+///
+/// Privacy contract (RFC 0 §3.2.2 / RFC 1 §4.2.3 + PR #56 QA follow-up): the hook is
+/// configured with `payload_visibility = Local`, which means `payload` is dropped and only
+/// `payload_summary` survives into the persisted audit. So this function must not echo
+/// arbitrary params content — a sentinel secret in a custom notification's params field
+/// would otherwise persist into the trigger audit entry.
+///
+/// The contract: only **method name** plus fields we already know are non-secret by the
+/// MCP spec (`uri` for `resources/updated`) appear in the summary. Adapters that need
+/// per-event detail must opt in via `_meta.pie_summary: "<human-safe text>"`, where the
+/// server explicitly declares the value is safe to persist; we still cap that string at
+/// 200 chars.
 fn render_summary(method: &str, params: &serde_json::Value) -> Option<String> {
-    // Compact one-liner: method + a single inline field if obvious. For unknown shapes we
-    // fall back to a length-bounded JSON snippet so the user still sees something.
-    if method == "notifications/resources/updated" {
-        if let Some(uri) = params.get("uri").and_then(|v| v.as_str()) {
-            return Some(format!("{method} uri={uri}"));
+    match method {
+        // `uri` is part of the MCP resource identity — explicitly part of the public
+        // address space and safe to surface.
+        "notifications/resources/updated" => {
+            if let Some(uri) = params.get("uri").and_then(|v| v.as_str()) {
+                Some(format!("{method} uri={uri}"))
+            } else {
+                Some(method.to_string())
+            }
         }
-    }
-    // Avoid serializing huge params blobs into the summary — cap at 200 chars.
-    let raw = serde_json::to_string(params).unwrap_or_else(|_| "<unrepresentable>".into());
-    let trimmed: String = raw.chars().take(200).collect();
-    if trimmed.is_empty() || trimmed == "null" {
-        Some(method.to_string())
-    } else {
-        Some(format!("{method} {trimmed}"))
+        // Standard listChanged events have no per-event detail worth rendering.
+        "notifications/tools/listChanged"
+        | "notifications/resources/listChanged"
+        | "notifications/prompts/listChanged" => Some(method.to_string()),
+        // Custom / unknown methods: NEVER serialize arbitrary params. Allow explicit
+        // opt-in via `_meta.pie_summary`; otherwise just the method name. This is what
+        // prevents secrets in a server's custom params from leaking into the audit.
+        _ => {
+            if let Some(s) = params
+                .get("_meta")
+                .and_then(|m| m.get("pie_summary"))
+                .and_then(|v| v.as_str())
+            {
+                let trimmed: String = s.chars().take(200).collect();
+                Some(format!("{method} {trimmed}"))
+            } else {
+                Some(method.to_string())
+            }
+        }
     }
 }
 
@@ -296,15 +346,17 @@ mod tests {
         (note_tx, trig_rx, status, handle)
     }
 
-    /// `tools/listChanged` → idempotency `"tools"` + `LatestReplaces`, no payload, MCP
-    /// source kind, server name + method threaded through.
+    /// `tools/listChanged` → idempotency `"mcp:{server}:tools"` + `LatestReplaces`, no
+    /// payload, MCP source kind, server name + method threaded through. The `mcp:{server}:`
+    /// prefix is what prevents two MCP servers' identical method-local keys from
+    /// dedup-cancelling each other in the runtime.
     #[tokio::test]
     async fn tools_list_changed_maps_to_latest_replaces() {
         let (tx, mut rx, _status, handle) = fixture();
         tx.send(note("notifications/tools/listChanged", json!({})))
             .unwrap();
         let trigger = rx.recv().await.expect("trigger should arrive");
-        assert_eq!(trigger.idempotency_key, "tools");
+        assert_eq!(trigger.idempotency_key, "mcp:filesystem:tools");
         assert_eq!(
             trigger.replacement_policy,
             ReplacementPolicy::LatestReplaces
@@ -325,6 +377,7 @@ mod tests {
     }
 
     /// `resources/updated` keys by URI so two updates to different files don't collapse.
+    /// Key is `"mcp:{server}:resources:{uri}"`.
     #[tokio::test]
     async fn resources_updated_keys_per_uri() {
         let (tx, mut rx, _status, handle) = fixture();
@@ -340,14 +393,16 @@ mod tests {
         .unwrap();
         let t1 = rx.recv().await.unwrap();
         let t2 = rx.recv().await.unwrap();
-        assert_eq!(t1.idempotency_key, "resources:file:///a.md");
-        assert_eq!(t2.idempotency_key, "resources:file:///b.md");
+        assert_eq!(t1.idempotency_key, "mcp:filesystem:resources:file:///a.md");
+        assert_eq!(t2.idempotency_key, "mcp:filesystem:resources:file:///b.md");
         assert_ne!(t1.idempotency_key, t2.idempotency_key);
         drop(tx);
         let _ = handle.await;
     }
 
-    /// Custom method with `_meta.pie_dedup_key` is accepted with `Drop` policy.
+    /// Custom method with `_meta.pie_dedup_key` is accepted with `Drop` policy. Key is
+    /// namespaced with the server prefix so the same external key from two servers does
+    /// not collide.
     #[tokio::test]
     async fn custom_with_meta_dedup_key_passes_through() {
         let (tx, mut rx, _status, handle) = fixture();
@@ -357,14 +412,15 @@ mod tests {
         ))
         .unwrap();
         let trigger = rx.recv().await.unwrap();
-        assert_eq!(trigger.idempotency_key, "build-42");
+        assert_eq!(trigger.idempotency_key, "mcp:filesystem:build-42");
         assert_eq!(trigger.replacement_policy, ReplacementPolicy::Drop);
         drop(tx);
         let _ = handle.await;
     }
 
     /// Legacy `_pie_dedup_key` (without `_meta`) is honored for backward compat. Newer
-    /// `_meta.pie_dedup_key` takes precedence when both are present.
+    /// `_meta.pie_dedup_key` takes precedence when both are present. Both forms still get
+    /// the server-name prefix.
     #[tokio::test]
     async fn legacy_dedup_key_works_and_meta_wins() {
         let (tx, mut rx, _status, handle) = fixture();
@@ -374,7 +430,7 @@ mod tests {
         ))
         .unwrap();
         let t1 = rx.recv().await.unwrap();
-        assert_eq!(t1.idempotency_key, "legacy-key");
+        assert_eq!(t1.idempotency_key, "mcp:filesystem:legacy-key");
 
         // When both are present, `_meta.pie_dedup_key` wins.
         tx.send(note(
@@ -386,7 +442,7 @@ mod tests {
         ))
         .unwrap();
         let t2 = rx.recv().await.unwrap();
-        assert_eq!(t2.idempotency_key, "new-key");
+        assert_eq!(t2.idempotency_key, "mcp:filesystem:new-key");
 
         drop(tx);
         let _ = handle.await;
@@ -444,16 +500,196 @@ mod tests {
         let _ = handle.await;
     }
 
-    /// `resources/updated` without a `uri` field falls back to the unscoped `"resources"`
-    /// key rather than crashing. (Defensive — MCP spec requires uri but adapters in the
-    /// wild may misbehave.)
+    /// `resources/updated` without a `uri` field falls back to `resources:unknown` (still
+    /// server-namespaced) rather than crashing. Defensive — MCP spec requires uri but
+    /// adapters in the wild may misbehave.
     #[tokio::test]
     async fn resources_updated_without_uri_falls_back_to_resources_key() {
         let (tx, mut rx, _status, handle) = fixture();
         tx.send(note("notifications/resources/updated", json!({})))
             .unwrap();
         let trigger = rx.recv().await.unwrap();
-        assert_eq!(trigger.idempotency_key, "resources:unknown");
+        assert_eq!(trigger.idempotency_key, "mcp:filesystem:resources:unknown");
+        drop(tx);
+        let _ = handle.await;
+    }
+
+    /// Two MCP servers emitting the **same** method-local key (`tools` / `resources` /
+    /// per-URI / custom `pie_dedup_key`) must produce **distinct** runtime
+    /// `idempotency_key`s so the harness dedup window does not collapse one server's event
+    /// onto the other's. The fix: prefix every key with `mcp:{server_name}:` at the
+    /// adapter. PR #56 QA blocker.
+    #[tokio::test]
+    async fn idempotency_keys_are_namespaced_per_server() {
+        let (note_tx_a, note_rx_a) = mpsc::unbounded_channel::<McpServerNotification>();
+        let (trig_tx_a, mut trig_rx_a) = mpsc::unbounded_channel::<Trigger>();
+        let hook_a = Arc::new(McpNotificationHook::new("server-a", note_rx_a));
+        let driver_a = hook_a.clone();
+        let handle_a = tokio::spawn(async move { driver_a.run(trig_tx_a).await });
+
+        let (note_tx_b, note_rx_b) = mpsc::unbounded_channel::<McpServerNotification>();
+        let (trig_tx_b, mut trig_rx_b) = mpsc::unbounded_channel::<Trigger>();
+        let hook_b = Arc::new(McpNotificationHook::new("server-b", note_rx_b));
+        let driver_b = hook_b.clone();
+        let handle_b = tokio::spawn(async move { driver_b.run(trig_tx_b).await });
+
+        // Both servers emit identical `tools/listChanged` — without the prefix they would
+        // collide as a single dedup-window entry. Same exercise for a per-URI key, and a
+        // custom `_meta.pie_dedup_key`.
+        note_tx_a
+            .send(note("notifications/tools/listChanged", json!({})))
+            .unwrap();
+        note_tx_b
+            .send(note("notifications/tools/listChanged", json!({})))
+            .unwrap();
+        note_tx_a
+            .send(note(
+                "notifications/resources/updated",
+                json!({ "uri": "file:///shared.md" }),
+            ))
+            .unwrap();
+        note_tx_b
+            .send(note(
+                "notifications/resources/updated",
+                json!({ "uri": "file:///shared.md" }),
+            ))
+            .unwrap();
+        note_tx_a
+            .send(note(
+                "notifications/custom/event",
+                json!({ "_meta": { "pie_dedup_key": "shared-build-1" } }),
+            ))
+            .unwrap();
+        note_tx_b
+            .send(note(
+                "notifications/custom/event",
+                json!({ "_meta": { "pie_dedup_key": "shared-build-1" } }),
+            ))
+            .unwrap();
+
+        // Server A emitted 3 triggers; server B emitted 3 triggers. All 6 keys must be
+        // distinct; specifically each pair must differ in the `mcp:{server}:` prefix.
+        let mut a_keys = Vec::new();
+        for _ in 0..3 {
+            a_keys.push(trig_rx_a.recv().await.unwrap().idempotency_key);
+        }
+        let mut b_keys = Vec::new();
+        for _ in 0..3 {
+            b_keys.push(trig_rx_b.recv().await.unwrap().idempotency_key);
+        }
+        for k in &a_keys {
+            assert!(
+                k.starts_with("mcp:server-a:"),
+                "server-a key missing prefix: {k}"
+            );
+        }
+        for k in &b_keys {
+            assert!(
+                k.starts_with("mcp:server-b:"),
+                "server-b key missing prefix: {k}"
+            );
+        }
+        // Pairwise: cross-server keys are never equal.
+        for ka in &a_keys {
+            for kb in &b_keys {
+                assert_ne!(
+                    ka, kb,
+                    "cross-server keys collided — runtime would dedup them as duplicates"
+                );
+            }
+        }
+
+        drop(note_tx_a);
+        drop(note_tx_b);
+        let _ = handle_a.await;
+        let _ = handle_b.await;
+    }
+
+    /// `payload_visibility = Local` means the full `payload` is dropped; only
+    /// `payload_summary` survives into the persisted audit. For custom / unknown
+    /// notifications the adapter MUST NOT echo arbitrary params content into the summary
+    /// because params may contain secrets the server tucked in (API tokens, file contents,
+    /// PII, etc.). PR #56 QA blocker.
+    #[tokio::test]
+    async fn custom_method_summary_does_not_leak_params_content() {
+        let (tx, mut rx, _status, handle) = fixture();
+        // Sentinel string the test would only find in the summary if `render_summary`
+        // serialized arbitrary params.
+        let sentinel = "TOKEN_SENTINEL_SHOULD_NOT_APPEAR_IN_AUDIT";
+        tx.send(note(
+            "notifications/custom/secret-bearing",
+            json!({
+                "_meta": { "pie_dedup_key": "evt-1" },
+                "secret": sentinel,
+                "nested": { "more_secret": sentinel },
+            }),
+        ))
+        .unwrap();
+        let trigger = rx.recv().await.unwrap();
+        let summary = trigger.payload_summary.unwrap_or_default();
+        assert!(
+            !summary.contains(sentinel),
+            "summary leaked params content: {summary}"
+        );
+        assert_eq!(
+            summary, "notifications/custom/secret-bearing",
+            "custom-method summary must reduce to bare method name (no params echo)"
+        );
+        drop(tx);
+        let _ = handle.await;
+    }
+
+    /// Adapters that need per-event human-readable detail for a custom notification can
+    /// opt in via `_meta.pie_summary: "<text>"`. The opt-in field is treated as
+    /// declaratively-safe by the server and surfaces into the summary capped at 200 chars.
+    /// Counterpart to the secret-leak test above.
+    #[tokio::test]
+    async fn custom_method_pie_summary_opt_in_appears_in_summary() {
+        let (tx, mut rx, _status, handle) = fixture();
+        tx.send(note(
+            "notifications/custom/build-finished",
+            json!({
+                "_meta": {
+                    "pie_dedup_key": "build-99",
+                    "pie_summary": "build #99 finished: 3 tests failed",
+                },
+                "internal_token": "should-not-appear",
+            }),
+        ))
+        .unwrap();
+        let trigger = rx.recv().await.unwrap();
+        let summary = trigger.payload_summary.unwrap_or_default();
+        assert!(
+            summary.contains("build #99 finished"),
+            "opt-in pie_summary should surface: {summary}"
+        );
+        assert!(
+            !summary.contains("should-not-appear"),
+            "params outside of pie_summary must not leak: {summary}"
+        );
+        drop(tx);
+        let _ = handle.await;
+    }
+
+    /// Known `resources/updated` keeps the `uri` in the summary — `uri` is part of the
+    /// public resource address per MCP spec, not arbitrary params. Pins that we don't
+    /// over-correct and drop legitimate detail.
+    #[tokio::test]
+    async fn resources_updated_summary_includes_uri() {
+        let (tx, mut rx, _status, handle) = fixture();
+        tx.send(note(
+            "notifications/resources/updated",
+            json!({ "uri": "file:///proj/README.md", "rev": 5 }),
+        ))
+        .unwrap();
+        let trigger = rx.recv().await.unwrap();
+        let summary = trigger.payload_summary.unwrap_or_default();
+        assert!(summary.contains("uri=file:///proj/README.md"), "{summary}");
+        // Defensive: `rev` is a non-spec field and must not leak.
+        assert!(
+            !summary.contains("rev"),
+            "non-spec params field leaked into summary: {summary}"
+        );
         drop(tx);
         let _ = handle.await;
     }
