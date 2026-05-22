@@ -10,18 +10,24 @@
 //!
 //! Mapping rules (RFC 1 §4.2.3 + PR #35 / PR #56 QA notes):
 //!
-//! | MCP method                            | idempotency key (raw)                | replacement      |
-//! |---------------------------------------|--------------------------------------|------------------|
-//! | `notifications/tools/listChanged`     | `tools`                              | `LatestReplaces` |
-//! | `notifications/resources/listChanged` | `resources`                          | `LatestReplaces` |
-//! | `notifications/resources/updated`     | `resources:{uri}`                    | `LatestReplaces` |
-//! | `notifications/prompts/listChanged`   | `prompts`                            | `LatestReplaces` |
-//! | custom `notifications/*`              | `_meta.pie_dedup_key` (or legacy `_pie_dedup_key`) | `Drop` |
+//! | MCP method                            | runtime idempotency key                          | replacement      |
+//! |---------------------------------------|--------------------------------------------------|------------------|
+//! | `notifications/tools/listChanged`     | `mcp:{server}:tools`                             | `LatestReplaces` |
+//! | `notifications/resources/listChanged` | `mcp:{server}:resources`                         | `LatestReplaces` |
+//! | `notifications/resources/updated`     | `mcp:{server}:resources:{uri}`                   | `LatestReplaces` |
+//! | `notifications/prompts/listChanged`   | `mcp:{server}:prompts`                           | `LatestReplaces` |
+//! | custom `notifications/*`              | `mcp:{server}:custom:{user-supplied-key}`        | `Drop`           |
 //!
-//! Every raw key above is then **namespaced** with `mcp:{server_name}:` before it reaches
-//! the runtime, so two MCP servers that legitimately produce the same intrinsic key
-//! (`tools/listChanged`, identical custom dedup keys, etc.) do not dedup-cancel each other
-//! in the runtime's global dedup window (PR #56 QA blocker).
+//! Two layers of namespacing:
+//!
+//! - **`mcp:{server_name}:` prefix** keeps the same intrinsic key from two MCP servers
+//!   (e.g. both `tools/listChanged`) from dedup-cancelling each other in the runtime's
+//!   global dedup window (PR #56 QA blocker #1).
+//! - **`custom:` segment** keeps user-supplied dedup keys in their own slot within a
+//!   server, so a custom notification with `_meta.pie_dedup_key = "tools"` cannot collide
+//!   with the built-in `tools/listChanged` row (PR #56 QA blocker #2). Built-in subsystems
+//!   (`tools` / `resources` / `prompts`) own the un-prefixed slot; everything user-provided
+//!   lives under `custom:`.
 //!
 //! A custom notification that provides neither dedup key form is dropped at the adapter
 //! with `dropped_count += 1`; the runtime never sees it. Adapters do **not** dedup
@@ -245,9 +251,16 @@ fn idempotency_for(
             // Custom notification — require an explicit dedup key. Prefer `_meta.pie_dedup_key`
             // (canonical going forward) over `_pie_dedup_key` (legacy, kept for adapters
             // already in the wild). Either form is treated as `Drop` semantics: every
-            // explicit key represents one logical event, no replacement. The server-name
-            // prefix still applies so two servers using the same external key don't collide.
-            extract_dedup_key(params).map(|k| (format!("{prefix}{k}"), ReplacementPolicy::Drop))
+            // explicit key represents one logical event, no replacement.
+            //
+            // The `custom:` segment after the server prefix keeps custom keys in their
+            // own namespace within the server so a user supplying
+            // `_meta.pie_dedup_key = "tools"` does NOT collide with the built-in
+            // `tools/listChanged` row. Built-in subsystems (`tools` / `resources` /
+            // `prompts`) own the un-prefixed slot; everything user-provided lives under
+            // `custom:`. PR #56 QA re-review blocker.
+            extract_dedup_key(params)
+                .map(|k| (format!("{prefix}custom:{k}"), ReplacementPolicy::Drop))
         }
     }
 }
@@ -400,9 +413,9 @@ mod tests {
         let _ = handle.await;
     }
 
-    /// Custom method with `_meta.pie_dedup_key` is accepted with `Drop` policy. Key is
-    /// namespaced with the server prefix so the same external key from two servers does
-    /// not collide.
+    /// Custom method with `_meta.pie_dedup_key` is accepted with `Drop` policy. Key gets
+    /// both the server prefix AND the `custom:` segment so user-supplied keys cannot
+    /// collide with the built-in `tools` / `resources` / `prompts` slots.
     #[tokio::test]
     async fn custom_with_meta_dedup_key_passes_through() {
         let (tx, mut rx, _status, handle) = fixture();
@@ -412,7 +425,7 @@ mod tests {
         ))
         .unwrap();
         let trigger = rx.recv().await.unwrap();
-        assert_eq!(trigger.idempotency_key, "mcp:filesystem:build-42");
+        assert_eq!(trigger.idempotency_key, "mcp:filesystem:custom:build-42");
         assert_eq!(trigger.replacement_policy, ReplacementPolicy::Drop);
         drop(tx);
         let _ = handle.await;
@@ -420,7 +433,7 @@ mod tests {
 
     /// Legacy `_pie_dedup_key` (without `_meta`) is honored for backward compat. Newer
     /// `_meta.pie_dedup_key` takes precedence when both are present. Both forms still get
-    /// the server-name prefix.
+    /// the `mcp:{server}:custom:` prefix.
     #[tokio::test]
     async fn legacy_dedup_key_works_and_meta_wins() {
         let (tx, mut rx, _status, handle) = fixture();
@@ -430,7 +443,7 @@ mod tests {
         ))
         .unwrap();
         let t1 = rx.recv().await.unwrap();
-        assert_eq!(t1.idempotency_key, "mcp:filesystem:legacy-key");
+        assert_eq!(t1.idempotency_key, "mcp:filesystem:custom:legacy-key");
 
         // When both are present, `_meta.pie_dedup_key` wins.
         tx.send(note(
@@ -442,7 +455,7 @@ mod tests {
         ))
         .unwrap();
         let t2 = rx.recv().await.unwrap();
-        assert_eq!(t2.idempotency_key, "mcp:filesystem:new-key");
+        assert_eq!(t2.idempotency_key, "mcp:filesystem:custom:new-key");
 
         drop(tx);
         let _ = handle.await;
@@ -603,6 +616,78 @@ mod tests {
         drop(note_tx_b);
         let _ = handle_a.await;
         let _ = handle_b.await;
+    }
+
+    /// Within a single server, a user-supplied custom dedup key (`_meta.pie_dedup_key`)
+    /// must not collide with the built-in `tools` / `resources` / `prompts` slots. The
+    /// adversarial case: a custom notification with `_meta.pie_dedup_key = "tools"`. Before
+    /// the `custom:` segment fix both events produced `mcp:filesystem:tools` and the
+    /// runtime would dedup them as duplicates; afterwards the custom key sits under
+    /// `mcp:filesystem:custom:tools`. PR #56 QA re-review blocker.
+    #[tokio::test]
+    async fn custom_key_cannot_collide_with_builtin_within_same_server() {
+        let (tx, mut rx, _status, handle) = fixture();
+        // Built-in path.
+        tx.send(note("notifications/tools/listChanged", json!({})))
+            .unwrap();
+        // Adversarial custom path: user picked the exact string the built-in uses.
+        tx.send(note(
+            "notifications/custom/payload",
+            json!({ "_meta": { "pie_dedup_key": "tools" } }),
+        ))
+        .unwrap();
+        // Same adversarial collision for `resources` and `prompts`.
+        tx.send(note(
+            "notifications/custom/payload",
+            json!({ "_meta": { "pie_dedup_key": "resources" } }),
+        ))
+        .unwrap();
+        tx.send(note(
+            "notifications/custom/payload",
+            json!({ "_meta": { "pie_dedup_key": "prompts" } }),
+        ))
+        .unwrap();
+        // And one that mimics the `resources:{uri}` shape of `resources/updated`.
+        tx.send(note(
+            "notifications/custom/payload",
+            json!({ "_meta": { "pie_dedup_key": "resources:file:///x.md" } }),
+        ))
+        .unwrap();
+
+        let t1 = rx.recv().await.unwrap();
+        let t2 = rx.recv().await.unwrap();
+        let t3 = rx.recv().await.unwrap();
+        let t4 = rx.recv().await.unwrap();
+        let t5 = rx.recv().await.unwrap();
+
+        assert_eq!(t1.idempotency_key, "mcp:filesystem:tools");
+        assert_eq!(t2.idempotency_key, "mcp:filesystem:custom:tools");
+        assert_eq!(t3.idempotency_key, "mcp:filesystem:custom:resources");
+        assert_eq!(t4.idempotency_key, "mcp:filesystem:custom:prompts");
+        assert_eq!(
+            t5.idempotency_key,
+            "mcp:filesystem:custom:resources:file:///x.md"
+        );
+
+        // Pairwise distinct — none of the four custom keys equals the built-in or each other.
+        let keys = [
+            &t1.idempotency_key,
+            &t2.idempotency_key,
+            &t3.idempotency_key,
+            &t4.idempotency_key,
+            &t5.idempotency_key,
+        ];
+        for (i, a) in keys.iter().enumerate() {
+            for b in &keys[i + 1..] {
+                assert_ne!(
+                    a, b,
+                    "custom/built-in same-server key collision: {a} vs {b}"
+                );
+            }
+        }
+
+        drop(tx);
+        let _ = handle.await;
     }
 
     /// `payload_visibility = Local` means the full `payload` is dropped; only
