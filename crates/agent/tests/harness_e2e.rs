@@ -1666,6 +1666,12 @@ async fn before_trigger_deny_records_permission_denied_state_and_reason() {
     opts.before_trigger = Some(deny_hook);
     let harness = AgentHarness::new(opts);
 
+    let events = Arc::new(std::sync::Mutex::new(Vec::<HarnessEvent>::new()));
+    let sink = events.clone();
+    let _unsub = harness.subscribe_harness(Arc::new(move |ev: HarnessEvent| {
+        sink.lock().unwrap().push(ev);
+    }));
+
     let outcome = harness
         .handle_trigger(sample_trigger("perm-deny", "trace-deny"))
         .await;
@@ -1697,6 +1703,29 @@ async fn before_trigger_deny_records_permission_denied_state_and_reason() {
     assert_eq!(decision["permission"].as_str(), Some("deny"));
     assert_eq!(
         decision["reason"].as_str(),
+        Some("principal not on allow-list")
+    );
+
+    // The live event must carry the same evaluator_decision the audit got, so TUI / JSONL
+    // subscribers can render the deny reason without re-reading the session.
+    let evs = events.lock().unwrap().clone();
+    let event_decision = evs
+        .iter()
+        .find_map(|e| match e {
+            HarnessEvent::TriggerHandled {
+                state,
+                evaluator_decision,
+                ..
+            } if *state == pie_agent_core::TriggerState::PermissionDenied => {
+                Some(evaluator_decision.clone())
+            }
+            _ => None,
+        })
+        .expect("TriggerHandled event with PermissionDenied state must exist");
+    let event_decision = event_decision.expect("event must carry evaluator_decision");
+    assert_eq!(event_decision["permission"].as_str(), Some("deny"));
+    assert_eq!(
+        event_decision["reason"].as_str(),
         Some("principal not on allow-list")
     );
 }
@@ -1751,14 +1780,29 @@ async fn before_trigger_prompt_records_needs_approval_state_and_reason() {
     );
 
     let evs = events.lock().unwrap().clone();
-    let handled_state = evs.iter().find_map(|e| match e {
-        HarnessEvent::TriggerHandled { state, .. } => Some(*state),
-        _ => None,
-    });
+    let (handled_state, handled_decision) = evs
+        .iter()
+        .find_map(|e| match e {
+            HarnessEvent::TriggerHandled {
+                state,
+                evaluator_decision,
+                ..
+            } => Some((*state, evaluator_decision.clone())),
+            _ => None,
+        })
+        .expect("must emit TriggerHandled");
     assert_eq!(
         handled_state,
-        Some(pie_agent_core::TriggerState::NeedsApproval),
+        pie_agent_core::TriggerState::NeedsApproval,
         "TriggerHandled event must carry the policy-terminal state"
+    );
+    // Live subscribers (TUI banner, JSONL logs) must be able to render the prompt reason
+    // straight from the event without a secondary session lookup.
+    let decision = handled_decision.expect("TriggerHandled must carry evaluator_decision");
+    assert_eq!(decision["permission"].as_str(), Some("prompt"));
+    assert_eq!(
+        decision["reason"].as_str(),
+        Some("Cloudflare hub trigger from new principal")
     );
 }
 

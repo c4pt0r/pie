@@ -63,16 +63,30 @@ pub enum HarnessEvent {
         trace_id: String,
     },
     /// Terminal: the trigger reached an end state. `state` is one of the terminal variants
-    /// (`Accepted` / `Deduped` / `CycleSuppressed` / etc. — `Accepted` is terminal for this
-    /// sub-PR slice, the running/completed transition lands with the agent-loop wiring in
-    /// sub-PR 3). `audit_entry_id` is the `SessionTreeEntry::Custom` id when persistence
-    /// succeeded, `None` if persistence failed (a parallel `PersistenceError` event will
-    /// describe the failure).
+    /// (`Accepted` / `Deduped` / `CycleSuppressed` / `PermissionDenied` / `NeedsApproval`
+    /// — `Accepted` is terminal for this sub-PR slice; the `Running`/`Completed`/`Failed`
+    /// transitions land with the agent-loop wiring in a follow-up).
+    ///
+    /// `audit_entry_id` is the `SessionTreeEntry::Custom` id when persistence succeeded,
+    /// `None` if persistence failed (a parallel `PersistenceError` event will describe
+    /// the failure).
+    ///
+    /// `evaluator_decision` mirrors what was persisted in the audit record (same JSON
+    /// shape) so live subscribers (TUI banner, `/triggers`, JSONL logs) can render *why*
+    /// the trigger reached its state without a secondary session lookup. Shape:
+    /// - Accept (Allow): `{ "outcome": "accept", "permission": "allow" }`
+    /// - Accept (Deny):  `{ "outcome": "accept", "permission": "deny",   "reason": ... }`
+    /// - Accept (Prompt):`{ "outcome": "accept", "permission": "prompt", "reason": ... }`
+    /// - Deduped:        `{ "outcome": "deduped", "replacement_policy": ..., "previous_trace_id": ... }`
+    /// - CycleSuppressed:`{ "outcome": "cycle_suppressed", "hop_count": N }`
+    ///
+    /// `None` only when audit serialization failed (a `PersistenceError` will accompany).
     TriggerHandled {
         idempotency_key: String,
         trace_id: String,
         state: super::trigger::TriggerState,
         audit_entry_id: Option<String>,
+        evaluator_decision: Option<serde_json::Value>,
     },
     /// Best-effort persistence error reflux. Currently fires only when the trigger audit
     /// `Custom` entry write failed in `handle_trigger`. The trigger itself still produced
@@ -438,7 +452,7 @@ impl AgentHarness {
 
         let mut record = TriggerRecord::received_from(&trigger);
         record.state = state;
-        record.evaluator_decision = evaluator_decision;
+        record.evaluator_decision = evaluator_decision.clone();
 
         let audit_payload = match serde_json::to_value(&record) {
             Ok(v) => Some(v),
@@ -477,6 +491,7 @@ impl AgentHarness {
             trace_id: trigger.trace_id,
             state,
             audit_entry_id,
+            evaluator_decision,
         });
 
         outcome

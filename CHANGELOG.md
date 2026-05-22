@@ -173,8 +173,13 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
   can reason over the full trigger envelope (authority / source / payload summary)
   plus a live `TriggerRuntimeSnapshot` (e.g. for burst-rate rules). `reason` strings
   appear in audit + observability surfaces and must not carry secrets — Provider/Auth
-  reviewed the boundary. 4 new integration tests pin default-Allow, Deny→PermissionDenied,
-  Prompt→NeedsApproval, and that the hook is bypassed on the Deduped path.
+  reviewed the boundary. The deny/prompt reason is also surfaced on
+  `HarnessEvent::TriggerHandled.evaluator_decision` (new field; mirrors the audit
+  record's `evaluator_decision`) so live subscribers (TUI banner, JSONL logs) can
+  render why a trigger was denied/needs approval without a secondary session lookup.
+  4 new integration tests pin default-Allow, Deny→PermissionDenied (asserting both the
+  audit record AND the event carry the reason), Prompt→NeedsApproval (same dual
+  assertion), and that the hook is bypassed on the Deduped path.
 
 ### Fixed
 
