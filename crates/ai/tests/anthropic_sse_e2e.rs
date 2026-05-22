@@ -7,8 +7,8 @@
 
 use futures::StreamExt;
 use pie_ai::{
-    Api, AssistantMessageEvent, Context, KnownApi, Message, Model, ModelCost, Provider,
-    StreamOptions, UserContent, UserMessage, UserRole, stream,
+    Api, AssistantMessageEvent, ContentBlock, Context, KnownApi, Message, Model, ModelCost,
+    Provider, StreamOptions, UserContent, UserMessage, UserRole, stream,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -139,11 +139,22 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
 
     let mut s = stream(&model, &user_ctx("weather?"), Some(&opts));
     let mut saw_tool_start = false;
+    let mut tool_end_args = None;
     let mut done_reason = None;
+    let mut done_args = None;
     while let Some(ev) = s.next().await {
         match ev {
             AssistantMessageEvent::ToolCallStart { .. } => saw_tool_start = true,
-            AssistantMessageEvent::Done { reason, .. } => done_reason = Some(reason),
+            AssistantMessageEvent::ToolCallEnd { tool_call, .. } => {
+                tool_end_args = Some(tool_call.arguments);
+            }
+            AssistantMessageEvent::Done { reason, message } => {
+                done_reason = Some(reason);
+                done_args = message.content.iter().find_map(|block| match block {
+                    ContentBlock::ToolCall(tc) => Some(tc.arguments.clone()),
+                    _ => None,
+                });
+            }
             AssistantMessageEvent::Error { error, .. } => {
                 panic!("unexpected error: {:?}", error.error_message)
             }
@@ -151,6 +162,20 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         }
     }
     assert!(saw_tool_start, "expected a ToolCallStart event");
+    assert_eq!(
+        tool_end_args
+            .as_ref()
+            .and_then(|args| args.get("city"))
+            .and_then(|v| v.as_str()),
+        Some("sf")
+    );
+    assert_eq!(
+        done_args
+            .as_ref()
+            .and_then(|args| args.get("city"))
+            .and_then(|v| v.as_str()),
+        Some("sf")
+    );
     assert_eq!(done_reason, Some(pie_ai::DoneReason::ToolUse));
 }
 

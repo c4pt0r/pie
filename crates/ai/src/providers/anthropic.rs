@@ -23,6 +23,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
+use std::collections::HashMap;
 
 use crate::api_registry::ApiProvider;
 use crate::types::*;
@@ -250,6 +251,7 @@ async fn run(
     }
 
     let mut partial = empty_partial(&model);
+    let mut tool_arg_buffers: HashMap<usize, String> = HashMap::new();
     sender.push(AssistantMessageEvent::Start {
         partial: partial.clone(),
     });
@@ -265,7 +267,7 @@ async fn run(
                 return;
             }
             Ok(ev) => {
-                if !handle_sse(&ev, &mut partial, &mut sender) {
+                if !handle_sse(&ev, &mut partial, &mut tool_arg_buffers, &mut sender) {
                     return;
                 }
             }
@@ -287,6 +289,7 @@ async fn run(
 fn handle_sse(
     ev: &crate::utils::sse::SseEvent,
     partial: &mut AssistantMessage,
+    tool_arg_buffers: &mut HashMap<usize, String>,
     sender: &mut AssistantMessageEventSender,
 ) -> bool {
     let Ok(payload): Result<Value, _> = serde_json::from_str(&ev.data) else {
@@ -306,8 +309,10 @@ fn handle_sse(
             }
         }
         "content_block_start" => on_content_block_start(&payload, partial, sender),
-        "content_block_delta" => on_content_block_delta(&payload, partial, sender),
-        "content_block_stop" => on_content_block_stop(&payload, partial, sender),
+        "content_block_delta" => {
+            on_content_block_delta(&payload, partial, tool_arg_buffers, sender)
+        }
+        "content_block_stop" => on_content_block_stop(&payload, partial, tool_arg_buffers, sender),
         "message_delta" => {
             if let Some(reason) = payload
                 .pointer("/delta/stop_reason")
@@ -417,6 +422,7 @@ fn on_content_block_start(
 fn on_content_block_delta(
     payload: &Value,
     partial: &mut AssistantMessage,
+    tool_arg_buffers: &mut HashMap<usize, String>,
     sender: &mut AssistantMessageEventSender,
 ) {
     let idx = payload["index"].as_u64().unwrap_or(0) as usize;
@@ -446,6 +452,7 @@ fn on_content_block_delta(
         }
         "input_json_delta" => {
             let t = delta["partial_json"].as_str().unwrap_or("").to_string();
+            tool_arg_buffers.entry(idx).or_default().push_str(&t);
             sender.push(AssistantMessageEvent::ToolCallDelta {
                 content_index: idx,
                 delta: t,
@@ -467,15 +474,17 @@ fn on_content_block_delta(
 fn on_content_block_stop(
     payload: &Value,
     partial: &mut AssistantMessage,
+    tool_arg_buffers: &mut HashMap<usize, String>,
     sender: &mut AssistantMessageEventSender,
 ) {
     let idx = payload["index"].as_u64().unwrap_or(0) as usize;
     // Tool-call arguments arrive as JSON fragments; assemble + parse on stop. Mirrors the TS
     // `partial-json` flow.
     if let Some(ContentBlock::ToolCall(tc)) = partial.content.get_mut(idx) {
-        let assembled = collect_tool_args_from_events(idx, sender);
-        if !assembled.is_empty() {
-            if let Ok(Value::Object(map)) = crate::utils::json_parse::parse_partial_json(&assembled)
+        if let Some(assembled) = tool_arg_buffers.remove(&idx) {
+            if !assembled.is_empty()
+                && let Ok(Value::Object(map)) =
+                    crate::utils::json_parse::parse_partial_json(&assembled)
             {
                 tc.arguments = map;
             }
@@ -506,18 +515,6 @@ fn on_content_block_stop(
         }
         _ => {}
     }
-}
-
-/// Tool-args arrive as `ToolCallDelta` events — but the sender side cannot peek inside its own
-/// channel. In TS the same object is used for read/write; in Rust we just keep a per-call buffer
-/// on the partial's `ToolCall::arguments` (serialized as text). For the moment we accept that
-/// arguments are populated only when the delta payloads come through here; downstream
-/// consumers see the assembled object via the `tool_call` block in `ToolCallEnd`.
-fn collect_tool_args_from_events(_idx: usize, _sender: &AssistantMessageEventSender) -> String {
-    // TODO: thread the accumulated `partial_json` chunks through `partial.content[idx]` once
-    // we extend ContentBlock::ToolCall with a raw-args buffer. For now we rely on consumers
-    // reading the per-event deltas.
-    String::new()
 }
 
 fn map_stop_reason(s: &str) -> StopReason {

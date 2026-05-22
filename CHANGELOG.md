@@ -125,6 +125,10 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
 
 ### Fixed
 
+- Anthropic `input_json_delta` fragments are now assembled into the final
+  `ToolCall.arguments` object before `ToolCallEnd` / `Done`. Previously tool calls streamed
+  their name and id correctly but ended with empty `{}` arguments, so downstream tools could
+  be invoked without the model-provided parameters.
 - **#48** `/share` no longer passes the removed `gh gist create --secret` flag. Secret
   gists are the GitHub CLI default; `/share --public` still passes `--public`, and errors
   continue to preserve the underlying `gh` stderr.
