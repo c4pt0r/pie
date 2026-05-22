@@ -9,7 +9,7 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::errors::McpError;
 use crate::protocol::{
@@ -17,6 +17,25 @@ use crate::protocol::{
     PROTOCOL_VERSION, RpcError, ToolsCallParams, ToolsListResult, make_notification, make_request,
 };
 use crate::transport::Transport;
+
+/// One server-pushed JSON-RPC notification surfaced by [`McpClient::take_notifications`].
+///
+/// MCP servers emit notifications without an `id` field. The client previously dropped them
+/// silently; per RFC 1 §4.2.1 we now route them through an `mpsc` channel so the
+/// notification-hook adapter in `crates/coding-agent` can map each one into a `Trigger`
+/// envelope. Consumers (e.g. `McpNotificationHook`) call [`McpClient::take_notifications`]
+/// once at startup to obtain the receiver; the channel is allocated unconditionally so this
+/// addition is fully additive — clients that never call `take_notifications` keep the prior
+/// silent-drop behaviour (the receiver lives inside the client and the buffer is freed when
+/// the client is dropped).
+#[derive(Clone, Debug)]
+pub struct McpServerNotification {
+    /// JSON-RPC `method` field, e.g. `"notifications/tools/listChanged"`.
+    pub method: String,
+    /// JSON-RPC `params` field (typically a JSON object). Set to `Value::Null` when the
+    /// server omitted it.
+    pub params: serde_json::Value,
+}
 
 /// Caller-facing capabilities advertised to the server. v1 advertises nothing — we're a
 /// pure-consumer client (we run their tools, not the other way around).
@@ -33,6 +52,12 @@ pub struct McpClient {
     request_timeout: Duration,
     /// Server tool catalog after `tools/list` succeeds. Cached so consumers don't re-fetch.
     catalog: Arc<Mutex<Vec<McpTool>>>,
+    /// Receiver half of the server-notification channel. Owned by the client until a
+    /// consumer calls [`Self::take_notifications`]; thereafter it lives inside the
+    /// consumer's task. Held in a `Mutex` because the receiver is taken at most once and
+    /// the take operation runs from outside the constructor. The sender half is moved into
+    /// the read pump's tokio task at construction time and is dropped when the pump exits.
+    notify_rx: Mutex<Option<mpsc::UnboundedReceiver<McpServerNotification>>>,
 }
 
 impl McpClient {
@@ -48,6 +73,7 @@ impl McpClient {
         > = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let pump_inflight = inflight.clone();
         let pump_transport = transport.clone();
+        let (pump_notify_tx, notify_rx) = mpsc::unbounded_channel::<McpServerNotification>();
         tokio::spawn(async move {
             loop {
                 match pump_transport.recv_line().await {
@@ -59,8 +85,22 @@ impl McpClient {
                         };
                         let id = value.get("id").and_then(|v| v.as_u64());
                         if id.is_none() {
-                            // Notification from server — ignore in v1 (no resource
-                            // subscriptions yet).
+                            // Server-pushed notification (no `id` per JSON-RPC). Route it to
+                            // the notification channel so the consumer (typically
+                            // `McpNotificationHook` in `crates/coding-agent`) can normalize
+                            // it into a `Trigger` envelope. If no consumer took the
+                            // receiver, the message buffers in the channel and is freed
+                            // when the client is dropped — same blast radius as the
+                            // previous silent-drop behaviour.
+                            let method = match value.get("method").and_then(|m| m.as_str()) {
+                                Some(m) => m.to_string(),
+                                None => continue,
+                            };
+                            let params = value
+                                .get("params")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null);
+                            let _ = pump_notify_tx.send(McpServerNotification { method, params });
                             continue;
                         }
                         let id = id.unwrap();
@@ -109,7 +149,17 @@ impl McpClient {
             initialized: Arc::new(Mutex::new(false)),
             request_timeout: Duration::from_secs(30),
             catalog: Arc::new(Mutex::new(Vec::new())),
+            notify_rx: Mutex::new(Some(notify_rx)),
         }
+    }
+
+    /// Take ownership of the server-notification receiver. Returns `Some(rx)` on the first
+    /// call and `None` on every call thereafter. Intended for `McpNotificationHook` (in
+    /// `crates/coding-agent`) to wire its outbound `TriggerSink` to the inbound MCP frames.
+    /// If no consumer ever calls this, server-pushed notifications buffer inside the channel
+    /// until the client is dropped — equivalent to the prior silent-drop behaviour.
+    pub fn take_notifications(&self) -> Option<mpsc::UnboundedReceiver<McpServerNotification>> {
+        self.notify_rx.lock().take()
     }
 
     pub fn with_timeout(mut self, t: Duration) -> Self {
