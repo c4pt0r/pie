@@ -122,6 +122,28 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
   **Pure logic — no I/O, no session writes, no harness wiring yet**; the
   `AgentHarness::handle_trigger` entrypoint that consumes this evaluator and persists
   the audit `Custom` entry lands in sub-PR 2.
+- **#20 (handle_trigger + audit + status snapshot)** `AgentHarness::handle_trigger(trigger)`
+  is now the runtime entrypoint for accepted notifications: it emits
+  `HarnessEvent::TriggerHandlingStart`, runs the dedup + cycle evaluator, persists a
+  `SessionTreeEntry::Custom { custom_type: "trigger", data: TriggerRecord }` audit entry
+  capturing the evaluator decision, and emits `HarnessEvent::TriggerHandled` with the
+  resulting `TriggerState` (`Accepted` / `Deduped` / `CycleSuppressed`). Audit
+  persistence is best-effort: when the session storage write fails, the trigger
+  evaluation outcome is still returned and `HarnessEvent::PersistenceError { context:
+  "trigger_audit", message }` is emitted alongside `TriggerHandled { audit_entry_id:
+  None }` so observability surfaces (TUI banner, `/triggers`, JSONL logs) can mark the
+  audit as best-effort lost rather than dropping it silently. New
+  `AgentHarness::notification_status_snapshot()` returns a copy-friendly
+  `NotificationStatusSnapshot { hooks, runtime }` for status banners — `runtime` is the
+  fresh `TriggerRuntimeSnapshot { dedup_entries, active_traces, accepted_total,
+  deduped_total, cycle_suppressed_total }`; `hooks` is an empty `Vec` in this PR (hook
+  registration + supervisor land in a follow-up so the shape is here today). New
+  `AgentHarnessOptions::trigger_runtime` lets callers override
+  `dedup_window` / `cycle_hop_limit`. The `Accepted → Running → Completed/Failed`
+  transition (real action execution) lands with the permission evaluator extension in
+  sub-PR 3 — `Accepted` is terminal for this slice. 5 new integration tests pin the
+  audit shape, dedup state propagation, cycle suppression, snapshot counter
+  monotonicity, and the persistence-failure reflux contract.
 
 ### Fixed
 

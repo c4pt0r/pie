@@ -95,6 +95,30 @@ struct Inner {
     /// is "done"), so we cap each entry's lifetime to one cycle window (= `dedup_window`,
     /// reused for simplicity) and prune the same way as the dedup map.
     cycle: HashMap<String, CycleEntry>,
+    /// Monotonic counters surfaced through [`TriggerRuntime::snapshot`] for TUI / `/triggers`
+    /// observability. These never decrement and survive entry pruning.
+    deduped_total: u64,
+    cycle_suppressed_total: u64,
+    accepted_total: u64,
+}
+
+/// Point-in-time view of the runtime's dedup + cycle bookkeeping. Cheap to copy; used by
+/// [`super::agent_harness::AgentHarness::notification_status_snapshot`] for status banners
+/// and `/triggers` rendering.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TriggerRuntimeSnapshot {
+    /// Number of distinct `idempotency_key` entries currently inside the dedup window.
+    pub dedup_entries: usize,
+    /// Number of distinct `trace_id` chains currently inside the cycle window.
+    pub active_traces: usize,
+    /// Lifetime count of triggers that admitted (advanced the dedup map + cycle counter).
+    pub accepted_total: u64,
+    /// Lifetime count of triggers that were dropped because their `idempotency_key`
+    /// matched an entry still inside the dedup window.
+    pub deduped_total: u64,
+    /// Lifetime count of triggers that were dropped because their `trace_id` exceeded
+    /// `cycle_hop_limit`.
+    pub cycle_suppressed_total: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -126,8 +150,25 @@ impl TriggerRuntime {
             inner: std::sync::Arc::new(Mutex::new(Inner {
                 dedup: HashMap::new(),
                 cycle: HashMap::new(),
+                deduped_total: 0,
+                cycle_suppressed_total: 0,
+                accepted_total: 0,
             })),
             config,
+        }
+    }
+
+    /// Point-in-time view of the dedup / cycle bookkeeping plus lifetime counters. Intended
+    /// for status banners; cheap (one mutex lock + struct copy). Lifetime counters never
+    /// decrement so consumers can build delta UIs without missing intermediate events.
+    pub fn snapshot(&self) -> TriggerRuntimeSnapshot {
+        let inner = self.inner.lock();
+        TriggerRuntimeSnapshot {
+            dedup_entries: inner.dedup.len(),
+            active_traces: inner.cycle.len(),
+            accepted_total: inner.accepted_total,
+            deduped_total: inner.deduped_total,
+            cycle_suppressed_total: inner.cycle_suppressed_total,
         }
     }
 
@@ -157,19 +198,23 @@ impl TriggerRuntime {
         // Dedup check runs first because a duplicate event is never "real" for cycle
         // counting — we do not want a deduped event to consume hop budget.
         if let Some(prev) = inner.dedup.get(&trigger.idempotency_key) {
-            return EvaluationOutcome::Deduped {
+            let outcome = EvaluationOutcome::Deduped {
                 replacement_policy: prev.replacement_policy,
                 previous_trace_id: prev.trace_id.clone(),
             };
+            inner.deduped_total = inner.deduped_total.saturating_add(1);
+            return outcome;
         }
 
         // Cycle check runs against the trace counter as it stands BEFORE this trigger; if
         // we are already at the limit, suppress without advancing.
         if let Some(existing) = inner.cycle.get(&trigger.trace_id) {
             if existing.hop_count >= self.config.cycle_hop_limit {
-                return EvaluationOutcome::CycleSuppressed {
+                let outcome = EvaluationOutcome::CycleSuppressed {
                     hop_count: existing.hop_count,
                 };
+                inner.cycle_suppressed_total = inner.cycle_suppressed_total.saturating_add(1);
+                return outcome;
             }
         }
 
@@ -193,6 +238,7 @@ impl TriggerRuntime {
                 hop_count: 1,
                 last_seen_at: now,
             });
+        inner.accepted_total = inner.accepted_total.saturating_add(1);
 
         EvaluationOutcome::Accept
     }
@@ -464,6 +510,36 @@ mod tests {
         assert_eq!(
             runtime.evaluate(&make_trigger("k-b-1", "trace-b", ReplacementPolicy::Drop)),
             EvaluationOutcome::Accept
+        );
+    }
+
+    #[test]
+    fn snapshot_counters_track_each_outcome() {
+        let runtime = TriggerRuntime::with_config(TriggerRuntimeConfig {
+            dedup_window: Duration::from_secs(300),
+            cycle_hop_limit: 2,
+        });
+        // accepted: 2 (two distinct keys / trace)
+        runtime.evaluate(&make_trigger("k1", "ta", ReplacementPolicy::Drop));
+        runtime.evaluate(&make_trigger("k2", "tb", ReplacementPolicy::Drop));
+        // deduped: 1 (duplicate of k1)
+        runtime.evaluate(&make_trigger("k1", "tc", ReplacementPolicy::Drop));
+        // cycle-suppress: take trace-a to limit + 1 over
+        runtime.evaluate(&make_trigger("k3", "ta", ReplacementPolicy::Drop));
+        // ta is now at hop 2 (limit). next evaluate hits CycleSuppressed.
+        runtime.evaluate(&make_trigger("k4", "ta", ReplacementPolicy::Drop));
+
+        let snap = runtime.snapshot();
+        assert_eq!(snap.accepted_total, 3, "snapshot: {snap:?}");
+        assert_eq!(snap.deduped_total, 1, "snapshot: {snap:?}");
+        assert_eq!(snap.cycle_suppressed_total, 1, "snapshot: {snap:?}");
+        assert!(
+            snap.dedup_entries >= 1,
+            "dedup map must hold at least one live entry"
+        );
+        assert!(
+            snap.active_traces >= 1,
+            "cycle map must hold at least one live trace"
         );
     }
 }

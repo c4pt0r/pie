@@ -24,7 +24,10 @@ pub use types::{
 
 #[cfg(feature = "harness")]
 pub use harness::{
-    agent_harness::{AgentHarness, AgentHarnessOptions, HarnessEvent, HarnessListener},
+    agent_harness::{
+        AgentHarness, AgentHarnessOptions, HarnessEvent, HarnessListener,
+        NotificationStatusSnapshot,
+    },
     compaction::{
         branch_summarization::{BranchSummaryResult, summarize_branch},
         compaction::{
@@ -68,7 +71,9 @@ pub use harness::{
         CredentialScope, PayloadVisibility, ReplacementPolicy, SourceKind, Trigger,
         TriggerAuthority, TriggerRecord, TriggerSource, TriggerState,
     },
-    trigger_runtime::{EvaluationOutcome, TriggerRuntime, TriggerRuntimeConfig},
+    trigger_runtime::{
+        EvaluationOutcome, TriggerRuntime, TriggerRuntimeConfig, TriggerRuntimeSnapshot,
+    },
     types::{
         ExecOptions, ExecOutput, ExecResult, ExecutionEnv, ExecutionError, ExecutionErrorCode,
         FileError, FileErrorCode, FileInfo, FileKind, FsResult, PromptTemplate, SessionError,

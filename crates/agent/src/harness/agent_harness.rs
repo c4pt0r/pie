@@ -52,6 +52,42 @@ pub enum HarnessEvent {
         to_entry_id: Option<String>,
         summary_entry_id: Option<String>,
     },
+    /// The harness has admitted a [`Trigger`] for processing — fires immediately at the
+    /// start of [`AgentHarness::handle_trigger`] before evaluation. Carries the source
+    /// identification needed to render a "processing X" banner. RFC 1 §2.7.
+    TriggerHandlingStart {
+        idempotency_key: String,
+        source_kind: super::trigger::SourceKind,
+        source_label: String,
+        event_label: String,
+        trace_id: String,
+    },
+    /// Terminal: the trigger reached an end state. `state` is one of the terminal variants
+    /// (`Accepted` / `Deduped` / `CycleSuppressed` / etc. — `Accepted` is terminal for this
+    /// sub-PR slice, the running/completed transition lands with the agent-loop wiring in
+    /// sub-PR 3). `audit_entry_id` is the `SessionTreeEntry::Custom` id when persistence
+    /// succeeded, `None` if persistence failed (a parallel `PersistenceError` event will
+    /// describe the failure).
+    TriggerHandled {
+        idempotency_key: String,
+        trace_id: String,
+        state: super::trigger::TriggerState,
+        audit_entry_id: Option<String>,
+    },
+    /// Best-effort persistence error reflux. Currently fires only when the trigger audit
+    /// `Custom` entry write failed in `handle_trigger`. The trigger itself still produced
+    /// a `TriggerHandled` event with `audit_entry_id = None`; this event explains why so
+    /// that observability (TUI banner, `/triggers`, JSONL logs) can mark the audit as
+    /// best-effort lost rather than dropping it silently.
+    PersistenceError {
+        /// Free-form context — currently always `"trigger_audit"`. New write sites that
+        /// surface through this event must pin themselves to a stable string.
+        context: String,
+        /// Short, secret-free message. The original `SessionError` is *not* exposed because
+        /// some implementations include filesystem paths or storage backend details that
+        /// belong in trace logs, not user-facing event surfaces.
+        message: String,
+    },
 }
 
 /// Listener for [`HarnessEvent`]. Shape mirrors `crate::agent::AgentListener` so the same Fn
@@ -64,11 +100,31 @@ use super::compaction::compaction::{
 };
 use super::cost::{CostSnapshot, CostTracker};
 use super::messages::compaction_summary;
+use super::notification_hook::NotificationHookStatus;
 use super::prompt_templates::PromptTemplateRegistry;
 use super::session::session::{BranchSummaryInput, Session};
 use super::skills::format_skill_invocation;
 use super::system_prompt::format_skills_for_system_prompt;
+use super::trigger::{Trigger, TriggerRecord, TriggerState};
+use super::trigger_runtime::{
+    EvaluationOutcome, TriggerRuntime, TriggerRuntimeConfig, TriggerRuntimeSnapshot,
+};
 use super::types::{PromptTemplate, Skill};
+
+/// Aggregated, copy-friendly snapshot returned by
+/// [`AgentHarness::notification_status_snapshot`]. The TUI / `/triggers hooks` command
+/// renders this directly; `hooks` is intentionally a snapshot `Vec` (not a live view) so the
+/// caller cannot pin the hook registry against new registrations.
+///
+/// Hook registry is currently empty in v1 of this PR — `register_notification_hook` lands
+/// alongside the hook supervisor in a follow-up. The shape is here so CLI/TUI can render
+/// `notifications: local mode (no hooks) — 0 waiting` against the real API today and not
+/// have to refactor when hooks become non-empty.
+#[derive(Clone, Debug)]
+pub struct NotificationStatusSnapshot {
+    pub hooks: Vec<NotificationHookStatus>,
+    pub runtime: TriggerRuntimeSnapshot,
+}
 
 pub struct AgentHarnessOptions {
     /// Base system prompt prepended to the rendered skill catalog.
@@ -91,6 +147,9 @@ pub struct AgentHarnessOptions {
     /// Per-session USD cap. When set, the harness refuses to start a new prompt once the
     /// running cost exceeds the cap. `None` disables the check.
     pub budget_cap_usd: Option<f64>,
+    /// Optional trigger runtime config override. Defaults to
+    /// [`TriggerRuntimeConfig::default`] (5-minute dedup, 5-hop cycle limit).
+    pub trigger_runtime: TriggerRuntimeConfig,
 }
 
 impl AgentHarnessOptions {
@@ -108,6 +167,7 @@ impl AgentHarnessOptions {
             before_tool_call: None,
             after_tool_call: None,
             budget_cap_usd: None,
+            trigger_runtime: TriggerRuntimeConfig::default(),
         }
     }
 }
@@ -131,6 +191,9 @@ pub struct AgentHarness {
     /// internal listener subscribed to `Agent::MessageEnd`. Snapshot via [`Self::cost`].
     cost: CostTracker,
     budget_cap_usd: Option<f64>,
+    /// In-memory dedup + cycle evaluator shared with [`Self::handle_trigger`]. Exposed via
+    /// [`Self::notification_status_snapshot`] for observability.
+    trigger_runtime: TriggerRuntime,
 }
 
 impl AgentHarness {
@@ -166,6 +229,7 @@ impl AgentHarness {
             session_start_emitted: Mutex::new(false),
             cost,
             budget_cap_usd: options.budget_cap_usd,
+            trigger_runtime: TriggerRuntime::with_config(options.trigger_runtime),
         }
     }
 
@@ -225,6 +289,113 @@ impl AgentHarness {
 
     pub fn agent(&self) -> &Agent {
         &self.agent
+    }
+
+    /// Accept an incoming [`Trigger`] from a notification adapter. Evaluates it against the
+    /// runtime's dedup + cycle bookkeeping, persists a
+    /// `SessionTreeEntry::Custom { custom_type: "trigger" }` audit entry summarizing the
+    /// decision, and emits [`HarnessEvent::TriggerHandlingStart`] / [`HarnessEvent::TriggerHandled`].
+    ///
+    /// Returns the [`EvaluationOutcome`] so adapters that synchronously dispatched the
+    /// trigger know whether downstream rule evaluation should proceed. In this PR `Accept`
+    /// is terminal — actually invoking the agent loop on an accepted trigger lands with the
+    /// permission evaluator extension and the running-state machine in sub-PR 3.
+    ///
+    /// Persistence is best-effort: if the audit write fails, this method still returns the
+    /// evaluator outcome and emits a [`HarnessEvent::PersistenceError`] alongside the
+    /// `TriggerHandled` event (with `audit_entry_id = None`). The trigger evaluation is
+    /// authoritative; the audit record is observability.
+    pub async fn handle_trigger(&self, trigger: Trigger) -> EvaluationOutcome {
+        self.emit_harness_event(HarnessEvent::TriggerHandlingStart {
+            idempotency_key: trigger.idempotency_key.clone(),
+            source_kind: trigger.source_kind,
+            source_label: trigger.source_label.clone(),
+            event_label: trigger.event_label.clone(),
+            trace_id: trigger.trace_id.clone(),
+        });
+
+        let outcome = self.trigger_runtime.evaluate(&trigger);
+
+        let (state, evaluator_decision) = match &outcome {
+            EvaluationOutcome::Accept => (
+                TriggerState::Accepted,
+                Some(serde_json::json!({ "outcome": "accept" })),
+            ),
+            EvaluationOutcome::Deduped {
+                replacement_policy,
+                previous_trace_id,
+            } => (
+                TriggerState::Deduped,
+                Some(serde_json::json!({
+                    "outcome": "deduped",
+                    "replacement_policy": replacement_policy,
+                    "previous_trace_id": previous_trace_id,
+                })),
+            ),
+            EvaluationOutcome::CycleSuppressed { hop_count } => (
+                TriggerState::CycleSuppressed,
+                Some(serde_json::json!({
+                    "outcome": "cycle_suppressed",
+                    "hop_count": hop_count,
+                })),
+            ),
+        };
+
+        let mut record = TriggerRecord::received_from(&trigger);
+        record.state = state;
+        record.evaluator_decision = evaluator_decision;
+
+        let audit_payload = match serde_json::to_value(&record) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                // Audit serialization failure is a programming error (the type derives
+                // Serialize over wholly-owned fields), but we don't want to panic on it
+                // from a user-driven path. Surface as PersistenceError and proceed.
+                self.emit_harness_event(HarnessEvent::PersistenceError {
+                    context: "trigger_audit".into(),
+                    message: format!("trigger record serialization failed: {e}"),
+                });
+                None
+            }
+        };
+
+        let audit_entry_id = match audit_payload {
+            Some(payload) => match self
+                .session
+                .append_custom(TriggerRecord::CUSTOM_TYPE, Some(payload))
+                .await
+            {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    self.emit_harness_event(HarnessEvent::PersistenceError {
+                        context: "trigger_audit".into(),
+                        message: format!("trigger audit append failed: {:?}", e.code),
+                    });
+                    None
+                }
+            },
+            None => None,
+        };
+
+        self.emit_harness_event(HarnessEvent::TriggerHandled {
+            idempotency_key: trigger.idempotency_key,
+            trace_id: trigger.trace_id,
+            state,
+            audit_entry_id,
+        });
+
+        outcome
+    }
+
+    /// Point-in-time view of the harness's notification surface — currently the
+    /// [`TriggerRuntimeSnapshot`] plus an empty hook list. Hook registration + supervisor
+    /// land in a follow-up PR; the shape is here so CLI/TUI can render banners against the
+    /// real API today and not have to refactor when the registry becomes non-empty.
+    pub fn notification_status_snapshot(&self) -> NotificationStatusSnapshot {
+        NotificationStatusSnapshot {
+            hooks: Vec::new(),
+            runtime: self.trigger_runtime.snapshot(),
+        }
     }
 
     pub fn session(&self) -> &Session {

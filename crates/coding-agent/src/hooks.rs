@@ -642,7 +642,11 @@ impl EventData {
                 d.compaction_summary = Some(truncate(summary));
                 Some(d)
             }
-            HarnessEvent::SessionStart { .. } | HarnessEvent::Branch { .. } => None,
+            HarnessEvent::SessionStart { .. }
+            | HarnessEvent::Branch { .. }
+            | HarnessEvent::TriggerHandlingStart { .. }
+            | HarnessEvent::TriggerHandled { .. }
+            | HarnessEvent::PersistenceError { .. } => None,
         }
     }
 }
