@@ -535,7 +535,10 @@ mod tests {
             .await
             .expect("exec must succeed");
         assert_eq!(out.exit_code, 0);
-        assert_eq!(out.stdout, "hello", "stdout must not gain a trailing newline");
+        assert_eq!(
+            out.stdout, "hello",
+            "stdout must not gain a trailing newline"
+        );
         assert_eq!(out.stderr, "err", "stderr must not gain a trailing newline");
     }
 
