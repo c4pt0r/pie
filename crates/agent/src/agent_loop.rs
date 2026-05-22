@@ -399,12 +399,17 @@ async fn execute_tools(
         // before_tool_call hook can veto. The hook sees the prepared args on BOTH
         // `ctx.args` and `ctx.tool_call.arguments` — there is no reason to expose two
         // shapes of the same call (a hook reading `tool_call.arguments` would otherwise
-        // miss any normalization the tool's `prepare_arguments` applied).
+        // miss any normalization the tool's `prepare_arguments` applied). If the tool's
+        // `prepare_arguments` returns a non-Object shape (Null, Array, scalar), we cannot
+        // represent it inside the `pie_ai::ToolCall.arguments` map; we clear the map to
+        // empty so the hook author has only one truthy source (`ctx.args`) and cannot read
+        // a stale raw map.
         if let Some(hook) = inner.options.before_tool_call.clone() {
             let mut hook_tc = (*tc).clone();
-            if let serde_json::Value::Object(map) = &args {
-                hook_tc.arguments = map.clone();
-            }
+            hook_tc.arguments = match &args {
+                serde_json::Value::Object(map) => map.clone(),
+                _ => serde_json::Map::new(),
+            };
             let ctx = BeforeToolCallContext {
                 assistant_message: assistant.clone(),
                 tool_call: hook_tc,
@@ -595,19 +600,25 @@ async fn run_one(
             tool,
         } => match tool {
             Some(t) => {
-                // Bridge the sync `AgentToolUpdate` callback to the async listener bus via a
-                // bounded mpsc channel + dedicated pump task. The pump emits
+                // Bridge the sync `AgentToolUpdate` callback to the async listener bus via
+                // an unbounded mpsc channel + dedicated pump task. The pump emits
                 // `ToolExecutionUpdate` events in send order; the sync callback never blocks
-                // (UnboundedSender::send is non-async and just enqueues). Channel closes when
-                // the `on_update` Arc is dropped (typically when `execute` returns), at
-                // which point the pump joins and we proceed to the outcome.
+                // (`UnboundedSender::send` is non-async and just enqueues). The channel
+                // closes when every sender is dropped, at which point `rx.recv()` returns
+                // `None` and the pump task exits.
+                //
+                // Contract: `execute()` must NOT retain `on_update` past return — e.g. by
+                // cloning the `Arc` into a `tokio::spawn`ed task. The wiring still has a
+                // bounded shutdown path for the misbehaving case (see PUMP_JOIN_TIMEOUT
+                // below), but updates the tool emits after `execute()` returns will be
+                // dropped without reaching subscribers.
                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentToolResult>();
                 let pump_inner = inner.clone();
                 let pump_id = id.clone();
                 let pump_name = name.clone();
                 let pump_args = args.clone();
                 let pump_cancel = cancel.clone();
-                let pump_handle = tokio::spawn(async move {
+                let mut pump_handle = tokio::spawn(async move {
                     while let Some(partial) = rx.recv().await {
                         emit(
                             &pump_inner,
@@ -632,10 +643,22 @@ async fn run_one(
                     })
                 };
                 let exec_result = t.execute(&id, args.clone(), cancel, Some(on_update)).await;
-                // Drop the outer-scope sender so the pump can finish even if the tool kept
-                // its `on_update` Arc alive past the await (rare, but defensive).
+                // Drop the outer-scope sender so the pump can finish in the well-behaved case
+                // where the tool released its `Arc<on_update>` before returning. If the tool
+                // misbehaved and kept the Arc alive (e.g. handed it to a `tokio::spawn`ed
+                // task), the cloned sender inside the closure also stays alive and `rx.recv`
+                // never returns `None`. The timeout + abort path below caps that case so
+                // `run_one` cannot hang the whole agent loop. Updates that arrive after the
+                // abort are dropped.
                 drop(tx);
-                let _ = pump_handle.await;
+                const PUMP_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+                if tokio::time::timeout(PUMP_JOIN_TIMEOUT, &mut pump_handle)
+                    .await
+                    .is_err()
+                {
+                    pump_handle.abort();
+                    let _ = pump_handle.await;
+                }
                 match exec_result {
                     Ok(r) => ToolOutcome {
                         id,

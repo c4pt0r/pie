@@ -202,14 +202,25 @@ pub trait AgentTool: Send + Sync {
         None
     }
 
-    /// Optional compatibility shim for raw tool-call arguments before schema validation. Default
-    /// passes the argument map through unchanged.
+    /// Compatibility shim for raw tool-call arguments. Runs once between tool resolution and
+    /// dispatch, and the result is what the `before_tool_call` hook (both `ctx.args` and
+    /// `ctx.tool_call.arguments`) and [`AgentTool::execute`]'s `params` see. Default passes
+    /// the argument map through unchanged.
     fn prepare_arguments(&self, args: serde_json::Value) -> serde_json::Value {
         args
     }
 
     /// Execute the tool call. Implementations should *not* encode errors in `content` — return
     /// `Err` instead; the agent loop wraps it into an `is_error: true` tool result.
+    ///
+    /// `on_update`, when `Some`, is the per-call streaming-progress callback. It is bound to
+    /// the lifetime of this `execute` call — the agent loop builds a pump that consumes
+    /// updates in send order and emits them as [`crate::AgentEvent::ToolExecutionUpdate`].
+    ///
+    /// Contract: do not retain `on_update` past `execute`'s return — e.g. by cloning the
+    /// `Arc` into a `tokio::spawn`ed task that outlives this call. The agent loop caps the
+    /// pump shutdown with a short timeout for safety, but any updates emitted after return
+    /// are dropped without reaching subscribers.
     async fn execute(
         &self,
         tool_call_id: &str,

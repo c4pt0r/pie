@@ -617,3 +617,105 @@ async fn tool_execution_update_callback_emits_listener_events_in_order() {
         "ToolExecutionUpdate events must be delivered in send order with the correct tool_call_id"
     );
 }
+
+#[tokio::test]
+async fn run_one_does_not_hang_when_tool_retains_on_update_past_return() {
+    // Regression for the pump-handle hang concern @Tools-MCP-Lead and @QA-Release-Lead
+    // raised on PR #49: a tool that hands `on_update` to a `tokio::spawn`ed task keeps an
+    // Arc<closure> alive past `execute()` return, so the cloned `tx` inside the closure
+    // stays alive and the pump task's `rx.recv()` would never return `None`. The agent
+    // loop must time out the pump join and abort the task so `run_one` (and the whole
+    // agent loop) cannot hang on a misbehaving tool.
+    //
+    // The bound is internal: `run_one` itself caps the join at ~2s. With the test wrapper
+    // around `agent.prompt(...)` we expect the whole call to finish well under the safety
+    // ceiling.
+    let args = serde_json::Map::new();
+    let responses = Arc::new(Mutex::new(vec![
+        assistant_with(
+            vec![ContentBlock::ToolCall(ToolCall {
+                id: "call_1".into(),
+                name: "leaker".into(),
+                arguments: args,
+                thought_signature: None,
+            })],
+            StopReason::ToolUse,
+        ),
+        assistant_with(vec![ContentBlock::text("done")], StopReason::Stop),
+    ]));
+
+    /// Misbehaving tool: hands `on_update` to a background task that holds it indefinitely.
+    /// The retained Arc keeps the channel's cloned sender alive after `execute` returns.
+    struct LeakerTool {
+        def: pie_ai::Tool,
+    }
+    #[async_trait::async_trait]
+    impl pie_agent_core::AgentTool for LeakerTool {
+        fn definition(&self) -> &pie_ai::Tool {
+            &self.def
+        }
+        fn label(&self) -> &str {
+            "leaker"
+        }
+        async fn execute(
+            &self,
+            _id: &str,
+            _params: serde_json::Value,
+            _cancel: CancellationToken,
+            on_update: Option<pie_agent_core::AgentToolUpdate>,
+        ) -> Result<pie_agent_core::AgentToolResult, pie_agent_core::AgentToolError> {
+            let cb = on_update.expect("agent loop must supply callback");
+            cb(pie_agent_core::AgentToolResult {
+                content: vec![pie_ai::UserContentBlock::text("first-and-only".to_string())],
+                details: serde_json::Value::Null,
+                terminate: None,
+            });
+            // Hold the callback alive for far longer than the pump-join timeout. The agent
+            // loop must abort the pump on timeout instead of waiting for this task to drop
+            // the Arc.
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                drop(cb);
+            });
+            Ok(pie_agent_core::AgentToolResult::default())
+        }
+    }
+    let tool = Arc::new(LeakerTool {
+        def: pie_ai::Tool {
+            name: "leaker".into(),
+            description: "retains on_update".into(),
+            parameters: serde_json::json!({ "type": "object" }),
+        },
+    });
+
+    let mut state = pie_agent_core::AgentState::default();
+    state.model = Some(faux_model());
+    state.tools = vec![tool];
+
+    let agent = Agent::new(AgentOptions {
+        initial_state: Some(state),
+        stream_fn: Some(faux_stream_fn_with(responses)),
+        ..Default::default()
+    });
+
+    let user = AgentMessage::Llm(pie_ai::Message::User(pie_ai::UserMessage {
+        role: pie_ai::UserRole::User,
+        content: pie_ai::UserContent::Text("go".into()),
+        timestamp: 0,
+    }));
+
+    let start = std::time::Instant::now();
+    // Outer timeout much wider than the pump's internal 2s, so a hang would still surface
+    // as the wrapper firing rather than the test runner's global timeout.
+    tokio::time::timeout(std::time::Duration::from_secs(10), agent.prompt(user))
+        .await
+        .expect("agent.prompt must complete — pump join must time out, not block forever")
+        .expect("agent.prompt itself must succeed");
+    let elapsed = start.elapsed();
+    // Loose ceiling: pump join is capped at 2s. Allow a generous 5s for full agent loop
+    // turn including faux LLM round-trip + listener emit + state lock contention.
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "expected run_one to return within ~2s after the tool returned, took {elapsed:?}"
+    );
+}
