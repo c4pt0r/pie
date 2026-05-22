@@ -406,6 +406,14 @@ impl HookRunner {
         payload_path: &Path,
         cancel: CancellationToken,
     ) -> anyhow::Result<()> {
+        // Previously: `cmd.output()` raced against `tokio::time::timeout` + cancel via
+        // `select!`. Either non-completion branch left `sh -c` running in the background
+        // (along with anything it spawned), so a hook that ran `(slow_thing) & wait` would
+        // leak descendants past its declared `timeout_ms`. Mirrors the bash-tool fix in
+        // PR #41 and the `NativeEnv::exec` fix in PR #40: spawn explicitly, put the child
+        // in its own process group on Unix via `setsid`, and `killpg(pgid, SIGKILL)` the
+        // whole tree on timeout / cancel. `kill_on_drop(true)` is the cross-platform
+        // backstop.
         let timeout = Duration::from_millis(rule.timeout_ms);
         let mut cmd = Command::new(shell_program());
         cmd.arg(shell_arg())
@@ -414,37 +422,105 @@ impl HookRunner {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .envs(env_for(payload, payload_path));
+            .envs(env_for(payload, payload_path))
+            .kill_on_drop(true);
 
-        let child = cmd.output();
-        let output = tokio::select! {
-            r = tokio::time::timeout(timeout, child) => r??,
-            _ = cancel.cancelled() => {
-                anyhow::bail!("cancelled");
+        #[cfg(unix)]
+        {
+            // SAFETY: `setsid` is async-signal-safe per POSIX and has no Rust state to
+            // invalidate. The child becomes session and process-group leader; SIGKILL to
+            // `-pgid` then targets the whole tree we just spawned. `tokio::process::Command`
+            // exposes `pre_exec` as an inherent method so no trait import is needed.
+            unsafe {
+                cmd.pre_exec(|| {
+                    if libc::setsid() == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+
+        let child = cmd.spawn().map_err(|e| anyhow::anyhow!("spawn: {e}"))?;
+        let child_pid = child.id();
+
+        // Race the wait against the rule's timeout and the cancel token. `biased` puts
+        // cancel first so a user Ctrl-C wins same-tick ties over the timeout.
+        let outcome: HookOutcome = {
+            let wait = child.wait_with_output();
+            tokio::pin!(wait);
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => HookOutcome::Cancelled,
+                res = tokio::time::timeout(timeout, &mut wait) => match res {
+                    Ok(out) => HookOutcome::Completed(out),
+                    Err(_) => HookOutcome::TimedOut,
+                },
             }
         };
-        if !output.status.success() {
-            anyhow::bail!(
-                "command exited {}: {}",
-                output.status.code().unwrap_or(-1),
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        if !output.stdout.is_empty() {
-            tracing::debug!(
-                "hook command stdout: {}",
-                String::from_utf8_lossy(&output.stdout).trim()
-            );
-        }
-        if !output.stderr.is_empty() {
-            tracing::debug!(
-                "hook command stderr: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        Ok(())
-    }
 
+        match outcome {
+            HookOutcome::Completed(Ok(output)) => {
+                if !output.status.success() {
+                    anyhow::bail!(
+                        "command exited {}: {}",
+                        output.status.code().unwrap_or(-1),
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    );
+                }
+                if !output.stdout.is_empty() {
+                    tracing::debug!(
+                        "hook command stdout: {}",
+                        String::from_utf8_lossy(&output.stdout).trim()
+                    );
+                }
+                if !output.stderr.is_empty() {
+                    tracing::debug!(
+                        "hook command stderr: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    );
+                }
+                Ok(())
+            }
+            HookOutcome::Completed(Err(e)) => Err(anyhow::anyhow!(e)),
+            HookOutcome::TimedOut => {
+                terminate_hook_tree(child_pid).await;
+                anyhow::bail!("timed out after {}ms", rule.timeout_ms);
+            }
+            HookOutcome::Cancelled => {
+                terminate_hook_tree(child_pid).await;
+                anyhow::bail!("cancelled");
+            }
+        }
+    }
+}
+
+/// Outcome of one `run_command` race. Lifted out of `tokio::select!` so the match below
+/// can spell the kill-tree path explicitly per branch rather than mixing it into the
+/// select arms.
+enum HookOutcome {
+    Completed(std::io::Result<std::process::Output>),
+    TimedOut,
+    Cancelled,
+}
+
+/// Best-effort SIGKILL of the hook child's whole process group on Unix. On non-Unix targets
+/// this is a no-op (the `kill_on_drop(true)` set on the `Command` is the only kill path
+/// when the wait future is dropped). The pid was snapshotted with `child.id()` before the
+/// wait future consumed the handle.
+async fn terminate_hook_tree(pid: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        // SAFETY: SIGKILL on a pid we just observed via `child.id()`. `killpg` returning
+        // `ESRCH` (group already gone) is benign and we don't act on the return.
+        unsafe {
+            libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+        }
+    }
+    let _ = pid;
+}
+
+impl HookRunner {
     async fn run_webhook(
         &self,
         rule: &HookRule,
@@ -975,4 +1051,111 @@ command = "echo nope"
 
     #[allow(dead_code)]
     fn _keep_tool_execution_mode(_: ToolExecutionMode) {}
+
+    /// Hook command that exceeds `timeout_ms` must be killed, including any descendant
+    /// process the shell backgrounded. The previous implementation used `cmd.output()`
+    /// inside a `select!` against `tokio::time::timeout`, so on timeout the underlying
+    /// `sh -c` (and any `(child) & wait` subprocess) kept running.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_hook_timeout_kills_descendant_process() {
+        use std::time::Instant;
+
+        // Unique marker so `pgrep` only finds the descendant this test spawned.
+        let marker = "pie-hook-timeout-test-mkr-z2x7a1";
+        let mut r = rule(HookEvent::ToolEnd);
+        r.timeout_ms = 100;
+        r.command = Some(format!("(sleep 30 && echo {marker}) & wait"));
+        let runner = runner(vec![r]);
+
+        let started = Instant::now();
+        let ev = AgentEvent::ToolExecutionEnd {
+            tool_call_id: "call-1".into(),
+            tool_name: "bash".into(),
+            result: AgentToolResult::default(),
+            is_error: false,
+        };
+        runner.handle_event(&ev, CancellationToken::new()).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed.as_secs() < 5,
+            "hook timeout path took {elapsed:?}; descendant kill did not happen in time"
+        );
+
+        // Give the kernel a beat to reap the killed group.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let pgrep = tokio::process::Command::new("pgrep")
+            .arg("-f")
+            .arg(marker)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn();
+        if let Ok(mut child) = pgrep {
+            let mut buf = String::new();
+            if let Some(mut s) = child.stdout.take() {
+                let _ = tokio::io::AsyncReadExt::read_to_string(&mut s, &mut buf).await;
+            }
+            let _ = child.wait().await;
+            assert!(
+                buf.trim().is_empty(),
+                "found surviving descendant matching {marker:?} after hook timeout: pids={buf}"
+            );
+        }
+    }
+
+    /// Cancellation token tripped mid-hook must kill the whole shell tree, mirroring the
+    /// timeout path. Mirrors `bash_tool::cancellation_kills_child_process` for hooks.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_hook_cancellation_kills_descendant_process() {
+        use std::time::Instant;
+
+        let marker = "pie-hook-cancel-test-mkr-z2x7b2";
+        let mut r = rule(HookEvent::ToolEnd);
+        r.timeout_ms = 30_000;
+        r.command = Some(format!("(sleep 30 && echo {marker}) & wait"));
+        let runner = runner(vec![r]);
+
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            cancel_clone.cancel();
+        });
+
+        let started = Instant::now();
+        let ev = AgentEvent::ToolExecutionEnd {
+            tool_call_id: "call-1".into(),
+            tool_name: "bash".into(),
+            result: AgentToolResult::default(),
+            is_error: false,
+        };
+        runner.handle_event(&ev, cancel).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed.as_secs() < 5,
+            "hook cancel path took {elapsed:?}; descendant kill did not happen in time"
+        );
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let pgrep = tokio::process::Command::new("pgrep")
+            .arg("-f")
+            .arg(marker)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn();
+        if let Ok(mut child) = pgrep {
+            let mut buf = String::new();
+            if let Some(mut s) = child.stdout.take() {
+                let _ = tokio::io::AsyncReadExt::read_to_string(&mut s, &mut buf).await;
+            }
+            let _ = child.wait().await;
+            assert!(
+                buf.trim().is_empty(),
+                "found surviving descendant matching {marker:?} after hook cancel: pids={buf}"
+            );
+        }
+    }
 }
