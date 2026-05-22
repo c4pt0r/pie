@@ -525,6 +525,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exec_preserves_stdout_stderr_without_inventing_trailing_newlines() {
+        // Regression for the previous-implementation regression: `AsyncBufReadExt::lines()`
+        // would have returned `["hello"]` plus a synthesized `'\n'` push from the wrapping
+        // loop, producing `"hello\n"`. `drain_stream` keeps the delimiter the child actually
+        // wrote, so a `printf hello` (no trailing newline) round-trips as exactly `"hello"`.
+        let out = env()
+            .exec("printf hello; printf err 1>&2", ExecOptions::default())
+            .await
+            .expect("exec must succeed");
+        assert_eq!(out.exit_code, 0);
+        assert_eq!(out.stdout, "hello", "stdout must not gain a trailing newline");
+        assert_eq!(out.stderr, "err", "stderr must not gain a trailing newline");
+    }
+
+    #[tokio::test]
     async fn exec_streaming_callbacks_receive_lines_in_order() {
         let captured = Arc::new(Mutex::new(Vec::<String>::new()));
         let sink = captured.clone();
