@@ -252,7 +252,8 @@ async fn remove_index_entry(dir: &std::path::Path, slug: &str) -> Result<(), Age
 }
 
 /// Load existing memory into a text block suitable for the system prompt. Returns an empty
-/// string when no memory exists. Walks `<dir>/*.md` (excluding `MEMORY.md`) and concatenates.
+/// string when no memory exists. Walks `<dir>/*.md` (excluding `MEMORY.md`, which is the
+/// index file injected separately by the harness, not a memory entry) and concatenates.
 pub async fn load_memory_block(dir: &std::path::Path) -> String {
     let Ok(mut rd) = tokio::fs::read_dir(dir).await else {
         return String::new();
@@ -260,7 +261,11 @@ pub async fn load_memory_block(dir: &std::path::Path) -> String {
     let mut entries: Vec<(String, std::path::PathBuf)> = Vec::new();
     while let Ok(Some(e)) = rd.next_entry().await {
         let name = e.file_name().to_string_lossy().into_owned();
-        if name.ends_with(".md") {
+        // Mirror the exclusion already applied by `action=list` (see the filter near the
+        // top of this file). Without this skip, the index file gets folded into the
+        // injected memory block in addition to being loaded separately, surfacing the same
+        // content twice in the system prompt. Code-review item #10 (2026-05-22).
+        if name.ends_with(".md") && name != "MEMORY.md" {
             entries.push((name, e.path()));
         }
     }

@@ -197,3 +197,45 @@ async fn memory_save_then_load_block() {
     assert!(block.contains("tabs"));
     assert!(block.contains("</memory>"));
 }
+
+/// `load_memory_block` must skip `MEMORY.md` so the index file isn't folded into the
+/// system-prompt memory block alongside its actual entries. The MEMORY.md file is loaded
+/// separately by the harness; duplicating it into this block surfaces the same content
+/// twice. Code-review item #10 (2026-05-22).
+#[tokio::test]
+async fn memory_block_excludes_memory_md_index_file() {
+    let dir = tempdir().unwrap();
+    let dir_path = dir.path().to_path_buf();
+    // Hand-write a MEMORY.md with a recognizable string we'd see if it leaks into the
+    // block, and one real entry so the block actually opens.
+    tokio::fs::write(
+        dir_path.join("MEMORY.md"),
+        "INDEX_SENTINEL_SHOULD_NOT_LEAK\n- [User Likes Tabs](user_likes_tabs.md)\n",
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(
+        dir_path.join("user_likes_tabs.md"),
+        "---\nname: user-likes-tabs\ndescription: indentation\nmetadata:\n  type: user\n---\n\nThe user prefers tabs.\n",
+    )
+    .await
+    .unwrap();
+
+    let block = tools::memory::load_memory_block(&dir_path).await;
+    assert!(
+        block.contains("<memory>"),
+        "block should be populated by the user entry: {block}"
+    );
+    assert!(
+        block.contains("prefers tabs"),
+        "real entry must appear in block: {block}"
+    );
+    assert!(
+        !block.contains("INDEX_SENTINEL_SHOULD_NOT_LEAK"),
+        "MEMORY.md index must not leak into the injected memory block: {block}"
+    );
+    assert!(
+        !block.contains("--- MEMORY.md ---"),
+        "MEMORY.md should not appear as a section header: {block}"
+    );
+}
