@@ -11,6 +11,7 @@ pub mod ls;
 pub mod mcp_adapter;
 pub mod memory;
 pub mod read;
+pub mod skill;
 pub mod task;
 pub mod truncate;
 pub mod web_fetch;
@@ -64,4 +65,16 @@ pub fn task_tool(
         stream_fn,
         Arc::new(subagent_read_only_tools),
     ))
+}
+
+/// Build the `Skill` tool. Separate from `default_tools` because the tool needs to reach the
+/// live `AgentHarness::skills()` snapshot, and the harness does not exist yet when this is
+/// called (we are still assembling the tool list that will be passed to `AgentHarness::new`).
+///
+/// The caller (`main.rs`) builds an `Arc<OnceCell<Arc<AgentHarness>>>`, passes it here, and —
+/// crucially — sets the cell immediately after the harness is constructed and *before* the
+/// REPL accepts any input. If the cell is unset at execute time the tool returns a recoverable
+/// `AgentToolError`, never a panic.
+pub fn skill_tool(harness_cell: skill::SkillHarnessCell) -> Arc<dyn AgentTool> {
+    Arc::new(skill::SkillTool::new(harness_cell))
 }

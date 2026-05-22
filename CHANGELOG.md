@@ -73,6 +73,12 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
 
 - **#18** Biased select against stream stalls so Ctrl-C unblocks the in-flight prompt
   within 500ms regardless of LLM stream state.
+- **#25 (PR A)** Register the `Skill` builtin tool the system prompt already advertises.
+  Before this fix the model would call `Skill { name: "..." }` and receive
+  `no tool named 'Skill'` because the tool was never wired into `default_tools`. On hit
+  the tool returns the skill body wrapped in a `<skill name="...">` block; on miss it
+  surfaces a typed error pointing the model at `/skills`. `disable_model_invocation=true`
+  is now enforced uniformly across all call paths (was previously a no-op flag).
 
 ### Explicitly de-scoped
 

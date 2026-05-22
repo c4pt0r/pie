@@ -213,6 +213,13 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
     // Task delegation tool (issue #11). Shares the parent's model + stream backend so its
     // subagents go through the same provider.
     tools.push(tools::task_tool(model.clone(), None));
+    // Skill tool (issue #25). Needs to reach the live `AgentHarness::skills()` snapshot, but
+    // the harness does not exist yet — we are still assembling the tool list that will be
+    // passed to `AgentHarness::new`. Use a `OnceCell` that we'll fill immediately after the
+    // harness is constructed, before the REPL accepts any input.
+    let skill_harness_cell: tools::skill::SkillHarnessCell =
+        std::sync::Arc::new(once_cell::sync::OnceCell::new());
+    tools.push(tools::skill_tool(skill_harness_cell.clone()));
 
     // MCP (issue #9): spawn every server configured under ~/.pie/mcp.toml or
     // <cwd>/.pie/mcp.toml, append their tools to the registry.
@@ -245,6 +252,15 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
         opts.after_tool_call = Some(lsp_supervisor::as_after_tool_call(lsp_supervisor.clone()));
     }
     let harness = std::sync::Arc::new(AgentHarness::new(opts));
+    // Resolve the Skill tool's chicken-and-egg harness reference (issue #25). The cell was
+    // handed to the tool at construction time; we set it now, before the REPL accepts any
+    // input. The `is_ok()` assert is a double-init guard: any future refactor that
+    // accidentally reaches this line twice will surface as a test/CI failure rather than as a
+    // runtime panic on the second set.
+    assert!(
+        skill_harness_cell.set(harness.clone()).is_ok(),
+        "Skill tool harness cell was set twice; main.rs wiring is the only setter"
+    );
     let session_runner =
         agent_session::AgentSession::new(harness.clone(), agent_session::RetrySettings::default());
 

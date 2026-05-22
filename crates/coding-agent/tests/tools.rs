@@ -110,6 +110,68 @@ async fn bash_reports_nonzero_exit() {
 }
 
 #[tokio::test]
+async fn skill_tool_returns_wrapped_body_on_hit() {
+    // Integration acceptance for issue #25 PR A: when a model issues `Skill { name: "..." }`
+    // for a real registered skill, the tool result content is the body wrapped in a
+    // `<skill name="...">` block (same shape `format_skills_for_system_prompt` advertises).
+    use once_cell::sync::OnceCell as SyncOnceCell;
+    use pie_agent_core::{
+        AgentHarness, AgentHarnessOptions, MemorySessionStorage, Session, SessionStorage, Skill,
+    };
+
+    let storage = Arc::new(MemorySessionStorage::new()) as Arc<dyn SessionStorage>;
+    let session = Session::new(storage);
+    let mut opts = AgentHarnessOptions::new(faux_model_for_skill_test(), session);
+    opts.skills = vec![Skill {
+        name: "test-skill".into(),
+        description: "description for the test skill".into(),
+        file_path: "/tmp/skills/test-skill/SKILL.md".into(),
+        content: "# test-skill\n\nDo the test thing.".into(),
+        disable_model_invocation: false,
+    }];
+    let harness: Arc<AgentHarness> = Arc::new(AgentHarness::new(opts));
+
+    let cell: tools::skill::SkillHarnessCell = Arc::new(SyncOnceCell::new());
+    assert!(cell.set(harness).is_ok(), "set once");
+
+    let tool = tools::skill::SkillTool::new(cell);
+    let result = tool
+        .execute(
+            "call-1",
+            serde_json::json!({ "name": "test-skill" }),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("hit");
+
+    let text = match &result.content[0] {
+        pie_ai::UserContentBlock::Text(t) => t.text.clone(),
+        _ => panic!("expected text content"),
+    };
+    assert!(text.contains("<skill name=\"test-skill\""));
+    assert!(text.contains("Do the test thing."));
+}
+
+fn faux_model_for_skill_test() -> pie_ai::Model {
+    pie_ai::Model {
+        id: "faux".into(),
+        name: "Faux".into(),
+        api: pie_ai::Api::from("faux"),
+        provider: pie_ai::Provider::from("faux"),
+        base_url: String::new(),
+        reasoning: false,
+        thinking_level_map: None,
+        input: vec![],
+        cost: pie_ai::ModelCost::default(),
+        context_window: 0,
+        max_tokens: 0,
+        headers: None,
+        compat: None,
+    }
+}
+
+#[tokio::test]
 async fn memory_save_then_load_block() {
     let dir = tempdir().unwrap();
     let dir_path = dir.path().to_path_buf();
