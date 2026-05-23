@@ -287,6 +287,19 @@ impl DynamicTriggerCheckHook {
         let current_dir = std::env::current_dir()
             .ok()
             .map(|path| path.display().to_string());
+        // RFC 0 §3.2.2 / RFC 1 §4.2.3: when `payload_visibility = Local`, consumers see
+        // only `payload_summary`. Folding the context fields into the summary instead of
+        // putting them in `payload` keeps the envelope internally consistent — the
+        // sub-agent prompt renderer drops `payload` for Local sources, so anything in
+        // `payload` here would never be visible to the evaluator anyway. The dynamic
+        // check's needs (cwd + clock + rule count) all fit in the summary string.
+        let summary = format!(
+            "Periodic dynamic trigger check at local time {} / UTC {} with {} enabled rule(s); cwd: {}",
+            now_local.format("%Y-%m-%d %H:%M:%S %Z"),
+            now_utc.to_rfc3339(),
+            rule_count,
+            current_dir.as_deref().unwrap_or("<unknown>"),
+        );
         Trigger {
             source: TriggerSource::Local {
                 subkind: "dynamic".into(),
@@ -295,20 +308,8 @@ impl DynamicTriggerCheckHook {
             source_label: "local:dynamic".into(),
             event_label: "dynamic periodic check".into(),
             payload_visibility: PayloadVisibility::Local,
-            payload_summary: Some(format!(
-                "Periodic dynamic trigger check at local time {} / UTC {} with {} enabled rule(s)",
-                now_local.format("%Y-%m-%d %H:%M:%S %Z"),
-                now_utc.to_rfc3339(),
-                rule_count
-            )),
-            payload: Some(json!({
-                "local": {
-                    "current_dir": current_dir,
-                    "local_time": now_local.to_rfc3339(),
-                    "utc_time": now_utc.to_rfc3339(),
-                },
-                "enabled_rule_count": rule_count,
-            })),
+            payload_summary: Some(summary),
+            payload: None,
             idempotency_key: format!("local:dynamic:{}", now_utc.timestamp_millis()),
             replacement_policy: ReplacementPolicy::Drop,
             trace_id: Uuid::new_v4().to_string(),
@@ -602,13 +603,25 @@ pub fn fire_once_harness_listener(registry: DynamicTriggerRegistry) -> HarnessLi
 
 fn render_dynamic_trigger_prompt(trigger: &Trigger, rules: &[DynamicTriggerRule]) -> String {
     let rules_json = serde_json::to_string_pretty(rules).unwrap_or_else(|_| "[]".to_string());
+    // RFC 0 §3.2.2 / RFC 1 §4.2.3 privacy contract: the full `payload` only reaches a
+    // consumer when `payload_visibility = Shared`. For `Local` (default) and `Redacted`
+    // sources we surface only the safe summary; the raw `payload` is null in the prompt
+    // even if the adapter populated it. This prevents future hub / file-watcher / local
+    // sources that legitimately attach context to `payload` from leaking that context
+    // into the sub-agent (and therefore the model provider). The unconditional
+    // serialization that existed before bypassed the contract.
+    let payload_for_prompt = match trigger.payload_visibility {
+        PayloadVisibility::Shared => trigger.payload.clone(),
+        PayloadVisibility::Local | PayloadVisibility::Redacted => None,
+    };
     let trigger_json = serde_json::json!({
         "source_kind": trigger.source_kind,
         "source": trigger.source.clone(),
         "source_label": trigger.source_label.clone(),
         "event_label": trigger.event_label.clone(),
+        "payload_visibility": trigger.payload_visibility,
         "payload_summary": trigger.payload_summary.clone(),
-        "payload": trigger.payload.clone(),
+        "payload": payload_for_prompt,
         "received_at": trigger.received_at,
         "idempotency_key": trigger.idempotency_key.clone(),
         "trace_id": trigger.trace_id.clone(),
@@ -1248,5 +1261,184 @@ mod tests {
                 .contains("include the requested file contents")
         );
         assert!(matches!(action.promote, PromoteAction::None));
+    }
+
+    /// `payload_visibility = Local` (the default for most sources) must drop the raw
+    /// `payload` JSON from the sub-agent prompt. The dynamic trigger evaluator runs in a
+    /// sub-agent that calls a model provider, so a payload field populated by any future
+    /// source (Cloudflare hub, local file-watcher with file contents, etc.) MUST NOT
+    /// reach the provider context unless the source explicitly declared
+    /// `PayloadVisibility::Shared`. The previous implementation serialized
+    /// `trigger.payload` unconditionally, which bypassed the RFC 0 §3.2.2 / RFC 1 §4.2.3
+    /// privacy contract and was flagged as a HIGH blocker by all reviewers on the
+    /// `dynamic trigger workflow` commit.
+    #[tokio::test]
+    async fn local_payload_visibility_does_not_leak_payload_into_sub_agent_prompt() {
+        let registry = DynamicTriggerRegistry::new();
+        let _rule = registry
+            .add_from_spec("when something happens, run echo nothing")
+            .expect("rule");
+        let hook = before_trigger_action_hook(registry);
+        // Sentinel chosen so a substring search reliably fails if the payload leaks.
+        let sentinel = "SECRET_PAYLOAD_SHOULD_NOT_REACH_MODEL_2K7";
+        let action = hook(
+            BeforeTriggerActionContext {
+                trigger: Trigger {
+                    source: TriggerSource::Local {
+                        subkind: "test".into(),
+                    },
+                    source_kind: SourceKind::Local,
+                    source_label: "local:test".into(),
+                    event_label: "build finished".into(),
+                    payload_visibility: PayloadVisibility::Local,
+                    payload_summary: Some("safe summary".into()),
+                    payload: Some(serde_json::json!({
+                        "leaked_field": sentinel,
+                        "nested": { "also_leaked": sentinel },
+                    })),
+                    idempotency_key: "test-key".into(),
+                    replacement_policy: ReplacementPolicy::Drop,
+                    trace_id: "trace-test".into(),
+                    authority: TriggerAuthority {
+                        principal_id: "test".into(),
+                        principal_label: "test".into(),
+                        credential_scope: CredentialScope::User,
+                        allowed_source_actions: vec![],
+                        expires_at: None,
+                    },
+                    received_at: Utc::now(),
+                },
+                runtime: TriggerRuntimeSnapshot {
+                    dedup_entries: 0,
+                    active_traces: 0,
+                    accepted_total: 0,
+                    deduped_total: 0,
+                    cycle_suppressed_total: 0,
+                },
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(
+            !action.prompt.contains(sentinel),
+            "Local payload must not leak into the sub-agent prompt — found sentinel in:\n{}",
+            action.prompt
+        );
+        // The safe `payload_summary` field MUST still survive — we are dropping the raw
+        // payload, not the entire envelope.
+        assert!(
+            action.prompt.contains("safe summary"),
+            "payload_summary should still be visible: {}",
+            action.prompt
+        );
+    }
+
+    /// Counterpart: when a source explicitly opts in to `PayloadVisibility::Shared`, the
+    /// full payload reaches the sub-agent prompt as before. Pins that the gate is a
+    /// per-source decision, not a blanket redaction.
+    #[tokio::test]
+    async fn shared_payload_visibility_includes_payload_in_sub_agent_prompt() {
+        let registry = DynamicTriggerRegistry::new();
+        let _rule = registry
+            .add_from_spec("when something happens, run echo nothing")
+            .expect("rule");
+        let hook = before_trigger_action_hook(registry);
+        let marker = "shared-payload-marker-must-appear";
+        let action = hook(
+            BeforeTriggerActionContext {
+                trigger: Trigger {
+                    source: TriggerSource::Hub {
+                        topic: "test".into(),
+                    },
+                    source_kind: SourceKind::Hub,
+                    source_label: "hub:test".into(),
+                    event_label: "explicit shared".into(),
+                    payload_visibility: PayloadVisibility::Shared,
+                    payload_summary: Some("shared event".into()),
+                    payload: Some(serde_json::json!({ "value": marker })),
+                    idempotency_key: "shared-key".into(),
+                    replacement_policy: ReplacementPolicy::Drop,
+                    trace_id: "trace-shared".into(),
+                    authority: TriggerAuthority {
+                        principal_id: "hub".into(),
+                        principal_label: "hub".into(),
+                        credential_scope: CredentialScope::User,
+                        allowed_source_actions: vec![],
+                        expires_at: None,
+                    },
+                    received_at: Utc::now(),
+                },
+                runtime: TriggerRuntimeSnapshot {
+                    dedup_entries: 0,
+                    active_traces: 0,
+                    accepted_total: 0,
+                    deduped_total: 0,
+                    cycle_suppressed_total: 0,
+                },
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(
+            action.prompt.contains(marker),
+            "Shared payload should reach the sub-agent prompt — marker missing from:\n{}",
+            action.prompt
+        );
+    }
+
+    /// `Redacted` visibility behaves like `Local` for prompt rendering: the raw payload is
+    /// dropped even though the source may have attached one. The runtime contract says
+    /// `Redacted` is the strongest of the three.
+    #[tokio::test]
+    async fn redacted_payload_visibility_does_not_leak_payload_into_sub_agent_prompt() {
+        let registry = DynamicTriggerRegistry::new();
+        let _rule = registry
+            .add_from_spec("when something happens, run echo nothing")
+            .expect("rule");
+        let hook = before_trigger_action_hook(registry);
+        let sentinel = "REDACTED_FIELD_MUST_BE_DROPPED_9X4";
+        let action = hook(
+            BeforeTriggerActionContext {
+                trigger: Trigger {
+                    source: TriggerSource::Local {
+                        subkind: "test".into(),
+                    },
+                    source_kind: SourceKind::Local,
+                    source_label: "local:test".into(),
+                    event_label: "sensitive event".into(),
+                    payload_visibility: PayloadVisibility::Redacted,
+                    payload_summary: Some("redacted summary only".into()),
+                    payload: Some(serde_json::json!({ "credential": sentinel })),
+                    idempotency_key: "redacted-key".into(),
+                    replacement_policy: ReplacementPolicy::Drop,
+                    trace_id: "trace-redacted".into(),
+                    authority: TriggerAuthority {
+                        principal_id: "test".into(),
+                        principal_label: "test".into(),
+                        credential_scope: CredentialScope::User,
+                        allowed_source_actions: vec![],
+                        expires_at: None,
+                    },
+                    received_at: Utc::now(),
+                },
+                runtime: TriggerRuntimeSnapshot {
+                    dedup_entries: 0,
+                    active_traces: 0,
+                    accepted_total: 0,
+                    deduped_total: 0,
+                    cycle_suppressed_total: 0,
+                },
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(
+            !action.prompt.contains(sentinel),
+            "Redacted payload must not leak into the sub-agent prompt — found sentinel in:\n{}",
+            action.prompt
+        );
     }
 }
