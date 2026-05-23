@@ -8,7 +8,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use pie_agent_core::{AgentHarness, Skill, ThinkingLevel};
+use pie_agent_core::{
+    AgentHarness, HookState, NotificationHookStatus, NotificationStatusSnapshot,
+    RunningTriggerState, SessionTreeEntry, Skill, ThinkingLevel,
+};
 use pie_ai::{Provider, get_model};
 
 #[cfg_attr(test, allow(dead_code))]
@@ -95,6 +98,7 @@ impl Registry {
         r.register(Arc::new(LogoutCommand));
         r.register(Arc::new(FindCommand));
         r.register(Arc::new(HistoryCommand));
+        r.register(Arc::new(TriggersCommand));
         r
     }
 
@@ -1033,6 +1037,366 @@ impl SlashCommand for HistoryCommand {
     }
 }
 
+struct TriggersCommand;
+
+#[async_trait]
+impl SlashCommand for TriggersCommand {
+    fn name(&self) -> &'static str {
+        "triggers"
+    }
+    fn description(&self) -> &'static str {
+        "show trigger hooks, running actions, and recent audit"
+    }
+    fn usage(&self) -> &'static str {
+        "[status|hooks|running|audit [N]|abort <trace_id>|abort --all]"
+    }
+    async fn run(&self, argv: &[String], ctx: &CommandCtx<'_>) -> CommandOutcome {
+        let subcommand = argv.first().map(String::as_str).unwrap_or("status");
+        match subcommand {
+            "status" => {
+                let snapshot = ctx.harness.notification_status_snapshot();
+                for line in render_triggers_status(&snapshot) {
+                    println!("{line}");
+                }
+                CommandOutcome::Handled
+            }
+            "hooks" => {
+                let snapshot = ctx.harness.notification_status_snapshot();
+                for line in render_trigger_hooks(&snapshot.hooks) {
+                    println!("{line}");
+                }
+                CommandOutcome::Handled
+            }
+            "running" => {
+                let snapshot = ctx.harness.notification_status_snapshot();
+                for line in render_running_triggers(&snapshot.running) {
+                    println!("{line}");
+                }
+                CommandOutcome::Handled
+            }
+            "audit" => {
+                let limit = argv.get(1).and_then(|s| s.parse().ok()).unwrap_or(10);
+                let entries = match ctx.harness.session().entries().await {
+                    Ok(entries) => entries,
+                    Err(e) => return CommandOutcome::Error(format!("read trigger audit: {e}")),
+                };
+                let rows = collect_trigger_audit_rows(&entries, limit);
+                for line in render_trigger_audit(&rows) {
+                    println!("{line}");
+                }
+                CommandOutcome::Handled
+            }
+            "abort" => {
+                let Some(target) = argv.get(1) else {
+                    return CommandOutcome::Error("usage: /triggers abort <trace_id>|--all".into());
+                };
+                let snapshot = ctx.harness.notification_status_snapshot();
+                if target == "--all" {
+                    let count = snapshot.running.len();
+                    ctx.harness.abort_all_triggers();
+                    println!("requested abort for {count} running trigger(s)");
+                } else {
+                    if !snapshot.running.iter().any(|t| t.trace_id == *target) {
+                        return CommandOutcome::Error(format!(
+                            "no running trigger with trace_id '{target}'"
+                        ));
+                    }
+                    ctx.harness.abort_trigger(target);
+                    println!("requested abort for trigger {target}");
+                }
+                CommandOutcome::Handled
+            }
+            other => CommandOutcome::Error(format!(
+                "unknown /triggers command: {other}. usage: /triggers {}",
+                self.usage()
+            )),
+        }
+    }
+}
+
+fn render_triggers_status(snapshot: &NotificationStatusSnapshot) -> Vec<String> {
+    let mut lines = Vec::new();
+    let runtime = snapshot.runtime;
+    lines.push("Trigger status:".into());
+    lines.push(format!(
+        "  runtime: accepted={} deduped={} cycle_suppressed={} active_traces={} dedup_entries={}",
+        runtime.accepted_total,
+        runtime.deduped_total,
+        runtime.cycle_suppressed_total,
+        runtime.active_traces,
+        runtime.dedup_entries
+    ));
+    let attention_count = snapshot
+        .hooks
+        .iter()
+        .filter(|h| h.requires_attention.is_some())
+        .count();
+    let connected_count = snapshot
+        .hooks
+        .iter()
+        .filter(|h| matches!(h.state, HookState::Connected))
+        .count();
+    lines.push(format!(
+        "  hooks: {} total, {} connected, {} require attention",
+        snapshot.hooks.len(),
+        connected_count,
+        attention_count
+    ));
+    lines.push(format!("  running: {}", snapshot.running.len()));
+    lines.push("  details: /triggers hooks | /triggers running | /triggers audit".into());
+    lines
+}
+
+fn render_trigger_hooks(hooks: &[NotificationHookStatus]) -> Vec<String> {
+    if hooks.is_empty() {
+        return vec!["(no trigger hooks registered)".into()];
+    }
+    let mut lines = vec![format!("Trigger hooks ({}):", hooks.len())];
+    for (idx, hook) in hooks.iter().enumerate() {
+        let labels = if hook.subscription_labels.is_empty() {
+            "subscriptions: none".into()
+        } else {
+            format!("subscriptions: {}", hook.subscription_labels.join(", "))
+        };
+        lines.push(format!(
+            "  - hook #{}: {} queued={} dropped={} deduped={} last_event={}{}",
+            idx + 1,
+            render_hook_state(&hook.state),
+            hook.queued_count,
+            hook.dropped_count,
+            hook.deduped_count,
+            hook.last_event_at
+                .map(|d| d.to_rfc3339())
+                .unwrap_or_else(|| "never".into()),
+            render_requires_attention(hook)
+        ));
+        lines.push(format!("      {labels}"));
+        if let Some(err) = &hook.last_error {
+            lines.push(format!("      last error: {}", preview_text(err, 160)));
+        }
+    }
+    lines
+}
+
+fn render_hook_state(state: &HookState) -> String {
+    match state {
+        HookState::Connected => "connected".into(),
+        HookState::Reconnecting => "reconnecting".into(),
+        HookState::Disconnected { reason } => {
+            format!("disconnected ({})", preview_text(reason, 80))
+        }
+        HookState::Disabled => "disabled".into(),
+        HookState::AuthFailed { reason } => format!("auth_failed ({})", preview_text(reason, 80)),
+    }
+}
+
+fn render_requires_attention(hook: &NotificationHookStatus) -> String {
+    hook.requires_attention
+        .as_ref()
+        .map(|message| format!("  attention: {}", preview_text(message, 120)))
+        .unwrap_or_default()
+}
+
+fn render_running_triggers(running: &[RunningTriggerState]) -> Vec<String> {
+    if running.is_empty() {
+        return vec!["(no running triggers)".into()];
+    }
+    let mut lines = vec![format!("Running triggers ({}):", running.len())];
+    for trigger in running {
+        lines.push(format!(
+            "  - {}  {} / {}  since {}",
+            trigger.trace_id,
+            trigger.source_label,
+            trigger.event_label,
+            trigger.started_at.to_rfc3339()
+        ));
+        lines.push(format!(
+            "      prompt: {}",
+            preview_text(&trigger.prompt_preview, 120)
+        ));
+    }
+    lines
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TriggerAuditRow {
+    custom_type: String,
+    timestamp: String,
+    trace_id: Option<String>,
+    state: String,
+    source_label: Option<String>,
+    event_label: Option<String>,
+    summary: Option<String>,
+    details: Vec<String>,
+}
+
+fn collect_trigger_audit_rows(entries: &[SessionTreeEntry], limit: usize) -> Vec<TriggerAuditRow> {
+    entries
+        .iter()
+        .rev()
+        .filter_map(trigger_audit_row)
+        .take(limit)
+        .collect()
+}
+
+fn trigger_audit_row(entry: &SessionTreeEntry) -> Option<TriggerAuditRow> {
+    let SessionTreeEntry::Custom {
+        timestamp,
+        custom_type,
+        data,
+        ..
+    } = entry
+    else {
+        return None;
+    };
+    if !matches!(
+        custom_type.as_str(),
+        "trigger" | "trigger_result" | "trigger_promotion"
+    ) {
+        return None;
+    }
+    let data = data.as_ref()?;
+    let trace_id = string_field(data, "trace_id");
+    let state = match custom_type.as_str() {
+        "trigger" => string_field(data, "state").unwrap_or_else(|| "unknown".into()),
+        "trigger_result" => match data.get("success").and_then(|v| v.as_bool()) {
+            Some(true) => "completed".into(),
+            Some(false) => "failed".into(),
+            None => "unknown".into(),
+        },
+        "trigger_promotion" => string_field(data, "state").unwrap_or_else(|| "unknown".into()),
+        _ => "unknown".into(),
+    };
+    let summary = match custom_type.as_str() {
+        "trigger" => string_field(data, "payload_summary"),
+        "trigger_result" => string_field(data, "summary").or_else(|| string_field(data, "reason")),
+        "trigger_promotion" => {
+            string_field(data, "redaction_status").map(|s| format!("redaction_status={s}"))
+        }
+        _ => None,
+    };
+    let details = match custom_type.as_str() {
+        "trigger" => trigger_decision_details(data),
+        "trigger_result" => trigger_result_details(data),
+        "trigger_promotion" => trigger_promotion_details(data),
+        _ => Vec::new(),
+    };
+    Some(TriggerAuditRow {
+        custom_type: custom_type.clone(),
+        timestamp: timestamp.clone(),
+        trace_id,
+        state,
+        source_label: string_field(data, "source_label"),
+        event_label: string_field(data, "event_label"),
+        summary,
+        details,
+    })
+}
+
+fn render_trigger_audit(rows: &[TriggerAuditRow]) -> Vec<String> {
+    if rows.is_empty() {
+        return vec!["(no trigger audit entries in this session)".into()];
+    }
+    let mut lines = vec![format!("Recent trigger audit ({}):", rows.len())];
+    for row in rows {
+        let trace = row.trace_id.as_deref().unwrap_or("unknown-trace");
+        let source = row.source_label.as_deref().unwrap_or("-");
+        let event = row.event_label.as_deref().unwrap_or("-");
+        lines.push(format!(
+            "  - {}  {}/{}  trace={}  {} / {}",
+            row.timestamp, row.custom_type, row.state, trace, source, event
+        ));
+        if let Some(summary) = &row.summary {
+            lines.push(format!("      {}", preview_text(summary, 160)));
+        }
+        for detail in &row.details {
+            lines.push(format!("      {detail}"));
+        }
+    }
+    lines
+}
+
+fn trigger_decision_details(data: &serde_json::Value) -> Vec<String> {
+    let Some(decision) = data.get("evaluator_decision") else {
+        return Vec::new();
+    };
+    let Some(outcome) = string_field(decision, "outcome") else {
+        return vec!["decision: present".into()];
+    };
+    let mut fields = vec![format!("decision: {outcome}")];
+    match outcome.as_str() {
+        "accept" => {
+            if let Some(permission) = string_field(decision, "permission") {
+                fields.push(format!("permission: {}", preview_text(&permission, 80)));
+            }
+            if let Some(reason) = string_field(decision, "reason") {
+                fields.push(format!("reason: {}", preview_text(&reason, 160)));
+            }
+        }
+        "deduped" => {
+            if let Some(previous) = string_field(decision, "previous_trace_id") {
+                fields.push(format!(
+                    "previous_trace_id: {}",
+                    preview_text(&previous, 80)
+                ));
+            }
+            if let Some(policy) = string_field(decision, "replacement_policy") {
+                fields.push(format!("replacement_policy: {}", preview_text(&policy, 80)));
+            }
+        }
+        "cycle_suppressed" => {
+            if let Some(hops) = number_field(decision, "hop_count") {
+                fields.push(format!("hop_count: {hops}"));
+            }
+        }
+        _ => {}
+    }
+    fields
+}
+
+fn trigger_result_details(data: &serde_json::Value) -> Vec<String> {
+    let mut fields = Vec::new();
+    if let Some(branch_id) = string_field(data, "branch_id") {
+        fields.push(format!("branch_id: {}", preview_text(&branch_id, 80)));
+    }
+    if let Some(count) = number_field(data, "message_count") {
+        fields.push(format!("message_count: {count}"));
+    }
+    fields
+}
+
+fn trigger_promotion_details(data: &serde_json::Value) -> Vec<String> {
+    let mut fields = Vec::new();
+    if let Some(kind) = string_field(data, "promote_kind") {
+        fields.push(format!("promote_kind: {}", preview_text(&kind, 80)));
+    }
+    if let Some(inserted) = string_field(data, "inserted_entry_id") {
+        fields.push(format!(
+            "inserted_entry_id: {}",
+            preview_text(&inserted, 80)
+        ));
+    }
+    fields
+}
+
+fn string_field(data: &serde_json::Value, name: &str) -> Option<String> {
+    data.get(name)
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string)
+}
+
+fn number_field(data: &serde_json::Value, name: &str) -> Option<u64> {
+    data.get(name).and_then(|v| v.as_u64())
+}
+
+fn preview_text(text: &str, max_chars: usize) -> String {
+    let mut preview = text.chars().take(max_chars).collect::<String>();
+    if preview.chars().count() < text.chars().count() {
+        preview.push('…');
+    }
+    preview.replace('\n', " ")
+}
+
 pub async fn dispatch(input: &str, registry: &Registry, ctx: &CommandCtx<'_>) -> CommandOutcome {
     let (name, argv) = match parse(input) {
         Some(parts) => parts,
@@ -1079,7 +1443,158 @@ mod tests {
         assert!(r.find("quit").is_some());
         assert!(r.find("q").is_some());
         assert!(r.find("exit").is_some());
+        assert!(r.find("triggers").is_some());
         assert!(r.find("nope").is_none());
+    }
+
+    #[test]
+    fn render_triggers_status_summarizes_runtime_hooks_and_running() {
+        let snapshot = NotificationStatusSnapshot {
+            hooks: vec![NotificationHookStatus {
+                state: HookState::Disconnected {
+                    reason: "protocol_mismatch".into(),
+                },
+                last_event_at: None,
+                last_ack_at: None,
+                last_error: Some("bad frame".into()),
+                queued_count: 2,
+                dropped_count: 3,
+                deduped_count: 4,
+                subscription_labels: vec!["repo c4pt0r/pie".into()],
+                requires_attention: Some("upgrade hub".into()),
+            }],
+            runtime: pie_agent_core::TriggerRuntimeSnapshot {
+                dedup_entries: 5,
+                active_traces: 6,
+                accepted_total: 7,
+                deduped_total: 8,
+                cycle_suppressed_total: 9,
+            },
+            running: vec![RunningTriggerState {
+                trace_id: "trace-1".into(),
+                source_label: "mcp:github".into(),
+                event_label: "pr_merged".into(),
+                started_at: chrono::DateTime::parse_from_rfc3339("2026-05-22T19:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+                prompt_preview: "summarize release".into(),
+            }],
+        };
+
+        let status = render_triggers_status(&snapshot).join("\n");
+        assert!(status.contains("accepted=7"));
+        assert!(status.contains("1 total"));
+        assert!(status.contains("1 require attention"));
+        assert!(status.contains("running: 1"));
+
+        let hooks = render_trigger_hooks(&snapshot.hooks).join("\n");
+        assert!(hooks.contains("disconnected (protocol_mismatch)"));
+        assert!(hooks.contains("queued=2"));
+        assert!(hooks.contains("subscriptions: repo c4pt0r/pie"));
+        assert!(hooks.contains("attention: upgrade hub"));
+
+        let running = render_running_triggers(&snapshot.running).join("\n");
+        assert!(running.contains("trace-1"));
+        assert!(running.contains("mcp:github / pr_merged"));
+        assert!(running.contains("summarize release"));
+    }
+
+    #[test]
+    fn collect_trigger_audit_rows_uses_preview_safe_fields_only() {
+        let entries = vec![
+            SessionTreeEntry::Custom {
+                id: "ignored".into(),
+                parent_id: None,
+                timestamp: "2026-05-22T19:00:00Z".into(),
+                custom_type: "not_trigger".into(),
+                data: Some(serde_json::json!({"trace_id": "ignored"})),
+            },
+            SessionTreeEntry::Custom {
+                id: "t1".into(),
+                parent_id: None,
+                timestamp: "2026-05-22T19:01:00Z".into(),
+                custom_type: "trigger".into(),
+                data: Some(serde_json::json!({
+                    "trace_id": "trace-a",
+                    "state": "permission_denied",
+                    "source_label": "mcp:github",
+                    "event_label": "pr_merged",
+                    "payload_summary": "safe summary",
+                    "evaluator_decision": {
+                        "outcome": "accept",
+                        "permission": "deny",
+                        "reason": "policy says no",
+                        "raw_payload": "must-not-render"
+                    },
+                    "payload": {"secret": "must-not-render"}
+                })),
+            },
+            SessionTreeEntry::Custom {
+                id: "r1".into(),
+                parent_id: None,
+                timestamp: "2026-05-22T19:02:00Z".into(),
+                custom_type: "trigger_result".into(),
+                data: Some(serde_json::json!({
+                    "trace_id": "trace-a",
+                    "success": false,
+                    "reason": "aborted"
+                })),
+            },
+            SessionTreeEntry::Custom {
+                id: "p1".into(),
+                parent_id: None,
+                timestamp: "2026-05-22T19:03:00Z".into(),
+                custom_type: "trigger_promotion".into(),
+                data: Some(serde_json::json!({
+                    "trace_id": "trace-a",
+                    "state": "pending",
+                    "redaction_status": "clean"
+                })),
+            },
+        ];
+
+        let rows = collect_trigger_audit_rows(&entries, 10);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].custom_type, "trigger_promotion");
+        assert_eq!(rows[0].state, "pending");
+        assert_eq!(rows[1].state, "failed");
+        assert_eq!(rows[2].source_label.as_deref(), Some("mcp:github"));
+        let rendered = render_trigger_audit(&rows).join("\n");
+        assert!(rendered.contains("trace-a"));
+        assert!(rendered.contains("safe summary"));
+        assert!(rendered.contains("decision: accept"));
+        assert!(rendered.contains("permission: deny"));
+        assert!(rendered.contains("reason: policy says no"));
+        assert!(rendered.contains("redaction_status=clean"));
+        assert!(!rendered.contains("must-not-render"));
+        assert!(!rendered.contains("payload"));
+    }
+
+    #[test]
+    fn trigger_decision_details_explain_dedup_and_cycle_states() {
+        let dedup = trigger_decision_details(&serde_json::json!({
+            "evaluator_decision": {
+                "outcome": "deduped",
+                "replacement_policy": "latest_replaces",
+                "previous_trace_id": "trace-old",
+                "raw_payload": "must-not-render",
+            }
+        }))
+        .join("\n");
+        assert!(dedup.contains("decision: deduped"));
+        assert!(dedup.contains("previous_trace_id: trace-old"));
+        assert!(dedup.contains("replacement_policy: latest_replaces"));
+        assert!(!dedup.contains("must-not-render"));
+
+        let cycle = trigger_decision_details(&serde_json::json!({
+            "evaluator_decision": {
+                "outcome": "cycle_suppressed",
+                "hop_count": 6,
+            }
+        }))
+        .join("\n");
+        assert!(cycle.contains("decision: cycle_suppressed"));
+        assert!(cycle.contains("hop_count: 6"));
     }
 
     #[test]

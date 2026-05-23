@@ -42,6 +42,10 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
   accepting `/login <provider> <api-key>` inline. Inline keys are rejected with a usage
   message that does not repeat the secret, preventing interactive terminal scrollback from
   retaining raw credential material.
+- **#66** `/triggers` slash command for the RFC 1 trigger surface. It now shows runtime
+  counters, hook health, running trigger actions, recent trigger audit rows, and supports
+  aborting one or all in-flight trigger actions from the terminal while rendering only
+  preview-safe fields.
 - **#4** Dangerous-bash detector wired through `before_tool_call`. 11-pattern corpus
   (`rm -rf /`, `sudo`, `curl|sh`, etc.) returns deny reason as the synthesized tool result.
 - **#5** `@file` mention injection. Files are read, capped at 64 KiB, prepended to the

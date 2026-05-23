@@ -130,6 +130,87 @@ async fn dispatch_unknown_command_returns_error_outcome() {
 }
 
 #[tokio::test]
+async fn dispatch_triggers_status_is_read_only_and_available() {
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage as Arc<dyn SessionStorage>);
+    let opts = AgentHarnessOptions::new(faux_model(), session.clone());
+    let harness = Arc::new(AgentHarness::new(opts));
+
+    let registry = commands::Registry::with_builtins();
+    let cwd = std::env::current_dir().unwrap();
+    let ctx = commands::CommandCtx {
+        harness: &harness,
+        session_id: "test",
+        log_path: None,
+        tool_count: 0,
+        cwd: &cwd,
+    };
+
+    let outcome = commands::dispatch("/triggers", &registry, &ctx).await;
+    assert!(matches!(outcome, commands::CommandOutcome::Handled));
+    assert!(
+        session.entries().await.unwrap().is_empty(),
+        "/triggers status must not mutate the session"
+    );
+}
+
+#[tokio::test]
+async fn dispatch_triggers_abort_missing_trace_returns_error() {
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage as Arc<dyn SessionStorage>);
+    let opts = AgentHarnessOptions::new(faux_model(), session.clone());
+    let harness = Arc::new(AgentHarness::new(opts));
+
+    let registry = commands::Registry::with_builtins();
+    let cwd = std::env::current_dir().unwrap();
+    let ctx = commands::CommandCtx {
+        harness: &harness,
+        session_id: "test",
+        log_path: None,
+        tool_count: 0,
+        cwd: &cwd,
+    };
+
+    let outcome = commands::dispatch("/triggers abort missing-trace", &registry, &ctx).await;
+    match outcome {
+        commands::CommandOutcome::Error(message) => {
+            assert!(message.contains("no running trigger"));
+            assert!(message.contains("missing-trace"));
+        }
+        other => panic!("expected Error outcome, got {other:?}"),
+    }
+    assert!(
+        session.entries().await.unwrap().is_empty(),
+        "failed abort lookup must not mutate the session"
+    );
+}
+
+#[tokio::test]
+async fn dispatch_triggers_abort_all_empty_harness_is_handled_and_read_only() {
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage as Arc<dyn SessionStorage>);
+    let opts = AgentHarnessOptions::new(faux_model(), session.clone());
+    let harness = Arc::new(AgentHarness::new(opts));
+
+    let registry = commands::Registry::with_builtins();
+    let cwd = std::env::current_dir().unwrap();
+    let ctx = commands::CommandCtx {
+        harness: &harness,
+        session_id: "test",
+        log_path: None,
+        tool_count: 0,
+        cwd: &cwd,
+    };
+
+    let outcome = commands::dispatch("/triggers abort --all", &registry, &ctx).await;
+    assert!(matches!(outcome, commands::CommandOutcome::Handled));
+    assert!(
+        session.entries().await.unwrap().is_empty(),
+        "abort --all on an empty harness must not mutate the session"
+    );
+}
+
+#[tokio::test]
 async fn dispatch_undo_removes_last_turn_from_active_branch() {
     use pie_agent_core::StreamFn;
     use pie_ai::{
