@@ -844,6 +844,9 @@ impl App {
                 match commands::dispatch(input, &self.registry, &ctx).await {
                     CommandOutcome::Quit => break,
                     CommandOutcome::Error(e) => eprintln!("error: {e}"),
+                    CommandOutcome::LoginSecret { provider } => {
+                        eprintln!("error: {}", crate::login_requires_tty_message(&provider));
+                    }
                     _ => {}
                 }
                 continue;
@@ -1047,5 +1050,14 @@ mod tests {
             text.contains("working"),
             "busy status should say working:\n{text}"
         );
+    }
+
+    #[test]
+    fn login_requires_tty_message_is_bounded_and_secret_free() {
+        let msg = crate::login_requires_tty_message("ds4");
+        assert!(msg.contains("interactive terminal"));
+        assert!(msg.contains("/login ds4"));
+        assert!(!msg.contains("api key for"));
+        assert!(!msg.contains("sk-"));
     }
 }

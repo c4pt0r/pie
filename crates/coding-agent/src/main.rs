@@ -535,15 +535,19 @@ pub(crate) async fn prompt_for_api_key(provider: &str) -> Result<String> {
     let provider = provider.to_string();
     tokio::task::spawn_blocking(move || {
         if !std::io::stdin().is_terminal() {
-            anyhow::bail!(
-                "/login requires an interactive terminal so the API key is not echoed; run pie in a TTY and use `/login {provider}`"
-            );
+            anyhow::bail!(login_requires_tty_message(&provider));
         }
         rpassword::prompt_password(format!("api key for `{provider}`: "))
             .context("read api key without echo")
     })
     .await
     .context("login prompt task")?
+}
+
+pub(crate) fn login_requires_tty_message(provider: &str) -> String {
+    format!(
+        "/login requires an interactive terminal so the API key is not echoed; run pie in a TTY and use `/login {provider}`"
+    )
 }
 
 fn parse_thinking(s: &str) -> Result<ThinkingLevel> {
