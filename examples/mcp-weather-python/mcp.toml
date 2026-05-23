@@ -1,0 +1,32 @@
+# Example pie MCP server registry for the live-weather push source. Drop this (or the
+# matching `[[server]]` block) into either of pie's two mcp.toml locations:
+#
+#   ~/.pie/mcp.toml             # user-global, applies to every pie run on this machine
+#   <repo>/.pie/mcp.toml        # project-local, only applies when running pie from <repo>
+#                                 (project entries override same-named user entries)
+#
+# The path in `args` is relative to the cwd pie is launched from. Replace it with an
+# absolute path if you want the entry to work regardless of where you run pie. Example:
+#
+#   args = ["/abs/path/to/pie/examples/mcp-weather-python/weather-server.py"]
+#
+# This registry has no `env` key; the child inherits pie's environment, so override the
+# defaults ("San Francisco", 600s) by exporting before launch:
+#   PIE_WEATHER_LOCATION=Tokyo PIE_WEATHER_INTERVAL_SECS=300 pie
+# ...or bake them into the spawn via a shell wrapper:
+#   command = "sh"
+#   args = ["-c", "PIE_WEATHER_LOCATION=Tokyo python3 ./examples/mcp-weather-python/weather-server.py"]
+
+[[server]]
+# `name` becomes the source label `mcp:<name>` and the prefix on every minted idempotency
+# key (e.g. `mcp:weather:custom:obs:2026-05-23:02:07PM`). Must be unique across all servers.
+name = "weather"
+command = "python3"
+args = ["./examples/mcp-weather-python/weather-server.py"]
+# Delivery mode for this server's pushes (pick at most one; both default false):
+#   inject_summary = true   each `pie_summary` is injected into chat as a `[Trigger …]`
+#                           message — no sub-agent, no model call, zero cost.
+#   inject_and_run = true   same injection, then ONE model turn runs in the chat's full
+#                           context so the agent reacts to the update (costs a turn).
+# Drop both to instead route pushes through dynamic trigger rules (sub-agent).
+inject_summary = true
