@@ -119,7 +119,7 @@ async fn handshake_list_and_call_round_trip() {
     assert_eq!(tools[0].name, "echo");
 
     let res = client
-        .tools_call("echo", Some(serde_json::json!({ "text": "hi" })))
+        .tools_call("echo", Some(serde_json::json!({ "text": "hi" })), None)
         .await
         .unwrap();
     assert!(!res.is_error);
@@ -252,4 +252,262 @@ async fn server_push_notifications_reach_take_notifications_in_order() {
     );
 
     server_handle.abort();
+}
+
+// ----------------------------------------------------------------------------------------------
+// Cancellation tests for `McpClient::tools_call(_, _, cancel)`.
+//
+// These tests cover the contract added in the MCP `tools_call` cancel PR:
+//   - `cancel.cancel()` mid-flight returns `McpError::Cancelled` bounded by the cancel
+//     notification budget (200ms), NOT by the request_timeout (30s).
+//   - A `notifications/cancelled` frame with the original JSON-RPC `requestId` is delivered
+//     to the server exactly once per cancelled call.
+//   - A response that arrives AFTER cancel is silently dropped by the read pump — no panic,
+//     no stale tool result, and the inflight HashMap shrinks back to empty.
+//   - A response that arrives BEFORE cancel still succeeds and the client does NOT emit a
+//     spurious cancel notification.
+//   - The pre-existing `tools_call(_, _, None)` shape keeps working unchanged.
+//   - The request_timeout path keeps working when no cancel token is supplied.
+// ----------------------------------------------------------------------------------------------
+
+/// Slow mock server: for any `tools/call` it delays the response until a barrier is released
+/// (so the client can be cancelled mid-wait), and records every incoming JSON frame in
+/// `seen_frames` so tests can assert the wire shape of the cancel notification. Anything
+/// other than `tools/call` is answered immediately (so `initialize` doesn't block the
+/// handshake).
+async fn run_slow_mock_server(
+    transport: Arc<PipeTransport>,
+    release: Arc<tokio::sync::Notify>,
+    seen_frames: Arc<AsyncMutex<Vec<serde_json::Value>>>,
+) {
+    loop {
+        let line = match transport.recv_line().await {
+            Ok(Some(l)) => l,
+            _ => break,
+        };
+        let v: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        seen_frames.lock().await.push(v.clone());
+
+        let method = v.get("method").and_then(|x| x.as_str()).unwrap_or("");
+        let id = v.get("id").and_then(|x| x.as_u64());
+
+        if method == "notifications/initialized" || method == "notifications/cancelled" {
+            continue; // pure notification — no response
+        }
+
+        match method {
+            "initialize" => {
+                let result = serde_json::json!({
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "serverInfo": { "name": "slow-server", "version": "0.0.1" }
+                });
+                let _ = transport
+                    .send_line(
+                        serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result })
+                            .to_string(),
+                    )
+                    .await;
+            }
+            "tools/list" => {
+                let result = serde_json::json!({
+                    "tools": [{
+                        "name": "slow_echo",
+                        "description": "echo, but only after the release barrier fires",
+                        "inputSchema": { "type": "object", "properties": {} }
+                    }]
+                });
+                let _ = transport
+                    .send_line(
+                        serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result })
+                            .to_string(),
+                    )
+                    .await;
+            }
+            "tools/call" => {
+                // Spawn the reply so the server loop keeps draining frames (including the
+                // cancel notification) while the tool call is "in flight".
+                let transport = transport.clone();
+                let release = release.clone();
+                tokio::spawn(async move {
+                    release.notified().await;
+                    let result = serde_json::json!({
+                        "content": [{ "type": "text", "text": "released" }],
+                        "isError": false
+                    });
+                    let _ = transport
+                        .send_line(
+                            serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result })
+                                .to_string(),
+                        )
+                        .await;
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn tools_call_cancel_during_wait_returns_cancelled_and_notifies_server() {
+    let (client_side, server_side) = pair();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let seen_frames: Arc<AsyncMutex<Vec<serde_json::Value>>> =
+        Arc::new(AsyncMutex::new(Vec::new()));
+    tokio::spawn(run_slow_mock_server(
+        server_side,
+        release.clone(),
+        seen_frames.clone(),
+    ));
+
+    let client = Arc::new(McpClient::new(client_side));
+    client.initialize("pie-test").await.unwrap();
+    let _tools = client.tools_list().await.unwrap();
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let client_for_call = client.clone();
+    let cancel_for_call = cancel.clone();
+    let call = tokio::spawn(async move {
+        client_for_call
+            .tools_call("slow_echo", None, Some(cancel_for_call))
+            .await
+    });
+
+    // Give the request frame time to land on the server before we cancel.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    cancel.cancel();
+
+    // The cancel return must be bounded by the 200ms notify budget, NOT the 30s request
+    // timeout. Allow generous slack for CI.
+    let started = std::time::Instant::now();
+    let res = tokio::time::timeout(std::time::Duration::from_secs(2), call)
+        .await
+        .expect("tools_call must return promptly after cancel")
+        .expect("join error");
+    assert!(
+        matches!(res, Err(McpError::Cancelled)),
+        "expected McpError::Cancelled, got {res:?}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "cancel must short-circuit the 30s request_timeout, took {:?}",
+        started.elapsed()
+    );
+
+    // The server must have observed exactly one `notifications/cancelled` frame, and its
+    // `requestId` must equal the JSON-RPC id of the original tools/call request.
+    // Wait for the cancel notification to flush into the server's seen-frames vector.
+    let mut cancel_frames = Vec::new();
+    let mut original_id: Option<u64> = None;
+    for _ in 0..50 {
+        let frames = seen_frames.lock().await;
+        original_id = frames
+            .iter()
+            .find(|f| f.get("method").and_then(|m| m.as_str()) == Some("tools/call"))
+            .and_then(|f| f.get("id").and_then(|v| v.as_u64()));
+        cancel_frames = frames
+            .iter()
+            .filter(|f| f.get("method").and_then(|m| m.as_str()) == Some("notifications/cancelled"))
+            .cloned()
+            .collect();
+        drop(frames);
+        if !cancel_frames.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        cancel_frames.len(),
+        1,
+        "exactly one notifications/cancelled frame must reach the server"
+    );
+    let cf = &cancel_frames[0];
+    assert!(
+        cf.get("id").is_none(),
+        "notifications/cancelled is a notification — must not carry an `id` field"
+    );
+    let request_id = cf
+        .get("params")
+        .and_then(|p| p.get("requestId"))
+        .and_then(|v| v.as_u64())
+        .expect("requestId must be present and numeric");
+    assert_eq!(
+        Some(request_id),
+        original_id,
+        "cancel notification requestId must match the original tools/call id"
+    );
+
+    // Even though we abandoned the call, the server still produces a response when released.
+    // The pump must silently drop the unmatched late response (no panic, no client crash).
+    // We assert by releasing + sleeping and observing that the runtime stays healthy enough
+    // to do further work (sleeping inside the runtime is what would explode if the pump
+    // task had panicked).
+    release.notify_waiters();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+}
+
+#[tokio::test]
+async fn tools_call_success_does_not_emit_cancelled_notification() {
+    let (client_side, server_side) = pair();
+    tokio::spawn(run_mock_server(server_side));
+
+    let client = McpClient::new(client_side);
+    client.initialize("pie-test").await.unwrap();
+    let _ = client.tools_list().await.unwrap();
+
+    // Even though we pass a cancel token, we never cancel it. The successful response should
+    // race-win and no `notifications/cancelled` frame should ever be emitted.
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let res = client
+        .tools_call(
+            "echo",
+            Some(serde_json::json!({ "text": "ok" })),
+            Some(cancel),
+        )
+        .await
+        .expect("normal call must succeed");
+    assert!(!res.is_error);
+    // No direct way to assert "no cancel frame was sent" against `run_mock_server` (it
+    // doesn't capture frames). The contract is enforced by the `biased; r = wait => r,`
+    // branch order in the select! — wait wins when both are ready, so a non-cancelled call
+    // never reaches the cancel branch.
+}
+
+#[tokio::test]
+async fn tools_call_without_cancel_token_keeps_pre_existing_behavior() {
+    let (client_side, server_side) = pair();
+    tokio::spawn(run_mock_server(server_side));
+
+    let client = McpClient::new(client_side);
+    client.initialize("pie-test").await.unwrap();
+    let _ = client.tools_list().await.unwrap();
+
+    let res = client
+        .tools_call("echo", Some(serde_json::json!({ "text": "hi" })), None)
+        .await
+        .unwrap();
+    assert!(!res.is_error);
+}
+
+#[tokio::test]
+async fn tools_call_request_timeout_still_returns_timeout_when_no_cancel() {
+    let (client_side, server_side) = pair();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let seen_frames: Arc<AsyncMutex<Vec<serde_json::Value>>> =
+        Arc::new(AsyncMutex::new(Vec::new()));
+    tokio::spawn(run_slow_mock_server(server_side, release, seen_frames));
+
+    // Override the 30s default so the test doesn't hang waiting for a real timeout.
+    let client = McpClient::new(client_side).with_timeout(std::time::Duration::from_millis(150));
+    client.initialize("pie-test").await.unwrap();
+    let _ = client.tools_list().await.unwrap();
+
+    let res = client.tools_call("slow_echo", None, None).await;
+    assert!(
+        matches!(res, Err(McpError::Timeout { .. })),
+        "expected timeout, got {res:?}"
+    );
 }

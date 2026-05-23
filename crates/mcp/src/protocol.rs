@@ -70,6 +70,17 @@ pub struct ToolsCallParams {
     pub arguments: Option<serde_json::Value>,
 }
 
+/// `params` for the MCP `notifications/cancelled` frame (spec 2025-03-26 §basic/utilities/cancellation).
+/// Sent by the client when a previously issued request id is no longer needed; the server SHOULD
+/// stop work for that id. `requestId` matches the original JSON-RPC request id.
+#[derive(Debug, Clone, Serialize)]
+pub struct CancelledNotificationParams {
+    #[serde(rename = "requestId")]
+    pub request_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpToolCallResult {
     pub content: Vec<ToolContent>,

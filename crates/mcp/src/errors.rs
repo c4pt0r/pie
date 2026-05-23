@@ -14,6 +14,8 @@ pub enum McpError {
     Timeout { seconds: u64 },
     #[error("client is not initialized; call `initialize` before issuing requests")]
     NotInitialized,
+    #[error("request cancelled before the server responded")]
+    Cancelled,
     #[error("{0}")]
     Other(String),
 }

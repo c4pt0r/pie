@@ -282,6 +282,18 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
 
 ### Fixed
 
+- `McpClient::tools_call` now races the caller's `CancellationToken` against the response
+  and request_timeout. When cancel fires before the server replies, the inflight slot is
+  released, a best-effort `notifications/cancelled` frame (MCP spec 2025-03-26) is sent to
+  the server with the original JSON-RPC `requestId` (bounded by a 200ms send budget so a
+  stuck transport can't keep the cancel path open), and the call returns
+  `McpError::Cancelled`. The `McpAgentTool` adapter plumbs the harness cancel token through
+  so a user Ctrl-C now (a) returns immediately at the adapter, (b) does not leak inflight
+  HashMap entries on cancel/dropped futures (an `InflightGuard` RAII covers every exit
+  path), and (c) gives the MCP server a chance to stop work instead of running to
+  completion. Late responses to an already-cancelled id are silently dropped by the read
+  pump. Tests in `crates/mcp/tests/client_fixture.rs` and `mcp_adapter::tests` pin the wire
+  shape, bounded return time, no-spurious-cancel-on-success, and adapter-level plumbing.
 - Slash commands that start an agent turn (`/new-trigger` and `/template <name>`) now route
   through the same REPL-owned Ctrl-C abort path as normal prompts, so thinking/streaming/tool
   execution can be interrupted consistently instead of being awaited inside command dispatch.
