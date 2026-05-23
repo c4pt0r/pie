@@ -138,18 +138,31 @@ pub enum HarnessEvent {
     /// material. The parent `trigger_result` audit entry has been written with
     /// `success: false`.
     TriggerFailed { trace_id: String, reason: String },
-    /// A trigger's `PromoteAction` rendered successfully and a parent-session entry was
-    /// inserted to surface the sub-agent result to the user / LLM. `inserted_entry_id` is
-    /// the id of the appended `Message::User` (pie_ai has no System role today; we use
-    /// User with a `[Trigger ...]` body prefix so the LLM disambiguates trigger-driven
-    /// context from human input). The `trigger_promotion` Custom audit records the same
-    /// id for cross-reference.
+    /// A trigger's `PromoteAction` rendered successfully and the runtime committed to
+    /// surfacing the sub-agent result to the user / LLM. pie_ai has no System role today;
+    /// the inserted entry is a `Message::User` with a `[Trigger ...]` body prefix so the
+    /// LLM disambiguates trigger-driven context from human input.
+    ///
+    /// `inserted_entry_id` semantics depend on the parent agent state at promotion time
+    /// (see also `trigger_promotion.state` in the same-trace audit entry):
+    ///
+    /// - **Idle parent** (`apply_promotion` took the synchronous-append branch):
+    ///   `inserted_entry_id` is the durable id of the appended `Message::User` and
+    ///   matches `trigger_promotion.inserted_entry_id`. Audit `state: "success"`.
+    /// - **Streaming parent** (queued through the loop's follow-up queue to avoid a
+    ///   double-persistence / ordering race): `inserted_entry_id` is an **empty string**
+    ///   because the session entry ID is only known after the loop drains the queue and
+    ///   the session listener writes the entry. Consumers should correlate by `trace_id`
+    ///   in this case. Audit `state: "queued"` and `inserted_entry_id: null` for the
+    ///   matching `trigger_promotion` entry.
     ///
     /// Causality (RFC 1 §5.F): `TriggerCompleted | TriggerFailed` → `TriggerPromoted` for
     /// the same `trace_id` when promotion is configured AND not held for approval.
     TriggerPromoted {
         trace_id: String,
         promote_kind: String,
+        /// See variant rustdoc: durable id for the idle branch; empty for the streaming
+        /// queued branch (consumers join by `trace_id`).
         inserted_entry_id: String,
         template_name: Option<String>,
         redaction_status: String,
