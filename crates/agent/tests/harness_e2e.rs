@@ -2402,67 +2402,79 @@ async fn trigger_result_audit_records_failure_reason_for_resume_archaeology() {
     );
 }
 
-#[test]
-fn last_assistant_text_truncation_does_not_panic_on_multibyte_codepoint() {
-    // CLI/TUI review on PR #64: `text.truncate(SUMMARY_CAP_BYTES)` panics if the cap lands
-    // mid-UTF-8. The fix walks back to a char boundary. Verify with a 3-byte CJK char
-    // string padded just past the 4 KiB cap.
-    //
-    // We unit-test the helper indirectly by feeding an `AgentState` with an assistant
-    // message whose text is engineered to land the byte cap inside a multi-byte char.
-    use pie_ai::{AssistantMessage, AssistantRole, ContentBlock, StopReason, Usage};
-    let mut state = pie_agent_core::AgentState::default();
-    // 你 is 3 bytes in UTF-8. 4096 / 3 = 1365.33; 1366 chars × 3 bytes = 4098 bytes, which
-    // means the 4096-byte cap lands inside the 1366th codepoint. The old `.truncate(4096)`
-    // would have panicked here.
-    let huge: String = "你".repeat(1366);
-    let assistant = AssistantMessage {
-        role: AssistantRole::Assistant,
-        content: vec![ContentBlock::text(huge)],
-        api: pie_ai::Api::from("faux"),
-        provider: pie_ai::Provider::from("faux"),
-        model: "faux".into(),
-        response_model: None,
-        response_id: None,
-        diagnostics: None,
-        usage: Usage::default(),
-        stop_reason: StopReason::Stop,
-        error_message: None,
-        timestamp: 0,
-    };
-    state.messages.push(pie_agent_core::AgentMessage::Llm(
-        pie_ai::Message::Assistant(assistant),
-    ));
+#[tokio::test]
+async fn trigger_result_summary_truncation_handles_multibyte_codepoint_via_production_path() {
+    // Per @CLI-TUI-Dev-Lead's second PR #64 review: the previous test re-implemented the
+    // boundary-walk logic locally, which proves the algorithm is sound but doesn't exercise
+    // the production `last_assistant_text` helper. Drive the real `handle_trigger` →
+    // sub-agent spawn → `last_assistant_text` → `trigger_result` audit path with a CJK-only
+    // body engineered to land the 4 KiB cap mid-codepoint. The pre-fix code would panic
+    // (turning the spawn task into a silent abort with no audit); the fixed code produces
+    // a truncated summary ending in the truncation marker.
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage.clone() as Arc<dyn SessionStorage>);
+    let mut opts = AgentHarnessOptions::new(faux_model(), session.clone());
 
-    // Drive the actual code path used in production. The harness's `last_assistant_text`
-    // helper is module-private; reach it through a full sub-agent run instead — see
-    // accepted_trigger_spawns_sub_agent_and_writes_trigger_result_audit for the wiring.
-    // For a unit-level test we can call the same operation manually:
-    let last = state
-        .messages
-        .iter()
-        .rev()
-        .find_map(|m| match m {
-            pie_agent_core::AgentMessage::Llm(pie_ai::Message::Assistant(a)) => Some(a),
+    // 你 is 3 bytes in UTF-8. 1366 copies = 4098 bytes — the 4096-byte cap lands inside the
+    // 1366th codepoint. We `Box::leak` because faux_stream_fn takes a `&'static str`.
+    let huge_text: &'static str = Box::leak(("你".repeat(1366)).into_boxed_str());
+    opts.stream_fn = Some(faux_stream_fn(huge_text));
+    let harness = AgentHarness::new(opts);
+
+    let events = Arc::new(std::sync::Mutex::new(Vec::<HarnessEvent>::new()));
+    let sink = events.clone();
+    let _unsub = harness.subscribe_harness(Arc::new(move |ev| {
+        sink.lock().unwrap().push(ev);
+    }));
+
+    let _ = harness
+        .handle_trigger(sample_trigger("k-utf8-trunc", "trace-utf8-trunc"))
+        .await;
+    // The production path must complete (not panic). If `last_assistant_text` panicked
+    // mid-spawn the TriggerCompleted event would never fire.
+    wait_for_event(&events, 5, |evs| {
+        evs.iter().find_map(|e| match e {
+            HarnessEvent::TriggerCompleted {
+                trace_id, summary, ..
+            } if trace_id == "trace-utf8-trunc" => Some(summary.clone()),
             _ => None,
         })
-        .unwrap();
-    let mut text = String::new();
-    for block in &last.content {
-        if let pie_ai::ContentBlock::Text(t) = block {
-            text.push_str(&t.text);
-        }
-    }
-    const CAP: usize = 4096;
-    assert!(text.len() > CAP);
-    // Boundary walk: walk back from CAP until char boundary.
-    let mut cut = CAP;
-    while cut > 0 && !text.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    // This MUST NOT panic — that's the regression we're guarding.
-    let mut truncated = text.clone();
-    truncated.truncate(cut);
-    // And the truncated value is valid UTF-8.
-    let _ = truncated.chars().count();
+    })
+    .await
+    .expect("TriggerCompleted must fire — pre-fix code would panic and abort the task");
+
+    // trigger_result audit's summary must be valid UTF-8 (otherwise serde_json would have
+    // refused to encode it on the way to JSONL) AND must end with the truncation marker.
+    let entries = session.entries().await.unwrap();
+    let data = entries
+        .iter()
+        .find_map(|e| match e {
+            SessionTreeEntry::Custom {
+                custom_type, data, ..
+            } if custom_type == "trigger_result" => data.clone(),
+            _ => None,
+        })
+        .expect("trigger_result audit");
+    let summary = data["summary"]
+        .as_str()
+        .expect("summary must be a string (proves valid UTF-8 round-trip through serde_json)");
+    assert!(
+        summary.ends_with("…[truncated]"),
+        "summary must be capped with truncation marker; got len={} ending={:?}",
+        summary.len(),
+        summary.chars().rev().take(15).collect::<String>(),
+    );
+    // The truncated content body is strictly less than 4 KiB + the marker bytes.
+    let body_only = summary.trim_end_matches("…[truncated]");
+    assert!(
+        body_only.len() <= 4096,
+        "body before marker must respect 4 KiB cap; got {}",
+        body_only.len()
+    );
+    // And the truncated text is still composed of valid `你` codepoints (no half codepoint
+    // bytes survived).
+    assert!(
+        body_only.chars().all(|c| c == '你'),
+        "truncation MUST land on a char boundary; got non-你 chars in body"
+    );
 }

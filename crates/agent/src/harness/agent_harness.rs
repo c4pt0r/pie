@@ -115,11 +115,13 @@ pub enum HarnessEvent {
     },
     /// A sub-agent execution finished successfully and the parent `trigger_result` audit
     /// entry has been written. `summary` is the sub-agent's self-summary (size-capped at
-    /// 4 KiB); `cost_usd` is added to the parent harness's cost total.
+    /// 4 KiB). `cost_usd` is `None` in sub-PR 5a because the bare sub-`Agent` has no
+    /// `CostTracker` wrapper — the value mirrors the audit's `cost_usd: null`. Sub-PR 5b
+    /// or 5c wraps the sub-agent in a mini-`CostTracker` and `cost_usd` will be `Some(f)`.
     TriggerCompleted {
         trace_id: String,
         summary: Option<String>,
-        cost_usd: f64,
+        cost_usd: Option<f64>,
     },
     /// A sub-agent execution failed (agent loop error, panic-via-spawn-error, or aborted by
     /// [`AgentHarness::abort_trigger`] / [`AgentHarness::abort_all_triggers`]). `reason` is
@@ -1443,12 +1445,16 @@ async fn run_trigger_action(
     // `Display` (free-form but generally short error string from our own code paths) and
     // explicitly avoid embedding any sub-agent message bodies / provider response content.
     if success {
+        // `cost_usd: None` mirrors the audit's `cost_usd: null`. Sub-agent in 5a is bare
+        // (no CostTracker wrapper); reporting 0.0 here while the audit said null would
+        // make event subscribers + jsonl readers disagree about the same field. 5b/5c
+        // will populate this with a real measurement when the sub-agent is wrapped.
         emit_from_listeners(
             &listeners,
             HarnessEvent::TriggerCompleted {
                 trace_id: trace_id.clone(),
                 summary,
-                cost_usd: 0.0,
+                cost_usd: None,
             },
         );
     } else {
