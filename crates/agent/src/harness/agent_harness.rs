@@ -306,6 +306,13 @@ pub struct RunningTriggerState {
 #[derive(Clone, Debug)]
 pub struct TriggerAction {
     pub prompt: String,
+    /// How a successful run is mirrored back into the parent transcript. Honored for
+    /// [`TriggerDelivery::SubAgent`] (applied to the sub-agent's result) and
+    /// [`TriggerDelivery::InjectSummary`] (applied to `trigger.payload_summary` as the
+    /// faux result). **Ignored for [`TriggerDelivery::InjectAndRun`]**: that mode
+    /// direct-injects `prompt` and asks the embedder to run one parent-loop turn, so
+    /// there's no separate "result" for `promote` to act on. Set `promote = None` for
+    /// `InjectAndRun` to make intent obvious.
     pub promote: PromoteAction,
     pub promote_requires_approval: bool,
     /// How the runtime delivers this action. Default [`TriggerDelivery::SubAgent`] preserves
@@ -327,8 +334,16 @@ pub enum TriggerDelivery {
     #[default]
     SubAgent,
     /// Skip the sub-agent. The runtime treats `trigger.payload_summary` as the result
-    /// `summary` and applies `promote` directly — no model call, no tools, zero cost. Used
-    /// by sources configured as pure notification feeds. `prompt` is ignored in this mode.
+    /// `summary` and applies `promote` directly — no model call, no tools, zero cost
+    /// **for the trigger itself**. Used by sources configured as pure notification feeds.
+    /// `prompt` is ignored in this mode.
+    ///
+    /// Note on cost attribution: when `promote` is non-`None` and the parent is mid-turn,
+    /// `apply_promotion`'s streaming branch enqueues a follow-up which the parent loop
+    /// drains into a real model turn. That turn's cost is attributed to the parent agent's
+    /// own usage, not to this trigger's `trigger_result.cost_usd` (which stays 0.0 — an
+    /// honest measurement of the direct trigger work). If you want truly zero cascade cost,
+    /// pair `InjectSummary` with `PromoteAction::None`.
     InjectSummary,
     /// Skip the sub-agent, but inject [`TriggerAction::prompt`] into the **parent**
     /// conversation and arrange for ONE model turn to run in the parent's full context.
@@ -341,6 +356,23 @@ pub enum TriggerDelivery {
     /// parent-loop event, not attributed to this trigger's `trigger_result`.
     InjectAndRun,
 }
+
+/// Audit-shape note for downstream JSONL readers and `/triggers audit` consumers:
+///
+/// The `trigger_promotion` and `trigger_result` audit entries both carry a
+/// `prefix_injected: bool` field (recording whether the engine had to prepend the
+/// `[Trigger {trace_id}] ` attribution prefix), but the *placement* depends on which
+/// delivery path produced the audit:
+///
+/// - [`TriggerDelivery::SubAgent`] + `PromoteAction::PromoteSummaryNow`/etc.: prefix lives
+///   on the `trigger_promotion` audit (written by `apply_promotion`).
+/// - [`TriggerDelivery::InjectSummary`]: prefix lives on the `trigger_promotion` audit
+///   (`apply_promotion` is still called for the summary).
+/// - [`TriggerDelivery::InjectAndRun`]: prefix lives on the `trigger_result` audit directly
+///   (no `apply_promotion` call; the inject path writes its own audit).
+///
+/// JSONL readers that join on `trace_id` should check both audit types for the field.
+const _AUDIT_SHAPE_DOC: () = ();
 
 impl TriggerAction {
     /// The default `Prompt` form used when no [`BeforeTriggerActionHook`] is configured.
