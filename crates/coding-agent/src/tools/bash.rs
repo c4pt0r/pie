@@ -320,17 +320,21 @@ mod tests {
     /// Spawn a long-running command, hit the timeout, and assert the child process is
     /// gone afterwards. The previous implementation marked the result `[timed out]` but
     /// left `sh -c sleep ...` running in the background.
+    ///
+    /// Uses a unique sleep duration (`sleep 47383`) so the `pgrep -f` check can scope to
+    /// this test only — `cargo test` runs tests in parallel, and a sibling test using
+    /// plain `sleep 60` would otherwise collide. Pick a value that's:
+    /// 1. larger than any plausible test wall-clock, so the kill path is the only exit
+    /// 2. unique across this file's tests
     #[tokio::test]
     async fn timeout_kills_child_process() {
+        const SLEEP_SECS: &str = "47383";
         let tool = BashTool;
         let started = Instant::now();
-        // `sleep 60` would block this test forever if the timeout path doesn't kill the
-        // child. We assert wall-clock under 3 seconds (timeout=1s + drain budget) AND
-        // that no `sleep 60` process survived the call.
         let result = tool
             .execute(
                 "t1",
-                json!({ "command": "sleep 60", "timeout": 1 }),
+                json!({ "command": format!("sleep {SLEEP_SECS}"), "timeout": 1 }),
                 CancellationToken::new(),
                 None,
             )
@@ -351,10 +355,15 @@ mod tests {
         );
         assert!(text.contains("[exit -1]"));
 
-        // Verify no sleep 60 child is hanging around. Best-effort process check via `pgrep`.
+        // Give the OS a beat to reap the killed process group.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Verify no `sleep 47383` process survived. `pgrep -f` matches the full argv,
+        // including the shell wrapper if any sibling test happened to spawn one — the
+        // unique duration scopes the check to this test.
         let pgrep = tokio::process::Command::new("pgrep")
             .arg("-f")
-            .arg("sleep 60")
+            .arg(format!("sleep {SLEEP_SECS}"))
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn();
@@ -366,7 +375,7 @@ mod tests {
             let _ = child.wait().await;
             assert!(
                 buf.trim().is_empty(),
-                "found surviving `sleep 60` process(es) after timeout: pids={buf}"
+                "found surviving `sleep {SLEEP_SECS}` process(es) after timeout: pids={buf}"
             );
         }
     }
@@ -428,9 +437,12 @@ mod tests {
     }
 
     /// Cancel via the token mid-run. Same expectation as timeout: child is killed, output
-    /// includes the `[aborted]` marker, and no zombie remains.
+    /// includes the `[aborted]` marker, and no zombie remains. Distinct sleep duration
+    /// from `timeout_kills_child_process` so `pgrep` checks across the file don't collide
+    /// when `cargo test` runs in parallel.
     #[tokio::test]
     async fn cancellation_kills_child_process() {
+        const SLEEP_SECS: &str = "47384";
         let tool = BashTool;
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
@@ -441,7 +453,12 @@ mod tests {
         });
         let started = Instant::now();
         let result = tool
-            .execute("t2", json!({ "command": "sleep 60" }), cancel, None)
+            .execute(
+                "t2",
+                json!({ "command": format!("sleep {SLEEP_SECS}") }),
+                cancel,
+                None,
+            )
             .await
             .expect("bash tool should not error on cancellation");
         let elapsed = started.elapsed();
