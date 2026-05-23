@@ -67,7 +67,7 @@ pub enum CommandOutcome {
     /// stays explicit instead of going through the agent steering queue.
     AttachSkill { name: String },
     /// Ask the REPL to run a prompt through the same active-turn path as normal user input.
-    /// Commands return this instead of awaiting the harness directly so Ctrl-C can abort
+    /// Commands return this instead of awaiting the harness directly so Ctrl-C/Esc can abort
     /// thinking, streaming, and tool execution consistently.
     RunAgentPrompt {
         prompt: String,
@@ -1222,7 +1222,7 @@ impl SlashCommand for NewTriggerCommand {
         );
         CommandOutcome::RunAgentPrompt {
             prompt,
-            error_context: "create trigger",
+            error_context: "create trigger: ",
         }
     }
 }

@@ -449,7 +449,7 @@ impl App {
 
         if trimmed.starts_with('/') {
             self.feed.push_user(&trimmed);
-            self.dispatch_slash(&trimmed, terminal).await;
+            self.dispatch_slash(&trimmed, terminal, turn).await;
             return Ok(());
         }
 
@@ -508,6 +508,7 @@ impl App {
         &mut self,
         input: &str,
         terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        turn: &mut TurnState,
     ) {
         let outcome = {
             let ctx = CommandCtx {
@@ -527,14 +528,41 @@ impl App {
             }
             CommandOutcome::Error(e) => self.error_line(e),
             CommandOutcome::AttachSkill { name } => {
-                self.system_line(format!("attached skill `{name}` for the next prompt"));
                 self.pending_skill = Some(name);
+            }
+            CommandOutcome::RunAgentPrompt {
+                prompt,
+                error_context,
+            } => {
+                self.start_prompt_turn(prompt, error_context, turn);
+            }
+            CommandOutcome::RunPromptTemplate { name, vars } => {
+                let harness = self.harness.clone();
+                turn.fut = Some(Box::pin(async move {
+                    harness.prompt_from_template(&name, vars).await
+                }));
+                turn.aborted = false;
+                turn.prefix = "template run failed: ";
+                self.busy = true;
             }
             CommandOutcome::LoginSecret { provider } => {
                 self.login(&provider, terminal).await;
             }
             CommandOutcome::Handled => {}
         }
+    }
+
+    fn start_prompt_turn(
+        &mut self,
+        prompt: String,
+        error_context: &'static str,
+        turn: &mut TurnState,
+    ) {
+        let harness = self.harness.clone();
+        turn.fut = Some(Box::pin(async move { harness.prompt(prompt).await }));
+        turn.aborted = false;
+        turn.prefix = error_context;
+        self.busy = true;
     }
 
     async fn login(
@@ -846,6 +874,19 @@ impl App {
                     CommandOutcome::Error(e) => eprintln!("error: {e}"),
                     CommandOutcome::LoginSecret { provider } => {
                         eprintln!("error: {}", crate::login_requires_tty_message(&provider));
+                    }
+                    CommandOutcome::RunAgentPrompt {
+                        prompt,
+                        error_context,
+                    } => {
+                        if let Err(e) = self.harness.prompt(prompt).await {
+                            eprintln!("error: {error_context}{e}");
+                        }
+                    }
+                    CommandOutcome::RunPromptTemplate { name, vars } => {
+                        if let Err(e) = self.harness.prompt_from_template(&name, vars).await {
+                            eprintln!("error: template run failed: {e}");
+                        }
                     }
                     _ => {}
                 }
