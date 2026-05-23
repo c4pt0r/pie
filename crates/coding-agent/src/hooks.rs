@@ -649,7 +649,9 @@ impl EventData {
             | HarnessEvent::PersistenceError { .. }
             | HarnessEvent::TriggerExecutionStarted { .. }
             | HarnessEvent::TriggerCompleted { .. }
-            | HarnessEvent::TriggerFailed { .. } => None,
+            | HarnessEvent::TriggerFailed { .. }
+            | HarnessEvent::TriggerPromoted { .. }
+            | HarnessEvent::PromotionPending { .. } => None,
         }
     }
 }

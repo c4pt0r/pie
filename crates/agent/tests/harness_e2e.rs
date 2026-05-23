@@ -345,6 +345,8 @@ async fn harness_event_bus_delivers_session_and_branch() {
             HarnessEvent::TriggerExecutionStarted { .. } => "TriggerExecutionStarted",
             HarnessEvent::TriggerCompleted { .. } => "TriggerCompleted",
             HarnessEvent::TriggerFailed { .. } => "TriggerFailed",
+            HarnessEvent::TriggerPromoted { .. } => "TriggerPromoted",
+            HarnessEvent::PromotionPending { .. } => "PromotionPending",
         })
         .collect();
     assert!(
@@ -2477,4 +2479,444 @@ async fn trigger_result_summary_truncation_handles_multibyte_codepoint_via_produ
         body_only.chars().all(|c| c == '你'),
         "truncation MUST land on a char boundary; got non-你 chars in body"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────
+// Promotion — RFC 1 sub-PR 5b (PromoteAction::PromoteSummaryNow + template engine +
+// trigger_promotion audit + promote_requires_approval fail-closed)
+// ─────────────────────────────────────────────────────────────────────────────────────────
+
+fn promoting_action_hook(
+    template: Option<String>,
+    require_approval: bool,
+) -> pie_agent_core::BeforeTriggerActionHook {
+    use pie_agent_core::{
+        BeforeTriggerActionContext, BeforeTriggerActionHook, PromoteAction, TriggerAction,
+    };
+    let hook: BeforeTriggerActionHook =
+        Arc::new(move |ctx: BeforeTriggerActionContext, _cancel| {
+            let template = template.clone();
+            Box::pin(async move {
+                TriggerAction {
+                    prompt: format!(
+                        "{} fired: {}",
+                        ctx.trigger.source_label, ctx.trigger.event_label
+                    ),
+                    promote: PromoteAction::PromoteSummaryNow { template },
+                    promote_requires_approval: require_approval,
+                }
+            })
+        });
+    hook
+}
+
+/// Acceptance #8 from the #20 amendment: no `PromoteAction` configured → parent transcript
+/// stays stable. Only `trigger` + `trigger_result` Custom entries appear; no message-typed
+/// entries beyond the user prompt + sub-agent transcript (which goes to sub-session, not
+/// parent).
+#[tokio::test]
+async fn no_promote_action_leaves_parent_transcript_stable() {
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage.clone() as Arc<dyn SessionStorage>);
+    let mut opts = AgentHarnessOptions::new(faux_model(), session.clone());
+    opts.stream_fn = Some(faux_stream_fn("ok"));
+    let harness = AgentHarness::new(opts);
+
+    let events = Arc::new(std::sync::Mutex::new(Vec::<HarnessEvent>::new()));
+    let sink = events.clone();
+    let _unsub = harness.subscribe_harness(Arc::new(move |ev| {
+        sink.lock().unwrap().push(ev);
+    }));
+
+    let _ = harness
+        .handle_trigger(sample_trigger("k-no-promote", "trace-no-promote"))
+        .await;
+    wait_for_event(&events, 5, |evs| {
+        evs.iter().find_map(|e| match e {
+            HarnessEvent::TriggerCompleted { trace_id, .. } if trace_id == "trace-no-promote" => {
+                Some(())
+            }
+            _ => None,
+        })
+    })
+    .await
+    .expect("must complete");
+
+    let entries = session.entries().await.unwrap();
+    // Must NOT contain any Message entries (sub-agent transcript lives in sub-session,
+    // promotion didn't fire so nothing inserted).
+    let has_message = entries
+        .iter()
+        .any(|e| matches!(e, SessionTreeEntry::Message { .. }));
+    assert!(
+        !has_message,
+        "no promote → parent transcript MUST be empty of Message entries; got {} entries",
+        entries.len()
+    );
+    // Must NOT have a trigger_promotion audit either.
+    let has_promotion_audit = entries.iter().any(|e| {
+        matches!(
+            e,
+            SessionTreeEntry::Custom { custom_type, .. } if custom_type == "trigger_promotion"
+        )
+    });
+    assert!(
+        !has_promotion_audit,
+        "no promote → no trigger_promotion audit"
+    );
+
+    let evs = events.lock().unwrap().clone();
+    let promoted = evs
+        .iter()
+        .any(|e| matches!(e, HarnessEvent::TriggerPromoted { .. }));
+    let pending = evs
+        .iter()
+        .any(|e| matches!(e, HarnessEvent::PromotionPending { .. }));
+    assert!(!promoted && !pending, "no promote → no promotion events");
+}
+
+/// Acceptance #9: `PromoteSummaryNow` (no template → built-in default) inserts an audited
+/// `Message::User` into the parent jsonl; `trigger_promotion.inserted_entry_id` matches.
+#[tokio::test]
+async fn promote_summary_now_inserts_audited_parent_entry() {
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage.clone() as Arc<dyn SessionStorage>);
+    let mut opts = AgentHarnessOptions::new(faux_model(), session.clone());
+    opts.stream_fn = Some(faux_stream_fn("sub agent reports OK"));
+    opts.before_trigger_action = Some(promoting_action_hook(None, false));
+    let harness = AgentHarness::new(opts);
+
+    let events = Arc::new(std::sync::Mutex::new(Vec::<HarnessEvent>::new()));
+    let sink = events.clone();
+    let _unsub = harness.subscribe_harness(Arc::new(move |ev| {
+        sink.lock().unwrap().push(ev);
+    }));
+
+    let _ = harness
+        .handle_trigger(sample_trigger("k-promote-ok", "trace-promote-ok"))
+        .await;
+
+    let promoted_event = wait_for_event(&events, 5, |evs| {
+        evs.iter().find_map(|e| match e {
+            HarnessEvent::TriggerPromoted {
+                trace_id,
+                inserted_entry_id,
+                redaction_status,
+                template_name,
+                ..
+            } if trace_id == "trace-promote-ok" => Some((
+                inserted_entry_id.clone(),
+                redaction_status.clone(),
+                template_name.clone(),
+            )),
+            _ => None,
+        })
+    })
+    .await
+    .expect("TriggerPromoted must fire");
+    let (inserted_entry_id, redaction_status, template_name) = promoted_event;
+    assert_eq!(redaction_status, "clean");
+    assert!(
+        template_name.is_none(),
+        "default template was used → name None"
+    );
+
+    let entries = session.entries().await.unwrap();
+
+    // The inserted Message::User must exist with the expected id + body containing the
+    // default template's text shape.
+    let msg = entries
+        .iter()
+        .find_map(|e| match e {
+            SessionTreeEntry::Message {
+                id,
+                message: AgentMessage::Llm(pie_ai::Message::User(u)),
+                ..
+            } if id == &inserted_entry_id => Some(u.clone()),
+            _ => None,
+        })
+        .expect("inserted user message must exist in parent jsonl");
+    let body = match &msg.content {
+        pie_ai::UserContent::Text(s) => s.clone(),
+        _ => panic!("expected text body"),
+    };
+    assert!(
+        body.contains("[Trigger trace-promote-ok]"),
+        "default template body must include trace_id prefix; got {body:?}"
+    );
+    assert!(
+        body.contains("sub agent reports OK"),
+        "body must include result.summary; got {body:?}"
+    );
+
+    // trigger_promotion audit must reference the same inserted_entry_id.
+    let audit = entries
+        .iter()
+        .find_map(|e| match e {
+            SessionTreeEntry::Custom {
+                custom_type, data, ..
+            } if custom_type == "trigger_promotion" => data.clone(),
+            _ => None,
+        })
+        .expect("trigger_promotion audit must exist");
+    assert_eq!(audit["state"].as_str(), Some("success"));
+    assert_eq!(audit["trace_id"].as_str(), Some("trace-promote-ok"));
+    assert_eq!(
+        audit["inserted_entry_id"].as_str(),
+        Some(inserted_entry_id.as_str())
+    );
+    assert_eq!(audit["redaction_status"].as_str(), Some("clean"));
+}
+
+/// Acceptance #10: template references unknown variable → no insertion, audit `state:
+/// "failed"` with `redaction_status: "render_error"`, parent transcript unchanged.
+#[tokio::test]
+async fn promote_template_unknown_var_fails_closed() {
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage.clone() as Arc<dyn SessionStorage>);
+    let mut opts = AgentHarnessOptions::new(faux_model(), session.clone());
+    opts.stream_fn = Some(faux_stream_fn("sub ok"));
+    opts.before_trigger_action = Some(promoting_action_hook(
+        Some("Hello {{nonexistent_field}}".into()),
+        false,
+    ));
+    let harness = AgentHarness::new(opts);
+
+    let events = Arc::new(std::sync::Mutex::new(Vec::<HarnessEvent>::new()));
+    let sink = events.clone();
+    let _unsub = harness.subscribe_harness(Arc::new(move |ev| {
+        sink.lock().unwrap().push(ev);
+    }));
+
+    let _ = harness
+        .handle_trigger(sample_trigger("k-unknown", "trace-unknown"))
+        .await;
+    // Wait for the promotion-failure PersistenceError reflux.
+    wait_for_event(&events, 5, |evs| {
+        evs.iter().find_map(|e| match e {
+            HarnessEvent::PersistenceError {
+                context, message, ..
+            } if context == "trigger_promotion" && message.contains("nonexistent_field") => {
+                Some(())
+            }
+            _ => None,
+        })
+    })
+    .await
+    .expect("PersistenceError with unknown_field reason");
+
+    let entries = session.entries().await.unwrap();
+    // No Message::User entries in parent transcript.
+    let has_msg = entries
+        .iter()
+        .any(|e| matches!(e, SessionTreeEntry::Message { .. }));
+    assert!(!has_msg, "render error → parent transcript unchanged");
+    let audit = entries
+        .iter()
+        .find_map(|e| match e {
+            SessionTreeEntry::Custom {
+                custom_type, data, ..
+            } if custom_type == "trigger_promotion" => data.clone(),
+            _ => None,
+        })
+        .expect("failed promotion audit");
+    assert_eq!(audit["state"].as_str(), Some("failed"));
+    assert_eq!(audit["redaction_status"].as_str(), Some("render_error"));
+    assert!(audit["inserted_entry_id"].is_null());
+}
+
+/// Acceptance #11: template references explicitly forbidden field (e.g.
+/// `trigger.payload`) → no insertion, audit `redaction_status: "forbidden_field"`.
+#[tokio::test]
+async fn promote_template_forbidden_field_fails_closed() {
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage.clone() as Arc<dyn SessionStorage>);
+    let mut opts = AgentHarnessOptions::new(faux_model(), session.clone());
+    opts.stream_fn = Some(faux_stream_fn("ok"));
+    opts.before_trigger_action = Some(promoting_action_hook(
+        Some("Leaking {{trigger.payload}}".into()),
+        false,
+    ));
+    let harness = AgentHarness::new(opts);
+
+    let events = Arc::new(std::sync::Mutex::new(Vec::<HarnessEvent>::new()));
+    let sink = events.clone();
+    let _unsub = harness.subscribe_harness(Arc::new(move |ev| {
+        sink.lock().unwrap().push(ev);
+    }));
+
+    let _ = harness
+        .handle_trigger(sample_trigger("k-forbid", "trace-forbid"))
+        .await;
+    wait_for_event(&events, 5, |evs| {
+        evs.iter().find_map(|e| match e {
+            HarnessEvent::PersistenceError {
+                context, message, ..
+            } if context == "trigger_promotion" && message.contains("trigger.payload") => Some(()),
+            _ => None,
+        })
+    })
+    .await
+    .expect("PersistenceError with forbidden_field reason");
+
+    let entries = session.entries().await.unwrap();
+    let has_msg = entries
+        .iter()
+        .any(|e| matches!(e, SessionTreeEntry::Message { .. }));
+    assert!(!has_msg);
+    let audit = entries
+        .iter()
+        .find_map(|e| match e {
+            SessionTreeEntry::Custom {
+                custom_type, data, ..
+            } if custom_type == "trigger_promotion" => data.clone(),
+            _ => None,
+        })
+        .expect("failed promotion audit");
+    assert_eq!(audit["state"].as_str(), Some("failed"));
+    assert_eq!(audit["redaction_status"].as_str(), Some("forbidden_field"));
+}
+
+/// Acceptance #13: `promote_requires_approval = true` + no CLI approval command shipped =
+/// fail-closed to pending. `trigger_promotion.state: "pending"`, `PromotionPending` event,
+/// parent transcript unchanged.
+#[tokio::test]
+async fn promote_requires_approval_fails_closed_to_pending() {
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage.clone() as Arc<dyn SessionStorage>);
+    let mut opts = AgentHarnessOptions::new(faux_model(), session.clone());
+    opts.stream_fn = Some(faux_stream_fn("ok"));
+    opts.before_trigger_action = Some(promoting_action_hook(None, true));
+    let harness = AgentHarness::new(opts);
+
+    let events = Arc::new(std::sync::Mutex::new(Vec::<HarnessEvent>::new()));
+    let sink = events.clone();
+    let _unsub = harness.subscribe_harness(Arc::new(move |ev| {
+        sink.lock().unwrap().push(ev);
+    }));
+
+    let _ = harness
+        .handle_trigger(sample_trigger("k-pending", "trace-pending"))
+        .await;
+    let pending = wait_for_event(&events, 5, |evs| {
+        evs.iter().find_map(|e| match e {
+            HarnessEvent::PromotionPending {
+                trace_id, preview, ..
+            } if trace_id == "trace-pending" => Some(preview.clone()),
+            _ => None,
+        })
+    })
+    .await
+    .expect("PromotionPending must fire");
+    let preview = pending.expect("preview body should be Some when render succeeded");
+    assert!(preview.contains("[Trigger trace-pending]"));
+
+    let entries = session.entries().await.unwrap();
+    let has_msg = entries
+        .iter()
+        .any(|e| matches!(e, SessionTreeEntry::Message { .. }));
+    assert!(
+        !has_msg,
+        "promote_requires_approval=true must NOT insert into parent transcript without explicit approval"
+    );
+    let audit = entries
+        .iter()
+        .find_map(|e| match e {
+            SessionTreeEntry::Custom {
+                custom_type, data, ..
+            } if custom_type == "trigger_promotion" => data.clone(),
+            _ => None,
+        })
+        .expect("pending promotion audit");
+    assert_eq!(audit["state"].as_str(), Some("pending"));
+    assert!(audit["inserted_entry_id"].is_null());
+
+    // Also assert no TriggerPromoted event.
+    let evs = events.lock().unwrap().clone();
+    let promoted = evs.iter().any(|e| {
+        matches!(
+            e,
+            HarnessEvent::TriggerPromoted { trace_id, .. } if trace_id == "trace-pending"
+        )
+    });
+    assert!(!promoted);
+}
+
+/// Acceptance #12: summary cap truncation. Large `result.summary` (> 4 KiB) is truncated
+/// and `redaction_status: "truncated"` is reflected in both the audit and the event.
+///
+/// Drive by giving the faux stream a huge assistant body so `last_assistant_text` already
+/// truncates the summary down to 4 KiB. Then the rendered template body (containing that
+/// summary) will exceed `PROMOTION_BODY_CAP_BYTES` and trigger the body-cap truncation.
+#[tokio::test]
+async fn promote_summary_truncation_records_redaction_status() {
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage.clone() as Arc<dyn SessionStorage>);
+    let mut opts = AgentHarnessOptions::new(faux_model(), session.clone());
+
+    // ~6 KiB assistant text.
+    let huge_text: &'static str = Box::leak(("X".repeat(6 * 1024)).into_boxed_str());
+    opts.stream_fn = Some(faux_stream_fn(huge_text));
+    opts.before_trigger_action = Some(promoting_action_hook(None, false));
+    let harness = AgentHarness::new(opts);
+
+    let events = Arc::new(std::sync::Mutex::new(Vec::<HarnessEvent>::new()));
+    let sink = events.clone();
+    let _unsub = harness.subscribe_harness(Arc::new(move |ev| {
+        sink.lock().unwrap().push(ev);
+    }));
+
+    let _ = harness
+        .handle_trigger(sample_trigger("k-trunc", "trace-trunc"))
+        .await;
+    let evt = wait_for_event(&events, 5, |evs| {
+        evs.iter().find_map(|e| match e {
+            HarnessEvent::TriggerPromoted {
+                trace_id,
+                redaction_status,
+                inserted_entry_id,
+                ..
+            } if trace_id == "trace-trunc" => {
+                Some((redaction_status.clone(), inserted_entry_id.clone()))
+            }
+            _ => None,
+        })
+    })
+    .await
+    .expect("TriggerPromoted (truncated) must fire");
+    let (redaction, inserted_id) = evt;
+    assert_eq!(redaction, "truncated");
+
+    // The inserted message must be capped (≤ 4 KiB + the marker bytes).
+    let entries = session.entries().await.unwrap();
+    let msg = entries
+        .iter()
+        .find_map(|e| match e {
+            SessionTreeEntry::Message {
+                id,
+                message: AgentMessage::Llm(pie_ai::Message::User(u)),
+                ..
+            } if id == &inserted_id => Some(u.clone()),
+            _ => None,
+        })
+        .expect("inserted user message");
+    let body = match &msg.content {
+        pie_ai::UserContent::Text(s) => s.clone(),
+        _ => panic!("expected text body"),
+    };
+    assert!(
+        body.ends_with("…[truncated]"),
+        "truncated body must end with truncation marker"
+    );
+    // Audit must match.
+    let audit = entries
+        .iter()
+        .find_map(|e| match e {
+            SessionTreeEntry::Custom {
+                custom_type, data, ..
+            } if custom_type == "trigger_promotion" => data.clone(),
+            _ => None,
+        })
+        .expect("audit");
+    assert_eq!(audit["redaction_status"].as_str(), Some("truncated"));
 }

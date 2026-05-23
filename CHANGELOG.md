@@ -209,6 +209,40 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
   reaches audit promptly), `running` snapshot bounded preview + leaves after completion,
   abort path (cancellation within 3s + failure audit), and non-Accepted states never
   spawn sub-agents.
+- **#20 (promotion: PromoteSummaryNow + template engine + trigger_promotion audit)**
+  `PromoteAction::PromoteSummaryNow { template: Option<String> }` now actually does
+  something. After a sub-agent completes the spawn task runs the per-trigger
+  `PromoteAction` (returned by `BeforeTriggerActionHook`); when set to `PromoteSummaryNow`,
+  the runtime renders a template over an **allowlisted** context (`trace_id`,
+  `trigger.source.kind/server_name/method/topic/subkind`, `trigger.source_label`,
+  `trigger.event_label`, `trigger.payload_summary`, `trigger.received_at`,
+  `trigger.idempotency_key`, `trigger.authority.principal_id/principal_label/credential_scope`,
+  `result.summary/status/message_count/cost_usd/branch_id`) and appends a
+  `Message::User` into the parent session jsonl carrying the rendered body.
+  Default template (when `template: None`) is the built-in
+  `"[Trigger {{trace_id}}] {{trigger.source_label}} fired {{trigger.event_label}}.\nResult: {{result.summary}}"`.
+  Every promotion attempt writes a `SessionTreeEntry::Custom { custom_type:
+  "trigger_promotion", data: { state, trace_id, promote_kind, template_name, template_hash,
+  inserted_entry_id, rule_id, redaction_status, dedup_collapsed } }` audit so JSONL
+  readers can attribute every parent transcript mutation to a specific trigger.
+  Three states are persisted: `success` (rendered + inserted), `pending` (when
+  `promote_requires_approval = true` and no `/triggers approve` command is shipped yet),
+  and `failed` (render error — unknown field or forbidden field). Forbidden field
+  references (`{{trigger.payload}}`, `{{trigger.authority.allowed_source_actions}}`,
+  any `_meta.*`) fail render with `redaction_status: "forbidden_field"`; unknown fields
+  fail with `redaction_status: "render_error"`; rendered bodies exceeding 4 KiB are
+  truncated on a UTF-8 char boundary with `redaction_status: "truncated"`. All failure
+  paths leave the parent transcript unchanged. Two new `HarnessEvent` variants
+  (`TriggerPromoted` / `PromotionPending`) carry preview-safe fields for live banner
+  rendering; causality `TriggerCompleted | TriggerFailed` → `TriggerPromoted |
+  PromotionPending` is preserved. `promote_requires_approval = true` v1 fail-closed
+  behavior is documented as a deliberate security choice: changing
+  "previously auto-merged, now requires approval" later is much worse than starting from
+  pending-only and adding the approval CLI surface in sub-PR 6. 5 new integration tests
+  cover all 5 promotion-related acceptance criteria from the issue #20 amendment (#8
+  no-promote stability, #9 success path inserts audited entry, #10 unknown var
+  fail-closed, #11 forbidden field fail-closed, #12 summary truncation marker, #13
+  approval required fail-closed-to-pending).
 
 ### Fixed
 

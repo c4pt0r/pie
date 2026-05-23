@@ -129,6 +129,35 @@ pub enum HarnessEvent {
     /// material. The parent `trigger_result` audit entry has been written with
     /// `success: false`.
     TriggerFailed { trace_id: String, reason: String },
+    /// A trigger's `PromoteAction` rendered successfully and a parent-session entry was
+    /// inserted to surface the sub-agent result to the user / LLM. `inserted_entry_id` is
+    /// the id of the appended `Message::User` (pie_ai has no System role today; we use
+    /// User with a `[Trigger ...]` body prefix so the LLM disambiguates trigger-driven
+    /// context from human input). The `trigger_promotion` Custom audit records the same
+    /// id for cross-reference.
+    ///
+    /// Causality (RFC 1 §5.F): `TriggerCompleted | TriggerFailed` → `TriggerPromoted` for
+    /// the same `trace_id` when promotion is configured AND not held for approval.
+    TriggerPromoted {
+        trace_id: String,
+        promote_kind: String,
+        inserted_entry_id: String,
+        template_name: Option<String>,
+        redaction_status: String,
+    },
+    /// A trigger's `PromoteAction` was held pending approval (`promote_requires_approval =
+    /// true`) and is awaiting an explicit `/triggers approve <trace_id>` (which lands in
+    /// sub-PR 6). The parent transcript has NOT been modified; a `trigger_promotion`
+    /// audit entry with `state: "pending"` has been written. `preview` is the rendered
+    /// template body the approval UI would surface, or `None` when the render itself
+    /// would have failed (in which case the audit reflects `redaction_status: "render_error"`
+    /// and `state: "failed"`).
+    PromotionPending {
+        trace_id: String,
+        promote_kind: String,
+        template_name: Option<String>,
+        preview: Option<String>,
+    },
 }
 
 /// Listener for [`HarnessEvent`]. Shape mirrors `crate::agent::AgentListener` so the same Fn
@@ -1453,7 +1482,10 @@ async fn run_trigger_action(
             &listeners,
             HarnessEvent::TriggerCompleted {
                 trace_id: trace_id.clone(),
-                summary,
+                // Resolution after 5a merge: HEAD (main) has cost_usd: Option<f64> = None
+                // per CLI-TUI review (3845107). 5b needs summary.clone() because the
+                // promotion step below consumes `summary` by reference. Combine both.
+                summary: summary.clone(),
                 cost_usd: None,
             },
         );
@@ -1462,13 +1494,398 @@ async fn run_trigger_action(
             &listeners,
             HarnessEvent::TriggerFailed {
                 trace_id: trace_id.clone(),
-                reason: failure_reason.unwrap_or_else(|| "unknown failure".to_string()),
+                reason: failure_reason
+                    .clone()
+                    .unwrap_or_else(|| "unknown failure".to_string()),
             },
         );
     }
 
+    // 7b. Promotion. RFC 1 §5.C: `PromoteAction` decides whether (and how) the
+    // `trigger_result` is mirrored back into the parent transcript / LLM context. Runs
+    // AFTER the terminal `TriggerCompleted | TriggerFailed` so the event order pinned in
+    // RFC 1 §5.F holds. Promotion outcomes are themselves emitted + audited as
+    // `TriggerPromoted | PromotionPending` + `Custom { custom_type: "trigger_promotion" }`.
+    apply_promotion(
+        &listeners,
+        &parent_session,
+        &trace_id,
+        &trigger,
+        success,
+        &summary,
+        message_count,
+        failure_reason.as_deref(),
+        &action.promote,
+        action.promote_requires_approval,
+    )
+    .await;
+
     // 8. Remove from registry.
     running_registry.lock().remove(&trace_id);
+}
+
+/// Inputs allowlisted for the promotion template per RFC 1 §5.C. Constructed once per
+/// promotion and exposed to the renderer as a sealed map; references to anything not in
+/// this set fail the render (fail-closed).
+fn build_template_context(
+    trace_id: &str,
+    trigger: &Trigger,
+    success: bool,
+    summary: &Option<String>,
+    message_count: usize,
+) -> std::collections::HashMap<String, String> {
+    use std::collections::HashMap;
+    let mut ctx: HashMap<String, String> = HashMap::new();
+    ctx.insert("trace_id".into(), trace_id.to_string());
+    let (source_kind_str, source_server, source_method, source_topic, source_subkind) =
+        match &trigger.source {
+            super::trigger::TriggerSource::Mcp {
+                server_name,
+                method,
+            } => (
+                "mcp".to_string(),
+                Some(server_name.clone()),
+                Some(method.clone()),
+                None,
+                None,
+            ),
+            super::trigger::TriggerSource::Hub { topic } => {
+                ("hub".to_string(), None, None, Some(topic.clone()), None)
+            }
+            super::trigger::TriggerSource::Local { subkind } => {
+                ("local".to_string(), None, None, None, Some(subkind.clone()))
+            }
+            super::trigger::TriggerSource::AgentDelegate { .. } => {
+                ("agent_delegate".to_string(), None, None, None, None)
+            }
+        };
+    ctx.insert("trigger.source.kind".into(), source_kind_str);
+    if let Some(v) = source_server {
+        ctx.insert("trigger.source.server_name".into(), v);
+    }
+    if let Some(v) = source_method {
+        ctx.insert("trigger.source.method".into(), v);
+    }
+    if let Some(v) = source_topic {
+        ctx.insert("trigger.source.topic".into(), v);
+    }
+    if let Some(v) = source_subkind {
+        ctx.insert("trigger.source.subkind".into(), v);
+    }
+    ctx.insert("trigger.source_label".into(), trigger.source_label.clone());
+    ctx.insert("trigger.event_label".into(), trigger.event_label.clone());
+    if let Some(s) = &trigger.payload_summary {
+        ctx.insert("trigger.payload_summary".into(), s.clone());
+    } else {
+        ctx.insert("trigger.payload_summary".into(), String::new());
+    }
+    ctx.insert(
+        "trigger.received_at".into(),
+        trigger.received_at.to_rfc3339(),
+    );
+    ctx.insert(
+        "trigger.idempotency_key".into(),
+        trigger.idempotency_key.clone(),
+    );
+    ctx.insert(
+        "trigger.authority.principal_id".into(),
+        trigger.authority.principal_id.clone(),
+    );
+    ctx.insert(
+        "trigger.authority.principal_label".into(),
+        trigger.authority.principal_label.clone(),
+    );
+    ctx.insert(
+        "trigger.authority.credential_scope".into(),
+        format!("{:?}", trigger.authority.credential_scope),
+    );
+    ctx.insert("result.summary".into(), summary.clone().unwrap_or_default());
+    ctx.insert(
+        "result.status".into(),
+        if success { "success" } else { "failed" }.into(),
+    );
+    ctx.insert("result.message_count".into(), message_count.to_string());
+    ctx.insert("result.cost_usd".into(), "null".into());
+    ctx.insert("result.branch_id".into(), "null".into());
+    ctx
+}
+
+/// Forbidden field references — referencing any of these via `{{name}}` in a promotion
+/// template fails the render at validation time (independent of whether the field happens
+/// to exist in the allowlist). RFC 1 §5.C: explicitly redacted boundary.
+const FORBIDDEN_TEMPLATE_FIELDS: &[&str] = &[
+    "trigger.payload",
+    "trigger.authority.allowed_source_actions",
+];
+
+#[derive(Debug, PartialEq, Eq)]
+enum TemplateRenderError {
+    UnknownField(String),
+    ForbiddenField(String),
+}
+
+/// Render a promotion template against the allowlisted context. Returns
+/// `Err(TemplateRenderError::UnknownField | ForbiddenField)` on any unknown or forbidden
+/// `{{...}}` reference (fail-closed; the caller must NOT insert anything on Err).
+///
+/// Whitespace inside `{{...}}` is tolerated (`{{ trace_id }}` works). `_meta.*` references
+/// are treated as unknown (the only metadata channel adapters have today flows through
+/// `trigger.payload_summary` per PR #56's privacy contract; bypassing that is forbidden).
+fn render_promotion_template(
+    body: &str,
+    ctx: &std::collections::HashMap<String, String>,
+) -> Result<String, TemplateRenderError> {
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    while let Some(open) = rest.find("{{") {
+        out.push_str(&rest[..open]);
+        let after_open = &rest[open + 2..];
+        let close = after_open.find("}}").ok_or_else(|| {
+            TemplateRenderError::UnknownField("unclosed `{{` placeholder".to_string())
+        })?;
+        let raw_name = &after_open[..close];
+        let name = raw_name.trim();
+        if FORBIDDEN_TEMPLATE_FIELDS.contains(&name) || name.starts_with("_meta") {
+            return Err(TemplateRenderError::ForbiddenField(name.to_string()));
+        }
+        let value = ctx
+            .get(name)
+            .ok_or_else(|| TemplateRenderError::UnknownField(name.to_string()))?;
+        out.push_str(value);
+        rest = &after_open[close + 2..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// Built-in fallback template used when `PromoteSummaryNow { template: None }`.
+const DEFAULT_PROMOTE_SUMMARY_TEMPLATE: &str = "[Trigger {{trace_id}}] {{trigger.source_label}} fired {{trigger.event_label}}.\nResult: {{result.summary}}";
+
+/// Same byte cap used for `result.summary` truncation; applied to the rendered promotion
+/// body so a runaway template (e.g. summary already at cap + verbose template body) cannot
+/// inflate the parent transcript beyond the 4 KiB boundary per RFC 1 §5.B.
+const PROMOTION_BODY_CAP_BYTES: usize = 4096;
+
+/// Truncate a promotion body to the byte cap on a UTF-8 char boundary. Returns the new
+/// string and `truncated: bool`. Walk-back ensures `truncate` never panics on a
+/// multi-byte char.
+fn truncate_on_char_boundary(body: String, cap_bytes: usize) -> (String, bool) {
+    if body.len() <= cap_bytes {
+        return (body, false);
+    }
+    let mut cut = cap_bytes;
+    while cut > 0 && !body.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut truncated = body;
+    truncated.truncate(cut);
+    truncated.push_str("…[truncated]");
+    (truncated, true)
+}
+
+/// Apply the trigger's [`PromoteAction`] after the sub-agent has finished and the
+/// `trigger_result` audit was written. RFC 1 §5.C — implements the v1 promotion variants
+/// `None` (no-op) and `PromoteSummaryNow { template }` (templated insertion into the
+/// parent session; fail-closed on render error; pending state when
+/// `promote_requires_approval = true`).
+#[allow(clippy::too_many_arguments)]
+async fn apply_promotion(
+    listeners: &Arc<Mutex<Vec<HarnessListener>>>,
+    parent_session: &Session,
+    trace_id: &str,
+    trigger: &Trigger,
+    success: bool,
+    summary: &Option<String>,
+    message_count: usize,
+    _failure_reason: Option<&str>,
+    promote: &PromoteAction,
+    require_approval: bool,
+) {
+    // template_body is the un-truncated rendered output; we cap it before insertion.
+    let (template_name, template_body) = match promote {
+        PromoteAction::None => return, // most common path; nothing else to do
+        PromoteAction::PromoteSummaryNow { template } => (template.clone(), template.clone()),
+    };
+    let promote_kind = "promote_summary_now";
+
+    // Build the sealed allowlisted template context once. Anything not in here is unknown
+    // to the renderer; anything explicitly forbidden fails before substitution.
+    let ctx = build_template_context(trace_id, trigger, success, summary, message_count);
+
+    // Resolve the template body: explicit string if provided, otherwise the built-in
+    // default. Both flow through the same renderer (per Provider/Auth: no
+    // fixed-summary insertion path that bypasses sanitization).
+    let body_template: &str = template_body
+        .as_deref()
+        .unwrap_or(DEFAULT_PROMOTE_SUMMARY_TEMPLATE);
+
+    let rendered = match render_promotion_template(body_template, &ctx) {
+        Ok(s) => s,
+        Err(err) => {
+            // Render failure → fail-closed. Write a `trigger_promotion { state: "failed" }`
+            // audit so jsonl-only readers can see what happened, and emit a
+            // `PersistenceError` reflux so live subscribers know promotion was lost.
+            let redaction_status = match &err {
+                TemplateRenderError::UnknownField(_) => "render_error",
+                TemplateRenderError::ForbiddenField(_) => "forbidden_field",
+            };
+            let err_msg = match &err {
+                TemplateRenderError::UnknownField(name) => {
+                    format!("unknown template field: {name}")
+                }
+                TemplateRenderError::ForbiddenField(name) => {
+                    format!("forbidden template field: {name}")
+                }
+            };
+            let audit_data = serde_json::json!({
+                "state": "failed",
+                "trace_id": trace_id,
+                "promote_kind": promote_kind,
+                "template_name": template_name,
+                "template_hash": serde_json::Value::Null,
+                "inserted_entry_id": serde_json::Value::Null,
+                "rule_id": serde_json::Value::Null,
+                "redaction_status": redaction_status,
+                "dedup_collapsed": false,
+            });
+            if let Err(e) = parent_session
+                .append_custom("trigger_promotion", Some(audit_data))
+                .await
+            {
+                emit_from_listeners(
+                    listeners,
+                    HarnessEvent::PersistenceError {
+                        context: "trigger_promotion".into(),
+                        message: format!("trigger_promotion (failed) append failed: {:?}", e.code),
+                    },
+                );
+            }
+            emit_from_listeners(
+                listeners,
+                HarnessEvent::PersistenceError {
+                    context: "trigger_promotion".into(),
+                    message: err_msg,
+                },
+            );
+            return;
+        }
+    };
+
+    // Pending path: render succeeded so we have a preview, but `promote_requires_approval`
+    // is true and there is no `/triggers approve` command in v1 — fail-closed-to-pending.
+    if require_approval {
+        let (preview, truncated) =
+            truncate_on_char_boundary(rendered.clone(), PROMOTION_BODY_CAP_BYTES);
+        let redaction_status = if truncated { "truncated" } else { "clean" };
+        let audit_data = serde_json::json!({
+            "state": "pending",
+            "trace_id": trace_id,
+            "promote_kind": promote_kind,
+            "template_name": template_name,
+            "template_hash": serde_json::Value::Null,
+            "inserted_entry_id": serde_json::Value::Null,
+            "rule_id": serde_json::Value::Null,
+            "redaction_status": redaction_status,
+            "dedup_collapsed": false,
+        });
+        if let Err(e) = parent_session
+            .append_custom("trigger_promotion", Some(audit_data))
+            .await
+        {
+            emit_from_listeners(
+                listeners,
+                HarnessEvent::PersistenceError {
+                    context: "trigger_promotion".into(),
+                    message: format!("trigger_promotion (pending) append failed: {:?}", e.code),
+                },
+            );
+        }
+        emit_from_listeners(
+            listeners,
+            HarnessEvent::PromotionPending {
+                trace_id: trace_id.to_string(),
+                promote_kind: promote_kind.into(),
+                template_name,
+                preview: Some(preview),
+            },
+        );
+        return;
+    }
+
+    // Success path: render OK, no approval gate → insert into parent transcript.
+    // pie_ai has no `Message::System` role; use `Message::User` with the rendered body
+    // (which always begins with the `[Trigger ...]` prefix in the default template, and
+    // hook-supplied templates are responsible for similar disambiguation).
+    let (final_body, truncated) = truncate_on_char_boundary(rendered, PROMOTION_BODY_CAP_BYTES);
+    let redaction_status = if truncated { "truncated" } else { "clean" };
+
+    let user_message = AgentMessage::Llm(PiMessage::User(pie_ai::UserMessage {
+        role: pie_ai::UserRole::User,
+        content: pie_ai::UserContent::Text(final_body),
+        timestamp: chrono::Utc::now().timestamp_millis(),
+    }));
+    let inserted_entry_id = match parent_session.append_message(user_message).await {
+        Ok(id) => id,
+        Err(e) => {
+            emit_from_listeners(
+                listeners,
+                HarnessEvent::PersistenceError {
+                    context: "trigger_promotion".into(),
+                    message: format!("promotion message append failed: {:?}", e.code),
+                },
+            );
+            // Audit the failure so jsonl-only readers know promotion attempted but was lost.
+            let audit_data = serde_json::json!({
+                "state": "failed",
+                "trace_id": trace_id,
+                "promote_kind": promote_kind,
+                "template_name": template_name,
+                "template_hash": serde_json::Value::Null,
+                "inserted_entry_id": serde_json::Value::Null,
+                "rule_id": serde_json::Value::Null,
+                "redaction_status": "render_error",
+                "dedup_collapsed": false,
+            });
+            let _ = parent_session
+                .append_custom("trigger_promotion", Some(audit_data))
+                .await;
+            return;
+        }
+    };
+
+    let audit_data = serde_json::json!({
+        "state": "success",
+        "trace_id": trace_id,
+        "promote_kind": promote_kind,
+        "template_name": template_name,
+        "template_hash": serde_json::Value::Null,
+        "inserted_entry_id": inserted_entry_id,
+        "rule_id": serde_json::Value::Null,
+        "redaction_status": redaction_status,
+        "dedup_collapsed": false,
+    });
+    if let Err(e) = parent_session
+        .append_custom("trigger_promotion", Some(audit_data))
+        .await
+    {
+        emit_from_listeners(
+            listeners,
+            HarnessEvent::PersistenceError {
+                context: "trigger_promotion".into(),
+                message: format!("trigger_promotion (success) append failed: {:?}", e.code),
+            },
+        );
+    }
+    emit_from_listeners(
+        listeners,
+        HarnessEvent::TriggerPromoted {
+            trace_id: trace_id.to_string(),
+            promote_kind: promote_kind.into(),
+            inserted_entry_id,
+            template_name,
+            redaction_status: redaction_status.into(),
+        },
+    );
 }
 
 /// Inspect the sub-agent's terminal state to summarize the outcome. Returns
