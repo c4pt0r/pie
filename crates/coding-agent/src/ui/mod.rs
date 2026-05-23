@@ -64,7 +64,8 @@ use pie_ai::{ContentBlock, ImageContent, Message, UserContent, UserContentBlock}
 /// In-flight model turn, polled in the event loop's `select!`. Running it as a local future
 /// (not `tokio::spawn`) sidesteps the `Send` bound — `AgentSession::prompt` briefly holds a
 /// `parking_lot` guard across an `.await`, so its future is `!Send`.
-type TurnFut = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AgentRunError>>>>;
+type TurnFut =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<String>, AgentRunError>>>>;
 
 #[derive(Default)]
 struct TurnState {
@@ -74,7 +75,7 @@ struct TurnState {
     prefix: &'static str,
 }
 
-async fn poll_turn(fut: &mut Option<TurnFut>) -> Result<(), AgentRunError> {
+async fn poll_turn(fut: &mut Option<TurnFut>) -> Result<Option<String>, AgentRunError> {
     // Only created by `select!` when `fut.is_some()`, so the unwrap is sound.
     fut.as_mut().expect("turn future present").await
 }
@@ -331,14 +332,18 @@ impl App {
     }
 
     /// Wrap up a finished turn: clear the busy state and surface an aborted/error line.
-    fn finish_turn(&mut self, turn: &mut TurnState, result: Result<(), AgentRunError>) {
+    fn finish_turn(&mut self, turn: &mut TurnState, result: Result<Option<String>, AgentRunError>) {
         turn.fut = None;
         self.busy = false;
         self.spinner_frame = 0;
         if turn.aborted {
             self.system_line("[aborted]");
-        } else if let Err(e) = result {
-            self.error_line(format!("{}{e}", turn.prefix));
+        } else {
+            match result {
+                Ok(Some(message)) => self.system_line(message),
+                Ok(None) => {}
+                Err(e) => self.error_line(format!("{}{e}", turn.prefix)),
+            }
         }
         turn.aborted = false;
         turn.prefix = "";
@@ -477,9 +482,15 @@ impl App {
         let has_images = !loaded_images.is_empty();
         turn.fut = Some(Box::pin(async move {
             if has_images {
-                harness.prompt_with_images(prompt_text, loaded_images).await
+                harness
+                    .prompt_with_images(prompt_text, loaded_images)
+                    .await
+                    .map(|_| None)
             } else {
-                AgentSession::new(harness, retry).prompt(prompt_text).await
+                AgentSession::new(harness, retry)
+                    .prompt(prompt_text)
+                    .await
+                    .map(|_| None)
             }
         }));
         turn.aborted = false;
@@ -498,7 +509,9 @@ impl App {
         self.system_line(format!("running triggered turn (trace {short})"));
         self.follow = true;
         let harness = self.harness.clone();
-        turn.fut = Some(Box::pin(async move { harness.continue_().await }));
+        turn.fut = Some(Box::pin(
+            async move { harness.continue_().await.map(|_| None) },
+        ));
         turn.aborted = false;
         turn.prefix = "triggered turn: ";
         self.busy = true;
@@ -539,10 +552,28 @@ impl App {
             CommandOutcome::RunPromptTemplate { name, vars } => {
                 let harness = self.harness.clone();
                 turn.fut = Some(Box::pin(async move {
-                    harness.prompt_from_template(&name, vars).await
+                    harness
+                        .prompt_from_template(&name, vars)
+                        .await
+                        .map(|_| None)
                 }));
                 turn.aborted = false;
                 turn.prefix = "template run failed: ";
+                self.busy = true;
+            }
+            CommandOutcome::RunCompaction { custom } => {
+                let harness = self.harness.clone();
+                turn.fut = Some(Box::pin(async move {
+                    harness.force_compact(custom).await.map(|ran| {
+                        Some(if ran {
+                            "compaction ran".to_string()
+                        } else {
+                            "nothing to compact".to_string()
+                        })
+                    })
+                }));
+                turn.aborted = false;
+                turn.prefix = "compaction failed: ";
                 self.busy = true;
             }
             CommandOutcome::LoginSecret { provider } => {
@@ -559,7 +590,9 @@ impl App {
         turn: &mut TurnState,
     ) {
         let harness = self.harness.clone();
-        turn.fut = Some(Box::pin(async move { harness.prompt(prompt).await }));
+        turn.fut = Some(Box::pin(async move {
+            harness.prompt(prompt).await.map(|_| None)
+        }));
         turn.aborted = false;
         turn.prefix = error_context;
         self.busy = true;
@@ -886,6 +919,13 @@ impl App {
                     CommandOutcome::RunPromptTemplate { name, vars } => {
                         if let Err(e) = self.harness.prompt_from_template(&name, vars).await {
                             eprintln!("error: template run failed: {e}");
+                        }
+                    }
+                    CommandOutcome::RunCompaction { custom } => {
+                        match self.harness.force_compact(custom).await {
+                            Ok(true) => println!("compaction ran"),
+                            Ok(false) => println!("nothing to compact"),
+                            Err(e) => eprintln!("error: compaction failed: {e}"),
                         }
                     }
                     _ => {}

@@ -277,6 +277,35 @@ async fn dispatch_template_returns_repl_owned_agent_work() {
     );
 }
 
+#[tokio::test]
+async fn dispatch_compact_returns_repl_owned_agent_work() {
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage as Arc<dyn SessionStorage>);
+    let opts = AgentHarnessOptions::new(faux_model(), session.clone());
+    let harness = Arc::new(AgentHarness::new(opts));
+
+    let registry = commands::Registry::with_builtins();
+    let cwd = std::env::current_dir().unwrap();
+    let ctx = commands::CommandCtx {
+        harness: &harness,
+        session_id: "test",
+        log_path: None,
+        tool_count: 0,
+        cwd: &cwd,
+    };
+    let outcome = commands::dispatch("/compact keep decisions", &registry, &ctx).await;
+    match outcome {
+        commands::CommandOutcome::RunCompaction { custom } => {
+            assert_eq!(custom.as_deref(), Some("keep decisions"));
+        }
+        other => panic!("expected RunCompaction outcome, got {other:?}"),
+    }
+    assert!(
+        session.entries().await.unwrap().is_empty(),
+        "/compact dispatch should not run compaction directly; the TUI owns Ctrl-C abort handling"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn dispatch_new_trigger_registers_dynamic_rule() {
     let _guard = DYNAMIC_TRIGGER_LOCK.lock().unwrap();

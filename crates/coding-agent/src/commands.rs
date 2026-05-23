@@ -78,6 +78,9 @@ pub enum CommandOutcome {
         name: String,
         vars: serde_json::Map<String, serde_json::Value>,
     },
+    /// Ask the REPL to run compaction through the active-turn path so Ctrl-C/Esc can abort
+    /// the model summarization request.
+    RunCompaction { custom: Option<String> },
     /// Prompt for a provider credential without echoing the secret in the terminal input line.
     LoginSecret { provider: String },
 }
@@ -650,23 +653,13 @@ impl SlashCommand for CompactCommand {
     fn usage(&self) -> &'static str {
         "[\"custom instructions\"]"
     }
-    async fn run(&self, argv: &[String], ctx: &CommandCtx<'_>) -> CommandOutcome {
+    async fn run(&self, argv: &[String], _ctx: &CommandCtx<'_>) -> CommandOutcome {
         let custom = if argv.is_empty() {
             None
         } else {
             Some(argv.join(" "))
         };
-        match ctx.harness.force_compact(custom).await {
-            Ok(true) => {
-                cprintln!("compaction ran");
-                CommandOutcome::Handled
-            }
-            Ok(false) => {
-                cprintln!("nothing to compact");
-                CommandOutcome::Handled
-            }
-            Err(e) => CommandOutcome::Error(format!("compaction failed: {e}")),
-        }
+        CommandOutcome::RunCompaction { custom }
     }
 }
 
