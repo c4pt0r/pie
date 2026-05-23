@@ -295,16 +295,21 @@ impl TriggerAction {
     }
 }
 
-/// How a completed sub-agent's `trigger_result` should affect the parent session. Lands as a
-/// no-op variant in sub-PR 5a; sub-PR 5b will honor `PromoteSummaryNow` (and follow-ups will
-/// add `InjectNextTurn` per the issue #20 amendment).
+/// How a completed sub-agent's `trigger_result` should affect the parent session. v1 ships
+/// `None` (no-op) and `PromoteSummaryNow` (templated insertion); `InjectNextTurn` per the
+/// issue #20 amendment is deferred to sub-PR 6 / RFC 4 work.
 #[derive(Clone, Debug, Default)]
 pub enum PromoteAction {
     #[default]
     None,
     PromoteSummaryNow {
-        /// Named [`PromptTemplate`]; `None` uses the runtime's built-in safe default.
-        template: Option<String>,
+        /// **Inline template body** to render against the allowlisted context. `None` uses
+        /// the runtime's built-in safe default. The audit + event `template_name` field is
+        /// always `None` in v1 (named-template lookup via `PromptTemplateRegistry` lands
+        /// in sub-PR 6 / RFC 4 rule engine work); the body is what gets rendered but is
+        /// never persisted as `template_name` because the audit contract reserves
+        /// `template_name` for a registry-style identity, not the body content.
+        template_body: Option<String>,
     },
 }
 
@@ -1669,6 +1674,39 @@ const PROMOTION_BODY_CAP_BYTES: usize = 4096;
 /// Truncate a promotion body to the byte cap on a UTF-8 char boundary. Returns the new
 /// string and `truncated: bool`. Walk-back ensures `truncate` never panics on a
 /// multi-byte char.
+/// Stable hex-encoded SHA-256 of the template body. Used only as a content fingerprint in
+/// the `trigger_promotion` audit so RFC 4 rule edits / template version bumps are
+/// detectable from JSONL log re-reads. Not used as a credential / authentication
+/// primitive — see `sha2` dep comment in `Cargo.toml`.
+fn sha256_hex(input: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    let out = hasher.finalize();
+    // Lowercase hex; the first 8 chars are sliced off by callers for the `inline:` name.
+    let mut s = String::with_capacity(out.len() * 2);
+    for byte in out.iter() {
+        use std::fmt::Write;
+        let _ = write!(&mut s, "{byte:02x}");
+    }
+    s
+}
+
+/// Enforce the `[Trigger {trace_id}] ` disambiguation prefix on a promotion body. Per
+/// @Tools-MCP-Lead's PR #65 review: trusting template authors to include the prefix is
+/// unsafe — a custom template that forgets it would produce a `Message::User` in the
+/// parent transcript that looks like human input, polluting the next-turn LLM context
+/// without user awareness. Idempotent (skip when the rendered body already begins with
+/// `[Trigger `, e.g. the built-in default template). Returns `(prefixed_body, injected)`.
+fn ensure_trigger_prefix(body: String, trace_id: &str) -> (String, bool) {
+    if body.starts_with("[Trigger ") {
+        (body, false)
+    } else {
+        let prefixed = format!("[Trigger {trace_id}] {body}");
+        (prefixed, true)
+    }
+}
+
 fn truncate_on_char_boundary(body: String, cap_bytes: usize) -> (String, bool) {
     if body.len() <= cap_bytes {
         return (body, false);
@@ -1701,10 +1739,12 @@ async fn apply_promotion(
     promote: &PromoteAction,
     require_approval: bool,
 ) {
-    // template_body is the un-truncated rendered output; we cap it before insertion.
-    let (template_name, template_body) = match promote {
+    // Extract the inline template body (if any). v1 does not look up named templates from
+    // any registry; that lands in sub-PR 6 / RFC 4 rule engine work. The body is what we
+    // render against — never persisted as `template_name` in the audit.
+    let template_body_arg: Option<String> = match promote {
         PromoteAction::None => return, // most common path; nothing else to do
-        PromoteAction::PromoteSummaryNow { template } => (template.clone(), template.clone()),
+        PromoteAction::PromoteSummaryNow { template_body } => template_body.clone(),
     };
     let promote_kind = "promote_summary_now";
 
@@ -1712,12 +1752,26 @@ async fn apply_promotion(
     // to the renderer; anything explicitly forbidden fails before substitution.
     let ctx = build_template_context(trace_id, trigger, success, summary, message_count);
 
-    // Resolve the template body: explicit string if provided, otherwise the built-in
-    // default. Both flow through the same renderer (per Provider/Auth: no
-    // fixed-summary insertion path that bypasses sanitization).
-    let body_template: &str = template_body
+    // Resolve the body to render: explicit if provided, otherwise the built-in default.
+    // Both flow through the same renderer (per Provider/Auth: no fixed-summary insertion
+    // path that bypasses sanitization).
+    let body_template: &str = template_body_arg
         .as_deref()
         .unwrap_or(DEFAULT_PROMOTE_SUMMARY_TEMPLATE);
+
+    // `template_name` / `template_hash` for audit + events: stable identifier + content
+    // fingerprint per @Tools-MCP-Lead's PR #65 follow-up. v1 categories:
+    // - `"default"` when no inline body was provided
+    // - `"inline:{hash[..8]}"` when the hook supplied a literal body
+    // - (future) `"rules.{rule_id}.template"` when RFC 4 rule engine names a template
+    // Provider/Auth blocker: the raw body is NEVER stored as `template_name`.
+    let template_hash = sha256_hex(body_template);
+    let template_name = match &template_body_arg {
+        None => "default".to_string(),
+        Some(_) => format!("inline:{}", &template_hash[..8]),
+    };
+    let template_name = Some(template_name);
+    let template_hash = Some(template_hash);
 
     let rendered = match render_promotion_template(body_template, &ctx) {
         Ok(s) => s,
@@ -1742,11 +1796,14 @@ async fn apply_promotion(
                 "trace_id": trace_id,
                 "promote_kind": promote_kind,
                 "template_name": template_name,
-                "template_hash": serde_json::Value::Null,
+                "template_hash": template_hash,
                 "inserted_entry_id": serde_json::Value::Null,
                 "rule_id": serde_json::Value::Null,
                 "redaction_status": redaction_status,
                 "dedup_collapsed": false,
+                // Render failed before the prefix step ran; record false so the audit shape
+                // stays uniform across all promotion states.
+                "prefix_injected": false,
             });
             if let Err(e) = parent_session
                 .append_custom("trigger_promotion", Some(audit_data))
@@ -1771,6 +1828,15 @@ async fn apply_promotion(
         }
     };
 
+    // Per @Tools-MCP-Lead's PR #65 review: enforce the `[Trigger {trace_id}] ` prefix at
+    // the engine level instead of trusting the template author to include it. A custom
+    // template that forgets the prefix would otherwise produce a parent-session
+    // `Message::User` that looks indistinguishable from human input, polluting the
+    // next-turn LLM context without user awareness. Idempotent: if the rendered body
+    // already starts with `[Trigger ` (e.g. the built-in default template), the prefix
+    // is not added twice.
+    let (rendered, prefix_injected) = ensure_trigger_prefix(rendered, trace_id);
+
     // Pending path: render succeeded so we have a preview, but `promote_requires_approval`
     // is true and there is no `/triggers approve` command in v1 — fail-closed-to-pending.
     if require_approval {
@@ -1782,11 +1848,12 @@ async fn apply_promotion(
             "trace_id": trace_id,
             "promote_kind": promote_kind,
             "template_name": template_name,
-            "template_hash": serde_json::Value::Null,
+            "template_hash": template_hash,
             "inserted_entry_id": serde_json::Value::Null,
             "rule_id": serde_json::Value::Null,
             "redaction_status": redaction_status,
             "dedup_collapsed": false,
+            "prefix_injected": prefix_injected,
         });
         if let Err(e) = parent_session
             .append_custom("trigger_promotion", Some(audit_data))
@@ -1813,9 +1880,10 @@ async fn apply_promotion(
     }
 
     // Success path: render OK, no approval gate → insert into parent transcript.
-    // pie_ai has no `Message::System` role; use `Message::User` with the rendered body
-    // (which always begins with the `[Trigger ...]` prefix in the default template, and
-    // hook-supplied templates are responsible for similar disambiguation).
+    // pie_ai has no `Message::System` role; use `Message::User` with the rendered body.
+    // The engine-injected `[Trigger {trace_id}] ` prefix (above) guarantees the appended
+    // entry is visually disambiguated from human input regardless of which template was
+    // used.
     let (final_body, truncated) = truncate_on_char_boundary(rendered, PROMOTION_BODY_CAP_BYTES);
     let redaction_status = if truncated { "truncated" } else { "clean" };
 
@@ -1840,11 +1908,12 @@ async fn apply_promotion(
                 "trace_id": trace_id,
                 "promote_kind": promote_kind,
                 "template_name": template_name,
-                "template_hash": serde_json::Value::Null,
+                "template_hash": template_hash,
                 "inserted_entry_id": serde_json::Value::Null,
                 "rule_id": serde_json::Value::Null,
                 "redaction_status": "render_error",
                 "dedup_collapsed": false,
+                "prefix_injected": prefix_injected,
             });
             let _ = parent_session
                 .append_custom("trigger_promotion", Some(audit_data))
@@ -1858,11 +1927,12 @@ async fn apply_promotion(
         "trace_id": trace_id,
         "promote_kind": promote_kind,
         "template_name": template_name,
-        "template_hash": serde_json::Value::Null,
+        "template_hash": template_hash,
         "inserted_entry_id": inserted_entry_id,
         "rule_id": serde_json::Value::Null,
         "redaction_status": redaction_status,
         "dedup_collapsed": false,
+        "prefix_injected": prefix_injected,
     });
     if let Err(e) = parent_session
         .append_custom("trigger_promotion", Some(audit_data))

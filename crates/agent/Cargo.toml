@@ -43,6 +43,11 @@ once_cell = "1"
 tracing = "0.1"
 ignore = "0.4"
 regex = "1"
+# Stable content hash for trigger_promotion audit. Used only to fingerprint promotion
+# template bodies for cross-process replay verification — never used as a credential
+# / authentication primitive. SHA-256 is overkill cryptographically for this purpose
+# but avoids the "two hashers disagree" footgun of non-deterministic stdlib hashers.
+sha2 = "0.10"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

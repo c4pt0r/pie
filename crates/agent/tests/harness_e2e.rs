@@ -2502,7 +2502,9 @@ fn promoting_action_hook(
                         "{} fired: {}",
                         ctx.trigger.source_label, ctx.trigger.event_label
                     ),
-                    promote: PromoteAction::PromoteSummaryNow { template },
+                    promote: PromoteAction::PromoteSummaryNow {
+                        template_body: template,
+                    },
                     promote_requires_approval: require_approval,
                 }
             })
@@ -2616,9 +2618,12 @@ async fn promote_summary_now_inserts_audited_parent_entry() {
     .expect("TriggerPromoted must fire");
     let (inserted_entry_id, redaction_status, template_name) = promoted_event;
     assert_eq!(redaction_status, "clean");
-    assert!(
-        template_name.is_none(),
-        "default template was used → name None"
+    // Default built-in template gets stable identifier "default" (per @Tools-MCP-Lead's
+    // PR #65 review — the audit contract requires a stable name, not None for default).
+    assert_eq!(
+        template_name.as_deref(),
+        Some("default"),
+        "default built-in template must record stable identifier \"default\""
     );
 
     let entries = session.entries().await.unwrap();
@@ -2919,4 +2924,213 @@ async fn promote_summary_truncation_records_redaction_status() {
         })
         .expect("audit");
     assert_eq!(audit["redaction_status"].as_str(), Some("truncated"));
+}
+
+/// Provider-Auth review on PR #65: inline `PromoteSummaryNow { template_body }` MUST NOT
+/// be stored as `template_name` in the `trigger_promotion` audit / events. Audit identity
+/// shape: `"default"` for built-in, `"inline:{hash[..8]}"` for hook-supplied bodies, with
+/// the full SHA-256 in `template_hash` for verification.
+#[tokio::test]
+async fn promote_inline_template_body_is_not_persisted_as_template_name() {
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage.clone() as Arc<dyn SessionStorage>);
+    let mut opts = AgentHarnessOptions::new(faux_model(), session.clone());
+    opts.stream_fn = Some(faux_stream_fn("subagent text"));
+    let inline_body = "Custom RFC4-style prompt: {{trigger.source_label}} → {{result.summary}}";
+    opts.before_trigger_action = Some(promoting_action_hook(Some(inline_body.into()), false));
+    let harness = AgentHarness::new(opts);
+
+    let events = Arc::new(std::sync::Mutex::new(Vec::<HarnessEvent>::new()));
+    let sink = events.clone();
+    let _unsub = harness.subscribe_harness(Arc::new(move |ev| {
+        sink.lock().unwrap().push(ev);
+    }));
+
+    let _ = harness
+        .handle_trigger(sample_trigger("k-inline-name", "trace-inline-name"))
+        .await;
+    let promoted_template_name = wait_for_event(&events, 5, |evs| {
+        evs.iter().find_map(|e| match e {
+            HarnessEvent::TriggerPromoted {
+                trace_id,
+                template_name,
+                ..
+            } if trace_id == "trace-inline-name" => Some(template_name.clone()),
+            _ => None,
+        })
+    })
+    .await
+    .expect("TriggerPromoted must fire");
+
+    let name = promoted_template_name.expect("template_name must be Some");
+    assert!(
+        name.starts_with("inline:"),
+        "inline template MUST be identified via inline:hash prefix, got {name:?}"
+    );
+    assert_eq!(
+        name.len(),
+        "inline:".len() + 8,
+        "inline name is `inline:` + first 8 chars of sha256(body); got {name:?}"
+    );
+    assert!(
+        !name.contains(inline_body),
+        "template_name MUST NOT contain raw body: got {name:?}"
+    );
+
+    // Audit shows the same shape + a full template_hash for cross-process verification.
+    let entries = session.entries().await.unwrap();
+    let audit = entries
+        .iter()
+        .find_map(|e| match e {
+            SessionTreeEntry::Custom {
+                custom_type, data, ..
+            } if custom_type == "trigger_promotion" => data.clone(),
+            _ => None,
+        })
+        .expect("trigger_promotion audit");
+    assert_eq!(audit["template_name"].as_str(), Some(name.as_str()));
+    let template_hash = audit["template_hash"]
+        .as_str()
+        .expect("template_hash must be Some(hex string)");
+    assert_eq!(
+        template_hash.len(),
+        64,
+        "SHA-256 hex must be 64 chars; got {} chars",
+        template_hash.len()
+    );
+    assert!(
+        !audit.to_string().contains(inline_body),
+        "raw template body MUST NOT appear anywhere in the audit blob: {audit:?}"
+    );
+}
+
+/// @Tools-MCP-Lead PR #65 review: enforce `[Trigger {trace_id}] ` prefix in the engine,
+/// not in template-author discipline. A custom template without the prefix MUST still
+/// produce a parent-session entry that starts with the prefix + audit
+/// `prefix_injected: true`.
+#[tokio::test]
+async fn promote_summary_now_custom_template_without_prefix_still_gets_injected() {
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage.clone() as Arc<dyn SessionStorage>);
+    let mut opts = AgentHarnessOptions::new(faux_model(), session.clone());
+    opts.stream_fn = Some(faux_stream_fn("subagent text"));
+    // Custom template WITHOUT the `[Trigger ...]` prefix — engine must inject one.
+    opts.before_trigger_action = Some(promoting_action_hook(
+        Some("Bare update from {{trigger.source_label}}: {{result.summary}}".into()),
+        false,
+    ));
+    let harness = AgentHarness::new(opts);
+
+    let events = Arc::new(std::sync::Mutex::new(Vec::<HarnessEvent>::new()));
+    let sink = events.clone();
+    let _unsub = harness.subscribe_harness(Arc::new(move |ev| {
+        sink.lock().unwrap().push(ev);
+    }));
+
+    let _ = harness
+        .handle_trigger(sample_trigger("k-prefix-inj", "trace-prefix-inj"))
+        .await;
+    let inserted_entry_id = wait_for_event(&events, 5, |evs| {
+        evs.iter().find_map(|e| match e {
+            HarnessEvent::TriggerPromoted {
+                trace_id,
+                inserted_entry_id,
+                ..
+            } if trace_id == "trace-prefix-inj" => Some(inserted_entry_id.clone()),
+            _ => None,
+        })
+    })
+    .await
+    .expect("TriggerPromoted must fire");
+
+    let entries = session.entries().await.unwrap();
+    let msg = entries
+        .iter()
+        .find_map(|e| match e {
+            SessionTreeEntry::Message {
+                id,
+                message: AgentMessage::Llm(pie_ai::Message::User(u)),
+                ..
+            } if id == &inserted_entry_id => Some(u.clone()),
+            _ => None,
+        })
+        .expect("inserted user message");
+    let body = match &msg.content {
+        pie_ai::UserContent::Text(s) => s.clone(),
+        _ => panic!("expected text body"),
+    };
+    assert!(
+        body.starts_with("[Trigger trace-prefix-inj] "),
+        "engine MUST inject the trigger prefix on templates that don't include one; got: {body:?}"
+    );
+    assert!(
+        body.contains("Bare update from MCP github"),
+        "custom template body MUST still be rendered after the injected prefix; got: {body:?}"
+    );
+
+    // Audit reflects prefix_injected = true.
+    let audit = entries
+        .iter()
+        .find_map(|e| match e {
+            SessionTreeEntry::Custom {
+                custom_type, data, ..
+            } if custom_type == "trigger_promotion" => data.clone(),
+            _ => None,
+        })
+        .expect("trigger_promotion audit");
+    assert_eq!(audit["prefix_injected"].as_bool(), Some(true));
+
+    // Idempotency check: a template that ALREADY starts with [Trigger should NOT get
+    // double-prefixed (covered by the default-template test where audit prefix_injected
+    // ought to be false). Verified here implicitly: if the engine doubled the prefix,
+    // body would start with `[Trigger trace-prefix-inj] [Trigger ...]`.
+    assert!(
+        !body.starts_with("[Trigger trace-prefix-inj] [Trigger"),
+        "prefix injection MUST be idempotent (no double `[Trigger `); got: {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn promote_default_template_does_not_get_double_prefixed() {
+    // Idempotency: the default template already starts with `[Trigger {{trace_id}}]`, so
+    // the engine must NOT prepend a second prefix. Audit reflects prefix_injected = false.
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage.clone() as Arc<dyn SessionStorage>);
+    let mut opts = AgentHarnessOptions::new(faux_model(), session.clone());
+    opts.stream_fn = Some(faux_stream_fn("ok"));
+    opts.before_trigger_action = Some(promoting_action_hook(None, false));
+    let harness = AgentHarness::new(opts);
+
+    let _ = harness
+        .handle_trigger(sample_trigger("k-default-pfx", "trace-default-pfx"))
+        .await;
+    // Wait for completion.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let entries = session.entries().await.unwrap();
+    let audit = entries
+        .iter()
+        .find_map(|e| match e {
+            SessionTreeEntry::Custom {
+                custom_type, data, ..
+            } if custom_type == "trigger_promotion" => data.clone(),
+            _ => None,
+        })
+        .expect("trigger_promotion audit");
+    assert_eq!(audit["prefix_injected"].as_bool(), Some(false));
+    let user_msg_body = entries.iter().find_map(|e| match e {
+        SessionTreeEntry::Message {
+            message: AgentMessage::Llm(pie_ai::Message::User(u)),
+            ..
+        } => match &u.content {
+            pie_ai::UserContent::Text(s) => Some(s.clone()),
+            _ => None,
+        },
+        _ => None,
+    });
+    let body = user_msg_body.expect("inserted user message");
+    let prefix_occurrences = body.matches("[Trigger trace-default-pfx]").count();
+    assert_eq!(
+        prefix_occurrences, 1,
+        "default template MUST NOT be double-prefixed; got body={body:?}"
+    );
 }
