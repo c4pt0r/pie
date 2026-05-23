@@ -94,14 +94,39 @@ pub enum HarnessEvent {
     /// that observability (TUI banner, `/triggers`, JSONL logs) can mark the audit as
     /// best-effort lost rather than dropping it silently.
     PersistenceError {
-        /// Free-form context — currently always `"trigger_audit"`. New write sites that
-        /// surface through this event must pin themselves to a stable string.
+        /// Free-form context — pinned strings: `"trigger_audit"`, `"trigger_result"`. New
+        /// write sites that surface through this event must pin themselves to a stable
+        /// string.
         context: String,
         /// Short, secret-free message. The original `SessionError` is *not* exposed because
         /// some implementations include filesystem paths or storage backend details that
         /// belong in trace logs, not user-facing event surfaces.
         message: String,
     },
+    /// A sub-agent execution started for an accepted trigger. Emitted by the spawned task
+    /// just before the sub-agent's first turn runs. `prompt_preview` is the first ~80
+    /// characters of the resolved action prompt, preview-safe for banners.
+    ///
+    /// Causality (pinned by RFC 1 §5.F + tests): `TriggerHandled { state: Accepted }`
+    /// always precedes `TriggerExecutionStarted` for the same `trace_id`.
+    TriggerExecutionStarted {
+        trace_id: String,
+        prompt_preview: String,
+    },
+    /// A sub-agent execution finished successfully and the parent `trigger_result` audit
+    /// entry has been written. `summary` is the sub-agent's self-summary (size-capped at
+    /// 4 KiB); `cost_usd` is added to the parent harness's cost total.
+    TriggerCompleted {
+        trace_id: String,
+        summary: Option<String>,
+        cost_usd: f64,
+    },
+    /// A sub-agent execution failed (agent loop error, panic-via-spawn-error, or aborted by
+    /// [`AgentHarness::abort_trigger`] / [`AgentHarness::abort_all_triggers`]). `reason` is
+    /// sanitized — never contains raw payload, provider response bodies, or credential
+    /// material. The parent `trigger_result` audit entry has been written with
+    /// `success: false`.
+    TriggerFailed { trace_id: String, reason: String },
 }
 
 /// Listener for [`HarnessEvent`]. Shape mirrors `crate::agent::AgentListener` so the same Fn
@@ -179,18 +204,98 @@ pub type BeforeTriggerHook = Arc<
 
 /// Aggregated, copy-friendly snapshot returned by
 /// [`AgentHarness::notification_status_snapshot`]. The TUI / `/triggers hooks` command
-/// renders this directly; `hooks` is intentionally a snapshot `Vec` (not a live view) so the
-/// caller cannot pin the hook registry against new registrations.
+/// renders this directly; `hooks` and `running` are snapshots, not live views, so the caller
+/// cannot pin the underlying registries against concurrent registrations / completions.
 ///
 /// `hooks` is filled from `hook.status()` of every hook registered via
 /// [`AgentHarness::register_notification_hook`]. Unregistered / hook-ended cases stay in the
 /// snapshot until the next registration cycle; consumers should treat `NotificationHookStatus.state`
 /// as the source of truth for whether a hook is currently usable.
+///
+/// `running` is the set of accepted triggers whose sub-agent execution has started and not
+/// yet finished. Each entry holds bounded preview-safe fields only (no raw payload, no
+/// template vars, no credentials). RFC 1 §5.G acceptance pins this.
 #[derive(Clone, Debug)]
 pub struct NotificationStatusSnapshot {
     pub hooks: Vec<NotificationHookStatus>,
     pub runtime: TriggerRuntimeSnapshot,
+    pub running: Vec<RunningTriggerState>,
 }
+
+/// Bounded preview-safe view of a single in-flight trigger action. Fields are intentionally
+/// minimal so the TUI banner / `/triggers` view cannot accidentally leak raw payload or
+/// credential material. RFC 1 §5.G.
+#[derive(Clone, Debug)]
+pub struct RunningTriggerState {
+    pub trace_id: String,
+    pub source_label: String,
+    pub event_label: String,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    /// First ~80 chars of the resolved action prompt.
+    pub prompt_preview: String,
+}
+
+/// Action the harness should take on an accepted trigger. Returned by
+/// [`BeforeTriggerActionHook`]; default (no hook) maps every trigger to
+/// `TriggerAction { prompt: format!("{source_label} fired: {event_label}"),
+/// promote: PromoteAction::None, promote_requires_approval: false }`.
+///
+/// `promote` and `promote_requires_approval` are accepted in this sub-PR but only the
+/// `PromoteAction::None` variant has an effect; the promotion pipeline lands in sub-PR 5b
+/// per the issue #20 amendment. Fields are reserved here so adapters can be written against
+/// the final shape today.
+#[derive(Clone, Debug)]
+pub struct TriggerAction {
+    pub prompt: String,
+    pub promote: PromoteAction,
+    pub promote_requires_approval: bool,
+}
+
+impl TriggerAction {
+    /// The default `Prompt` form used when no [`BeforeTriggerActionHook`] is configured.
+    /// `format!("{source_label} fired: {event_label}")` is the RFC 1 §5.C stable fallback —
+    /// always non-empty and carries enough context that the sub-agent can react.
+    pub fn default_for(trigger: &Trigger) -> Self {
+        Self {
+            prompt: format!("{} fired: {}", trigger.source_label, trigger.event_label),
+            promote: PromoteAction::None,
+            promote_requires_approval: false,
+        }
+    }
+}
+
+/// How a completed sub-agent's `trigger_result` should affect the parent session. Lands as a
+/// no-op variant in sub-PR 5a; sub-PR 5b will honor `PromoteSummaryNow` (and follow-ups will
+/// add `InjectNextTurn` per the issue #20 amendment).
+#[derive(Clone, Debug, Default)]
+pub enum PromoteAction {
+    #[default]
+    None,
+    PromoteSummaryNow {
+        /// Named [`PromptTemplate`]; `None` uses the runtime's built-in safe default.
+        template: Option<String>,
+    },
+}
+
+/// Snapshot context passed into [`BeforeTriggerActionHook`]. Hook returns the
+/// [`TriggerAction`] for the accepted trigger.
+#[derive(Clone, Debug)]
+pub struct BeforeTriggerActionContext {
+    pub trigger: super::trigger::Trigger,
+    pub runtime: super::trigger_runtime::TriggerRuntimeSnapshot,
+}
+
+/// Hook called by [`AgentHarness::handle_trigger`] *after* the optional
+/// [`BeforeTriggerHook`] returned `Allow`, to decide the action the sub-agent should run.
+/// `None` falls back to [`TriggerAction::default_for`].
+pub type BeforeTriggerActionHook = Arc<
+    dyn Fn(
+            BeforeTriggerActionContext,
+            tokio_util::sync::CancellationToken,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TriggerAction> + Send>>
+        + Send
+        + Sync,
+>;
 
 pub struct AgentHarnessOptions {
     /// Base system prompt prepended to the rendered skill catalog.
@@ -220,6 +325,10 @@ pub struct AgentHarnessOptions {
     /// `None` is equivalent to a hook that always returns
     /// [`BeforeTriggerDecision::Allow`]. See [`BeforeTriggerHook`].
     pub before_trigger: Option<BeforeTriggerHook>,
+    /// Optional action hook resolving accepted triggers to a [`TriggerAction`]. `None`
+    /// falls back to [`TriggerAction::default_for`] (the stable `format!("{source_label}
+    /// fired: {event_label}")` mapping).
+    pub before_trigger_action: Option<BeforeTriggerActionHook>,
 }
 
 impl AgentHarnessOptions {
@@ -239,6 +348,7 @@ impl AgentHarnessOptions {
             budget_cap_usd: None,
             trigger_runtime: TriggerRuntimeConfig::default(),
             before_trigger: None,
+            before_trigger_action: None,
         }
     }
 }
@@ -274,6 +384,28 @@ pub struct AgentHarness {
     /// Optional permission hook applied to accepted triggers before they advance to a
     /// terminal state. `None` defaults to [`BeforeTriggerDecision::Allow`].
     before_trigger: Option<BeforeTriggerHook>,
+    /// Optional action hook resolving accepted triggers to a `TriggerAction`. `None` falls
+    /// back to [`TriggerAction::default_for`].
+    before_trigger_action: Option<BeforeTriggerActionHook>,
+    /// Retained `before_tool_call` hook for cloning into sub-agent harnesses spawned by
+    /// `spawn_trigger_action`. Mirrors the same hook handed to the inner `Agent`.
+    before_tool_call: Option<BeforeToolCallHook>,
+    /// Retained `after_tool_call` hook for the same purpose.
+    after_tool_call: Option<AfterToolCallHook>,
+    /// In-flight sub-agent executions keyed by `trace_id`. Each entry holds the cancel
+    /// token (so [`Self::abort_trigger`] / [`Self::abort_all_triggers`] can interrupt the
+    /// sub-agent) plus the preview-safe state surfaced by
+    /// [`Self::notification_status_snapshot`]. Entries are inserted just before
+    /// `TriggerExecutionStarted` and removed after the terminal `Completed`/`Failed`
+    /// event so snapshots reflect what's really running.
+    running_triggers: Arc<Mutex<std::collections::HashMap<String, RunningTriggerHandle>>>,
+}
+
+/// Internal record kept under `AgentHarness::running_triggers`. The public-facing snapshot
+/// type is [`RunningTriggerState`]; this struct adds the cancel token used by the abort APIs.
+struct RunningTriggerHandle {
+    state: RunningTriggerState,
+    cancel: tokio_util::sync::CancellationToken,
 }
 
 impl AgentHarness {
@@ -312,6 +444,10 @@ impl AgentHarness {
             trigger_runtime: TriggerRuntime::with_config(options.trigger_runtime),
             notification_hooks: Arc::new(Mutex::new(Vec::new())),
             before_trigger: options.before_trigger,
+            before_trigger_action: options.before_trigger_action,
+            before_tool_call: options.before_tool_call,
+            after_tool_call: options.after_tool_call,
+            running_triggers: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -486,15 +622,81 @@ impl AgentHarness {
             None => None,
         };
 
+        let trace_id = trigger.trace_id.clone();
+        let idempotency_key = trigger.idempotency_key.clone();
+
         self.emit_harness_event(HarnessEvent::TriggerHandled {
-            idempotency_key: trigger.idempotency_key,
-            trace_id: trigger.trace_id,
+            idempotency_key,
+            trace_id: trace_id.clone(),
             state,
             audit_entry_id,
             evaluator_decision,
         });
 
+        // Sub-agent execution only fires on the policy-Allow Accepted path. Other terminal
+        // states (Deduped / CycleSuppressed / PermissionDenied / NeedsApproval) leave
+        // `handle_trigger` here with only the audit + `TriggerHandled` event written.
+        if state == TriggerState::Accepted {
+            self.spawn_trigger_action(trigger);
+        }
+
         outcome
+    }
+
+    /// Spawn the detached sub-agent task for an accepted trigger. RFC 1 §5.A: the parent
+    /// `Agent` is single-tenant, so we cannot run the action on the same `AgentHarness`;
+    /// instead each accepted trigger gets its own sub-harness rooted on an in-memory
+    /// session. The parent session only gets the `trigger_result` audit when the sub-agent
+    /// completes (or is cancelled).
+    ///
+    /// **Known limitation in sub-PR 5a**: the sub-agent's session is in-memory and
+    /// discarded when the task finishes. Per the issue #20 amendment, jsonl-backed retained
+    /// branches (so `pie --resume <trace_id>` can replay sub-agent transcripts for
+    /// archaeology) is a sub-PR 5c follow-up. `trigger_result.summary` is preserved; the
+    /// full sub-agent transcript is not.
+    fn spawn_trigger_action(&self, trigger: Trigger) {
+        // Snapshot every input the spawned task needs so the closure can be `'static`. We
+        // intentionally do not require `self: &Arc<Self>` to avoid a breaking-change to
+        // existing callers of `AgentHarness::new`; instead we capture the underlying
+        // shared state through individual handles.
+        let trace_id = trigger.trace_id.clone();
+        let source_label = trigger.source_label.clone();
+        let event_label = trigger.event_label.clone();
+        let listeners = Arc::clone(&self.harness_listeners);
+        let parent_session = self.session.clone();
+        let running_registry = Arc::clone(&self.running_triggers);
+        let action_hook = self.before_trigger_action.clone();
+        let runtime_snapshot = self.trigger_runtime.snapshot();
+        let parent_state = self.agent.state();
+        let parent_model = parent_state.model.clone();
+        let parent_system_prompt = parent_state.system_prompt.clone();
+        let parent_tools = parent_state.tools.clone();
+        let parent_thinking = parent_state.thinking_level;
+        let stream_fn = self.stream_fn.clone();
+        let before_tool_call = self.before_tool_call.clone();
+        let after_tool_call = self.after_tool_call.clone();
+
+        tokio::spawn(async move {
+            run_trigger_action(
+                trigger,
+                trace_id,
+                source_label,
+                event_label,
+                listeners,
+                parent_session,
+                running_registry,
+                action_hook,
+                runtime_snapshot,
+                parent_model,
+                parent_system_prompt,
+                parent_tools,
+                parent_thinking,
+                stream_fn,
+                before_tool_call,
+                after_tool_call,
+            )
+            .await;
+        });
     }
 
     /// Invoke the optional permission hook on an accepted trigger. Returns
@@ -528,9 +730,45 @@ impl AgentHarness {
         // lock) would otherwise block concurrent `register_notification_hook` calls.
         let hook_arcs: Vec<DynNotificationHook> = self.notification_hooks.lock().clone();
         let hooks: Vec<NotificationHookStatus> = hook_arcs.iter().map(|h| h.status()).collect();
+        // Running triggers: clone the public-facing state out of each handle. Drop the lock
+        // before returning so consumers cannot pin the registry against concurrent inserts /
+        // removes by the spawned sub-agent tasks.
+        let running: Vec<RunningTriggerState> = self
+            .running_triggers
+            .lock()
+            .values()
+            .map(|h| h.state.clone())
+            .collect();
         NotificationStatusSnapshot {
             hooks,
             runtime: self.trigger_runtime.snapshot(),
+            running,
+        }
+    }
+
+    /// Cancel the in-flight sub-agent for `trace_id`. No-op if the trigger has already
+    /// completed or was never accepted. The spawned task will observe the cancel inside its
+    /// `select!`, abort the agent loop, and emit `TriggerFailed` with
+    /// `reason == "aborted"` plus a `trigger_result { success: false, summary:
+    /// Some("aborted") }` audit entry.
+    pub fn abort_trigger(&self, trace_id: &str) {
+        if let Some(handle) = self.running_triggers.lock().get(trace_id) {
+            handle.cancel.cancel();
+        }
+    }
+
+    /// Cancel every in-flight sub-agent. Each cancelled task writes its own
+    /// `trigger_result` and emits `TriggerFailed`. Convenience wrapper around
+    /// [`Self::abort_trigger`] for graceful shutdown.
+    pub fn abort_all_triggers(&self) {
+        let cancels: Vec<_> = self
+            .running_triggers
+            .lock()
+            .values()
+            .map(|h| h.cancel.clone())
+            .collect();
+        for c in cancels {
+            c.cancel();
         }
     }
 
@@ -996,4 +1234,289 @@ fn finish_persisted_run(
         return Err(AgentRunError::Other(format!("session append message: {e}")));
     }
     Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────
+// Sub-agent execution (RFC 1 sub-PR 5a)
+// ─────────────────────────────────────────────────────────────────────────────────────────
+
+/// Emit a [`HarnessEvent`] to a snapshot of the listener registry, isolating each listener
+/// with `catch_unwind` so a single panicking listener cannot poison the others. Mirrors
+/// the contract of `AgentHarness::emit_harness_event` but operates on a cloned `Arc` of
+/// listeners (so the spawned sub-agent task does not need an `AgentHarness` reference).
+fn emit_from_listeners(listeners: &Arc<Mutex<Vec<HarnessListener>>>, event: HarnessEvent) {
+    let snapshot = listeners.lock().clone();
+    for listener in snapshot {
+        let event = event.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || listener(event)));
+    }
+}
+
+/// Top-level body of the spawned sub-agent task. Drives the lifecycle:
+/// 1. Resolve the `TriggerAction` via `before_trigger_action` hook (or default).
+/// 2. Register the trigger as in-flight (`running_triggers`) + emit
+///    `TriggerExecutionStarted`.
+/// 3. Build the sub-agent's `Agent` on an in-memory session, inheriting parent context.
+/// 4. Race `agent.prompt(action.prompt)` against the cancel token via `tokio::select!`.
+/// 5. Compute `(success, summary, cost_usd)` from the agent's final state.
+/// 6. Write the `trigger_result` audit entry to the **parent** session.
+/// 7. Emit `TriggerCompleted` or `TriggerFailed`.
+/// 8. Remove the trigger from `running_triggers`.
+#[allow(clippy::too_many_arguments)]
+async fn run_trigger_action(
+    trigger: Trigger,
+    trace_id: String,
+    source_label: String,
+    event_label: String,
+    listeners: Arc<Mutex<Vec<HarnessListener>>>,
+    parent_session: Session,
+    running_registry: Arc<Mutex<std::collections::HashMap<String, RunningTriggerHandle>>>,
+    action_hook: Option<BeforeTriggerActionHook>,
+    runtime_snapshot: super::trigger_runtime::TriggerRuntimeSnapshot,
+    parent_model: Option<Model>,
+    parent_system_prompt: String,
+    parent_tools: Vec<Arc<dyn AgentTool>>,
+    parent_thinking: Option<ThinkingLevel>,
+    stream_fn: Option<StreamFn>,
+    before_tool_call: Option<BeforeToolCallHook>,
+    after_tool_call: Option<AfterToolCallHook>,
+) {
+    // 1. Resolve action. Cancel token is the same one we'll race the agent loop against —
+    // the hook can listen for it to abort a long-running rule/permission UI cleanly.
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let action = match action_hook {
+        Some(hook) => {
+            let ctx = BeforeTriggerActionContext {
+                trigger: trigger.clone(),
+                runtime: runtime_snapshot,
+            };
+            hook(ctx, cancel.clone()).await
+        }
+        None => TriggerAction::default_for(&trigger),
+    };
+
+    // 2. Register as in-flight + emit ExecutionStarted. The preview is bounded to ~80 chars
+    // because TUI banners cannot render arbitrary user content safely; the full prompt
+    // remains audited through the sub-agent's own jsonl when 5c lands the retained branch.
+    let prompt_preview = preview_for_banner(&action.prompt, 80);
+    let started_at = chrono::Utc::now();
+    {
+        let mut reg = running_registry.lock();
+        reg.insert(
+            trace_id.clone(),
+            RunningTriggerHandle {
+                state: RunningTriggerState {
+                    trace_id: trace_id.clone(),
+                    source_label: source_label.clone(),
+                    event_label: event_label.clone(),
+                    started_at,
+                    prompt_preview: prompt_preview.clone(),
+                },
+                cancel: cancel.clone(),
+            },
+        );
+    }
+    emit_from_listeners(
+        &listeners,
+        HarnessEvent::TriggerExecutionStarted {
+            trace_id: trace_id.clone(),
+            prompt_preview,
+        },
+    );
+
+    // 3. Build sub-agent. In sub-PR 5a we use MemorySessionStorage; the sub-agent's
+    // transcript lives in memory only and is discarded when this task finishes. Per the
+    // issue #20 amendment, jsonl-backed retained branches land in sub-PR 5c. The
+    // `trigger_result.summary` we persist to the parent session is the only durable
+    // record of what the sub-agent produced in 5a.
+    let sub_storage: Arc<dyn super::session::session::SessionStorage> =
+        Arc::new(super::session::memory_storage::MemorySessionStorage::new());
+    let sub_session = super::session::session::Session::new(sub_storage);
+
+    let mut sub_state = AgentState::default();
+    sub_state.model = parent_model;
+    sub_state.thinking_level = parent_thinking;
+    sub_state.tools = parent_tools;
+    sub_state.system_prompt = parent_system_prompt;
+
+    let sub_agent = Agent::new(AgentOptions {
+        initial_state: Some(sub_state),
+        stream_fn,
+        before_tool_call,
+        after_tool_call,
+        ..Default::default()
+    });
+
+    // Persist sub-agent messages into the sub-session jsonl as they finalize. Even though
+    // the storage is in-memory in 5a, this keeps the message-stream → session-state link
+    // intact so 5c's jsonl swap is a pure storage change with no agent-loop refactor.
+    let persist_errors: Arc<Mutex<Vec<super::types::SessionError>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let persist_session = sub_session.clone();
+    let persist_errors_listener = persist_errors.clone();
+    let _persist_unsub = sub_agent.subscribe(Arc::new(move |event, _cancel| {
+        let session = persist_session.clone();
+        let sink = persist_errors_listener.clone();
+        Box::pin(async move {
+            if let AgentEvent::MessageEnd { message } = event {
+                if let Err(e) = session.append_message(message).await {
+                    sink.lock().push(e);
+                }
+            }
+        })
+    }));
+
+    // 4. Race agent.prompt against cancel. The sub-agent receives the resolved action
+    // prompt as a user message. On abort we propagate to the sub-agent's own
+    // CancellationToken via `Agent::abort()`.
+    let user_message = AgentMessage::Llm(PiMessage::User(pie_ai::UserMessage {
+        role: pie_ai::UserRole::User,
+        content: pie_ai::UserContent::Text(action.prompt.clone()),
+        timestamp: chrono::Utc::now().timestamp_millis(),
+    }));
+    let run_outcome: Result<(), AgentRunError> = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            sub_agent.abort();
+            Err(AgentRunError::Other("aborted".into()))
+        }
+        res = sub_agent.prompt(user_message) => res,
+    };
+
+    // 5. Compute summary. The sub-agent's final assistant message is our best
+    // first-cut summary for 5a (no model-driven self-summary yet — that's a 5b polish).
+    // Cost comes from the sub-agent's CostTracker via state.
+    let (success, summary, message_count) = compute_sub_agent_outcome(&sub_agent, &run_outcome);
+    // CostTracker is private to harness; the sub-agent here is bare (no harness wrapper),
+    // so cost is unknown at this layer. Sub-PR 5b can wrap sub-agent in a mini-harness or
+    // expose the agent-side usage totals. For now report 0.0 and rely on parent cost
+    // tracking (parent's tools include the sub-agent's via inheritance — usage flows the
+    // same way through `MessageEnd`).
+    let cost_usd: f64 = 0.0;
+
+    // 6. Persist `trigger_result` to PARENT session. Best-effort: on failure we emit a
+    // `PersistenceError` reflux event (same shape as `trigger_audit` failures in
+    // sub-PR 2) but still proceed to remove from registry + emit terminal event.
+    let result_data = serde_json::json!({
+        "trace_id": trace_id,
+        "branch_id": serde_json::Value::Null,
+        "success": success,
+        "summary": summary,
+        "message_count": message_count,
+        "cost_usd": cost_usd,
+    });
+    let audit_write_result = parent_session
+        .append_custom("trigger_result", Some(result_data))
+        .await;
+    if let Err(e) = audit_write_result {
+        emit_from_listeners(
+            &listeners,
+            HarnessEvent::PersistenceError {
+                context: "trigger_result".into(),
+                message: format!("trigger_result append failed: {:?}", e.code),
+            },
+        );
+    }
+    // Also surface any sub-agent-side persist errors so they aren't silently swallowed.
+    for e in persist_errors.lock().iter() {
+        emit_from_listeners(
+            &listeners,
+            HarnessEvent::PersistenceError {
+                context: "trigger_result".into(),
+                message: format!("sub-agent session append failed: {:?}", e.code),
+            },
+        );
+    }
+
+    // 7. Terminal event. `reason` for Failed is sanitized: we pass the `AgentRunError`'s
+    // `Display` (free-form but generally short error string from our own code paths) and
+    // explicitly avoid embedding any sub-agent message bodies / provider response content.
+    if success {
+        emit_from_listeners(
+            &listeners,
+            HarnessEvent::TriggerCompleted {
+                trace_id: trace_id.clone(),
+                summary,
+                cost_usd,
+            },
+        );
+    } else {
+        let reason = match run_outcome {
+            Err(AgentRunError::Other(msg)) if msg == "aborted" => "aborted".to_string(),
+            Err(e) => format!("{e}"),
+            Ok(_) => "unknown failure".to_string(),
+        };
+        emit_from_listeners(
+            &listeners,
+            HarnessEvent::TriggerFailed {
+                trace_id: trace_id.clone(),
+                reason,
+            },
+        );
+    }
+
+    // 8. Remove from registry.
+    running_registry.lock().remove(&trace_id);
+}
+
+/// Inspect the sub-agent's terminal state to summarize the outcome. Returns
+/// `(success, summary, message_count)`.
+///
+/// `summary` is the text of the sub-agent's final assistant message when one exists; this
+/// is a first-cut heuristic for 5a. Sub-PR 5b can replace this with a model-driven summary
+/// or a hook-supplied template-rendered summary.
+fn compute_sub_agent_outcome(
+    sub_agent: &Agent,
+    run_outcome: &Result<(), AgentRunError>,
+) -> (bool, Option<String>, usize) {
+    if let Err(_e) = run_outcome {
+        // Try to grab a partial last-assistant-message even on failure for context.
+        let state = sub_agent.state();
+        let last = last_assistant_text(&state);
+        return (false, last, state.messages.len());
+    }
+    let state = sub_agent.state();
+    let summary = last_assistant_text(&state);
+    (true, summary, state.messages.len())
+}
+
+/// Extract the text of the last assistant message, if any. Returns `None` if the agent
+/// produced no assistant content (e.g. aborted before the first turn). Truncated to 4 KiB
+/// per RFC 1 §5.B size cap.
+fn last_assistant_text(state: &AgentState) -> Option<String> {
+    let last = state.messages.iter().rev().find_map(|m| match m {
+        AgentMessage::Llm(pie_ai::Message::Assistant(a)) => Some(a),
+        _ => None,
+    })?;
+    let mut text = String::new();
+    for block in &last.content {
+        if let pie_ai::ContentBlock::Text(t) = block {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&t.text);
+        }
+    }
+    if text.is_empty() {
+        return None;
+    }
+    const SUMMARY_CAP_BYTES: usize = 4096;
+    if text.len() > SUMMARY_CAP_BYTES {
+        // Cap on byte length to honor the audit boundary; we don't worry about cutting
+        // mid-codepoint here because the summary is preview-only and the cap is generous.
+        text.truncate(SUMMARY_CAP_BYTES);
+        text.push_str("…[truncated]");
+    }
+    Some(text)
+}
+
+/// Bounded preview text for status banners. Avoids panicking on multi-byte char boundaries
+/// by walking char count, not byte count.
+fn preview_for_banner(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max_chars).collect();
+    out.push('…');
+    out
 }

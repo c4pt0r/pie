@@ -646,7 +646,10 @@ impl EventData {
             | HarnessEvent::Branch { .. }
             | HarnessEvent::TriggerHandlingStart { .. }
             | HarnessEvent::TriggerHandled { .. }
-            | HarnessEvent::PersistenceError { .. } => None,
+            | HarnessEvent::PersistenceError { .. }
+            | HarnessEvent::TriggerExecutionStarted { .. }
+            | HarnessEvent::TriggerCompleted { .. }
+            | HarnessEvent::TriggerFailed { .. } => None,
         }
     }
 }

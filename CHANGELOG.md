@@ -180,6 +180,35 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
   4 new integration tests pin default-Allow, Deny→PermissionDenied (asserting both the
   audit record AND the event carry the reason), Prompt→NeedsApproval (same dual
   assertion), and that the hook is bypassed on the Deduped path.
+- **#20 (sub-agent execution, no promotion yet)** Accepted triggers now spawn a detached
+  sub-agent that runs the trigger's action prompt without blocking the `handle_trigger`
+  caller or the `register_notification_hook` pump (RFC 1 §5.A). New
+  `AgentHarnessOptions::before_trigger_action: Option<BeforeTriggerActionHook>` resolves
+  the prompt; absence falls back to the stable
+  `format!("{source_label} fired: {event_label}")` mapping. New `TriggerAction { prompt,
+  promote, promote_requires_approval }` and `PromoteAction { None | PromoteSummaryNow {
+  template } }` are accepted for forward compatibility but only `PromoteAction::None` has
+  any effect — the promotion pipeline lands in sub-PR 5b. On sub-agent completion the
+  parent session gets a `SessionTreeEntry::Custom { custom_type: "trigger_result", data:
+  { trace_id, branch_id, success, summary, message_count, cost_usd } }` audit entry; the
+  sub-agent's full transcript lives in an in-memory session that is discarded when the
+  task ends (jsonl-backed retained branches per the issue #20 amendment are tracked as a
+  sub-PR 5c follow-up — `branch_id` is `null` in 5a). Three new `HarnessEvent` variants
+  (`TriggerExecutionStarted` / `TriggerCompleted` / `TriggerFailed`) carry preview-safe
+  fields for live banner / JSONL rendering; causality `TriggerHandled(Accepted)` →
+  `TriggerExecutionStarted` → `TriggerCompleted | TriggerFailed` is pinned by rustdoc
+  and a test. `NotificationStatusSnapshot.running: Vec<RunningTriggerState>` exposes
+  in-flight triggers with bounded preview fields (no raw payload, no template vars).
+  `AgentHarness::abort_trigger(trace_id)` and `AgentHarness::abort_all_triggers()`
+  cancel running sub-agents; cancelled sub-agents emit `TriggerFailed { reason:
+  "aborted" }` and write `trigger_result { success: false }`. Sub-agents inherit the
+  parent's `model` / `system_prompt` / `tools` / `before_tool_call` /
+  `after_tool_call` so permission policies continue to apply to trigger-driven tool
+  calls. 6 new integration tests cover: accepted trigger writes audit (summary +
+  trace_id link), event ordering, pump non-blocking (two triggers; first slow, second
+  reaches audit promptly), `running` snapshot bounded preview + leaves after completion,
+  abort path (cancellation within 3s + failure audit), and non-Accepted states never
+  spawn sub-agents.
 
 ### Fixed
 
