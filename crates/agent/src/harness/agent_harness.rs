@@ -1696,28 +1696,42 @@ fn sha256_hex(input: &str) -> String {
 /// @Tools-MCP-Lead's PR #65 review: trusting template authors to include the prefix is
 /// unsafe — a custom template that forgets it would produce a `Message::User` in the
 /// parent transcript that looks like human input, polluting the next-turn LLM context
-/// without user awareness. Idempotent (skip when the rendered body already begins with
-/// `[Trigger `, e.g. the built-in default template). Returns `(prefixed_body, injected)`.
+/// without user awareness. Idempotent only for the **current** trace id: if the body
+/// already begins with `[Trigger {trace_id}] ` (the form the engine would produce), the
+/// prefix is not re-added. A `[Trigger evil] ` prefix carrying a different trace id is
+/// NOT trusted — the engine still prepends the real `[Trigger {trace_id}] ` so the
+/// authoritative trace id wins. Returns `(prefixed_body, injected)`.
 fn ensure_trigger_prefix(body: String, trace_id: &str) -> (String, bool) {
-    if body.starts_with("[Trigger ") {
+    let expected = format!("[Trigger {trace_id}] ");
+    if body.starts_with(&expected) {
         (body, false)
     } else {
-        let prefixed = format!("[Trigger {trace_id}] {body}");
-        (prefixed, true)
+        (format!("{expected}{body}"), true)
     }
 }
 
+/// Truncation marker appended to bodies that overrun `cap_bytes`. Counted toward the cap
+/// so the final string length is `<= cap_bytes`.
+const TRUNCATION_MARKER: &str = "…[truncated]";
+
+/// Truncate `body` to fit within `cap_bytes` *including* the truncation marker. The body
+/// portion is cut on a UTF-8 char boundary so `truncate` never panics on a multi-byte
+/// codepoint. The final length is at most `cap_bytes`: we reserve
+/// `TRUNCATION_MARKER.len()` from the budget before the boundary walk.
 fn truncate_on_char_boundary(body: String, cap_bytes: usize) -> (String, bool) {
     if body.len() <= cap_bytes {
         return (body, false);
     }
-    let mut cut = cap_bytes;
+    // Reserve room for the marker so the final string fits the cap. If the cap is
+    // somehow smaller than the marker, fall back to "marker-only" output.
+    let budget = cap_bytes.saturating_sub(TRUNCATION_MARKER.len());
+    let mut cut = budget.min(body.len());
     while cut > 0 && !body.is_char_boundary(cut) {
         cut -= 1;
     }
     let mut truncated = body;
     truncated.truncate(cut);
-    truncated.push_str("…[truncated]");
+    truncated.push_str(TRUNCATION_MARKER);
     (truncated, true)
 }
 
@@ -2000,18 +2014,11 @@ fn last_assistant_text(state: &AgentState) -> Option<String> {
         return None;
     }
     const SUMMARY_CAP_BYTES: usize = 4096;
-    if text.len() > SUMMARY_CAP_BYTES {
-        // Walk back from the byte cap to the previous UTF-8 char boundary so `truncate`
-        // never lands inside a multi-byte codepoint (which would panic). The cap is
-        // generous; in practice the boundary walk shifts at most 3 bytes.
-        let mut cut = SUMMARY_CAP_BYTES;
-        while cut > 0 && !text.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        text.truncate(cut);
-        text.push_str("…[truncated]");
-    }
-    Some(text)
+    // Per @QA-Release-Lead's PR #65 review: cap must include the truncation marker so
+    // the final body fits the documented 4 KiB boundary. Reuse the shared helper for
+    // consistency between `trigger_result.summary` and promotion body truncation.
+    let (capped, _truncated) = truncate_on_char_boundary(text, SUMMARY_CAP_BYTES);
+    Some(capped)
 }
 
 /// Bounded preview text for status banners. Avoids panicking on multi-byte char boundaries
