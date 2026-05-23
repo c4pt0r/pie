@@ -393,6 +393,9 @@ impl App {
                 }
             }
             KeyCode::Char('d') if ctrl => {
+                if self.handle_ctrl_d(turn) {
+                    return Ok(());
+                }
                 if self.input_text().is_empty() {
                     self.system_line("eof — exiting");
                     self.quit = true;
@@ -632,6 +635,15 @@ impl App {
         }
     }
 
+    fn handle_ctrl_d(&mut self, turn: &mut TurnState) -> bool {
+        if turn.fut.is_some() {
+            self.request_abort(turn);
+            true
+        } else {
+            false
+        }
+    }
+
     fn on_idle_ctrlc(&mut self) -> bool {
         let now = Instant::now();
         if self
@@ -682,15 +694,18 @@ impl App {
         if self.completions.is_empty() {
             return;
         }
+        let options = self.completions.clone();
         let pick = self.completions[self.completion_idx % self.completions.len()].clone();
         self.completion_idx = (self.completion_idx + 1) % self.completions.len();
         // Replace just the slash token (the whole single-line input here).
         let mut input = new_textarea();
         input.insert_str(&pick);
         self.input = input;
-        // Recompute against the now-complete token (usually empties the list).
-        self.completions = self.completer.matches(&pick);
-        if self.completions.is_empty() {
+        if options.len() > 1 {
+            // Keep the original candidate set so repeated Tab cycles through visible choices.
+            self.completions = options;
+        } else {
+            self.completions.clear();
             self.completion_idx = 0;
         }
     }
@@ -1116,6 +1131,41 @@ mod tests {
             "status rule should be pinned near the bottom (row {status_row} of {}):\n{text}",
             lines.len()
         );
+    }
+
+    #[test]
+    fn tab_cycles_slash_command_completions() {
+        let mut app = test_app();
+        app.set_input("/");
+        let options = app.completions.clone();
+        assert!(
+            options.len() > 1,
+            "slash prefix should expose multiple command completions"
+        );
+
+        app.cycle_completion();
+        let first = app.input_text();
+        app.cycle_completion();
+        let second = app.input_text();
+
+        assert_eq!(first, options[0]);
+        assert_eq!(second, options[1]);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn ctrl_d_aborts_active_turn_before_exiting() {
+        let mut app = test_app();
+        let mut turn = TurnState {
+            fut: Some(Box::pin(std::future::pending())),
+            aborted: false,
+            prefix: "",
+        };
+
+        assert!(app.handle_ctrl_d(&mut turn));
+
+        assert!(turn.aborted);
+        assert!(!app.quit, "Ctrl-D during work should abort, not exit");
     }
 
     #[test]
