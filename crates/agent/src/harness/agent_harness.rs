@@ -2101,63 +2101,76 @@ async fn apply_promotion(
         content: pie_ai::UserContent::Text(final_body),
         timestamp: chrono::Utc::now().timestamp_millis(),
     }));
-    let inserted_entry_id = match parent_session.append_message(user_message.clone()).await {
-        Ok(id) => id,
-        Err(e) => {
-            emit_from_listeners(
-                listeners,
-                HarnessEvent::PersistenceError {
-                    context: "trigger_promotion".into(),
-                    message: format!("promotion message append failed: {:?}", e.code),
-                },
-            );
-            // Audit the failure so jsonl-only readers know promotion attempted but was lost.
-            let audit_data = serde_json::json!({
-                "state": "failed",
-                "trace_id": trace_id,
-                "promote_kind": promote_kind,
-                "template_name": template_name,
-                "template_hash": template_hash,
-                "inserted_entry_id": serde_json::Value::Null,
-                "rule_id": serde_json::Value::Null,
-                "redaction_status": "render_error",
-                "dedup_collapsed": false,
-                "prefix_injected": prefix_injected,
-            });
-            let _ = parent_session
-                .append_custom("trigger_promotion", Some(audit_data))
-                .await;
-            return;
-        }
-    };
-    // Mirror the promoted message into the parent agent's in-memory state so the next loop
-    // turn sees it. Two paths so we never race the parent agent loop:
+
+    // Single persistence path. The promoted message must land in the session JSONL exactly
+    // once, with deterministic ordering relative to any in-flight assistant response. Two
+    // disjoint branches based on parent loop state:
     //
-    // - **Streaming**: parent is mid-prompt. A direct push into `state.messages` can land
-    //   between an LLM streamback and the assistant-message append, producing a transcript
-    //   order `[…, user_promoted, assistant_response]` where the assistant appears to have
-    //   answered a question that wasn't yet asked. Instead enqueue via the loop's own
-    //   follow-up queue, which the loop drains at a turn boundary (designed for exactly
-    //   this case — external code injecting a message safely).
+    // - **Streaming**: parent has an active prompt. Hand the message to the loop's
+    //   follow-up queue. The loop drains it at the next turn boundary (after the in-flight
+    //   assistant response has emitted its `MessageEnd` and been persisted by the session
+    //   listener), pushes it into `state.messages`, and emits a `MessageEnd` whose session
+    //   listener writes the single canonical session entry. Order in JSONL: assistant
+    //   response → user_promoted, matching what the model actually saw. We do NOT call
+    //   `parent_session.append_message` here — that would double-persist and land in the
+    //   wrong order. Audit captures the queued state; `inserted_entry_id` is only known
+    //   after the loop drains, so it's `Null` here and correlated via `trace_id`.
     //
-    // - **Idle**: no active loop, no race. Direct push so the user's next `prompt()` /
-    //   `continue_()` sees the promotion immediately without an explicit rehydrate.
-    //
-    // Either way the message has already been durably persisted via `append_message`
-    // above; the choice here is only about how the in-memory `Agent` learns of it.
-    if parent_agent.is_streaming() {
+    // - **Idle**: no active loop, no listener race. Synchronously
+    //   `parent_session.append_message` (single write) then push to `state.messages` so
+    //   the user's next `prompt()` / `continue_()` sees the promotion without an explicit
+    //   rehydrate. Loop isn't running, so no `MessageEnd` fires for this message → no
+    //   duplicate listener write.
+    let queued_for_followup = parent_agent.is_streaming();
+    let (audit_state, inserted_entry_id_value, inserted_entry_id_str) = if queued_for_followup {
         parent_agent.enqueue_follow_up(user_message);
+        (
+            "queued",
+            serde_json::Value::Null,
+            String::new(), // event field is set; TUI / /triggers audit join by trace_id
+        )
     } else {
+        let id = match parent_session.append_message(user_message.clone()).await {
+            Ok(id) => id,
+            Err(e) => {
+                emit_from_listeners(
+                    listeners,
+                    HarnessEvent::PersistenceError {
+                        context: "trigger_promotion".into(),
+                        message: format!("promotion message append failed: {:?}", e.code),
+                    },
+                );
+                // Audit the failure so jsonl-only readers know promotion attempted but
+                // was lost.
+                let audit_data = serde_json::json!({
+                    "state": "failed",
+                    "trace_id": trace_id,
+                    "promote_kind": promote_kind,
+                    "template_name": template_name,
+                    "template_hash": template_hash,
+                    "inserted_entry_id": serde_json::Value::Null,
+                    "rule_id": serde_json::Value::Null,
+                    "redaction_status": "render_error",
+                    "dedup_collapsed": false,
+                    "prefix_injected": prefix_injected,
+                });
+                let _ = parent_session
+                    .append_custom("trigger_promotion", Some(audit_data))
+                    .await;
+                return;
+            }
+        };
         parent_agent.state().messages.push(user_message);
-    }
+        ("success", serde_json::Value::String(id.clone()), id)
+    };
 
     let audit_data = serde_json::json!({
-        "state": "success",
+        "state": audit_state,
         "trace_id": trace_id,
         "promote_kind": promote_kind,
         "template_name": template_name,
         "template_hash": template_hash,
-        "inserted_entry_id": inserted_entry_id,
+        "inserted_entry_id": inserted_entry_id_value,
         "rule_id": serde_json::Value::Null,
         "redaction_status": redaction_status,
         "dedup_collapsed": false,
@@ -2171,7 +2184,10 @@ async fn apply_promotion(
             listeners,
             HarnessEvent::PersistenceError {
                 context: "trigger_promotion".into(),
-                message: format!("trigger_promotion (success) append failed: {:?}", e.code),
+                message: format!(
+                    "trigger_promotion ({audit_state}) append failed: {:?}",
+                    e.code
+                ),
             },
         );
     }
@@ -2180,7 +2196,7 @@ async fn apply_promotion(
         HarnessEvent::TriggerPromoted {
             trace_id: trace_id.to_string(),
             promote_kind: promote_kind.into(),
-            inserted_entry_id,
+            inserted_entry_id: inserted_entry_id_str,
             template_name,
             redaction_status: redaction_status.into(),
         },
