@@ -29,6 +29,18 @@ pub struct ServerConfig {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+    /// Treat this server as a pure notification feed: its pushed `payload_summary` is
+    /// injected straight into the parent chat (no sub-agent, no model call) instead of
+    /// dispatching the dynamic-rule sub-agent. Off by default. See
+    /// `triggers::direct_inject_action_hook`.
+    #[serde(default)]
+    pub inject_summary: bool,
+    /// Like `inject_summary`, but additionally run ONE model turn in the parent's full
+    /// context so the agent reacts to the notification. Off by default; wins over
+    /// `inject_summary` if both are set. Authority note: this lets a trusted source's data
+    /// wake the main agent (with tools + history) — opt in per server only.
+    #[serde(default)]
+    pub inject_and_run: bool,
 }
 
 /// Output of loading. Holds tools (to register with the agent), diagnostics (startup
@@ -41,6 +53,12 @@ pub struct LoadedMcp {
     pub diagnostics: Vec<String>,
     pub client_count: usize,
     pub notification_hooks: Vec<Arc<McpNotificationHook>>,
+    /// Names of servers configured with `inject_summary = true`. The caller wires these into
+    /// `triggers::direct_inject_action_hook` so their pushes bypass the sub-agent.
+    pub inject_summary_servers: std::collections::HashSet<String>,
+    /// Names of servers configured with `inject_and_run = true` — injected summary plus one
+    /// model turn in the parent context.
+    pub inject_and_run_servers: std::collections::HashSet<String>,
 }
 
 /// Load and connect every MCP server from the project + user configs. Project entries with
@@ -63,6 +81,17 @@ pub async fn load_all(cwd: &Path) -> LoadedMcp {
         }
     }
 
+    let inject_summary_servers: std::collections::HashSet<String> = configs
+        .iter()
+        .filter(|c| c.inject_summary)
+        .map(|c| c.name.clone())
+        .collect();
+    let inject_and_run_servers: std::collections::HashSet<String> = configs
+        .iter()
+        .filter(|c| c.inject_and_run)
+        .map(|c| c.name.clone())
+        .collect();
+
     let (tools, notification_hooks, connect_diagnostics, client_count) =
         connect_all(&configs).await;
     diagnostics.extend(connect_diagnostics);
@@ -71,6 +100,8 @@ pub async fn load_all(cwd: &Path) -> LoadedMcp {
         diagnostics,
         client_count,
         notification_hooks,
+        inject_summary_servers,
+        inject_and_run_servers,
     }
 }
 
@@ -175,11 +206,15 @@ mod tests {
                 name: "broken-a".into(),
                 command: "/definitely/not/a/real/path/for/mcp/test-a".into(),
                 args: vec![],
+                inject_summary: false,
+                inject_and_run: false,
             },
             ServerConfig {
                 name: "broken-b".into(),
                 command: "/definitely/not/a/real/path/for/mcp/test-b".into(),
                 args: vec![],
+                inject_summary: false,
+                inject_and_run: false,
             },
         ];
         let (tools, hooks, diagnostics, client_count) = connect_all(&configs).await;

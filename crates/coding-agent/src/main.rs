@@ -204,6 +204,36 @@ async fn delete_session_cmd(repo: &JsonlSessionRepo, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Run ONE model turn requested by an inject-and-run delivery. The kernel has already
+/// injected the `[Trigger …]` prompt into the parent conversation, so we just continue the
+/// loop over the current transcript. Called only from the REPL's readline/select loop, so it
+/// is serialized with user input — there is never concurrent access to the single-tenant
+/// agent. Streamed output renders through the persistent `tui.listener()` like any turn.
+/// Ctrl-C aborts this turn, mirroring the user-prompt path.
+async fn run_triggered_main_turn(harness: &AgentHarness, tui: &tui::Tui, trace_id: &str) {
+    // Defensive: the kernel emits `TriggerRequestsMainRun` only for an idle parent, but a
+    // user prompt may have started in the gap. `continue_` would return `AlreadyStreaming`;
+    // skip rather than error — the injected message is still in the transcript for next time.
+    if harness.agent().is_streaming() {
+        return;
+    }
+    let short = &trace_id[..trace_id.len().min(8)];
+    tui.system_line(&format!("running triggered turn (trace {short})"));
+    let run = harness.continue_();
+    tokio::pin!(run);
+    let res = tokio::select! {
+        biased;
+        res = &mut run => res,
+        _ = tokio::signal::ctrl_c() => {
+            harness.abort();
+            (&mut run).await
+        }
+    };
+    if let Err(e) = res {
+        tui.error_line(&format!("triggered turn: {e}"));
+    }
+}
+
 async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo) -> Result<()> {
     let local_models = local_models::load_all(&cwd).await?;
     let model = model::auto_detect_model(cli.provider.as_deref(), cli.model.as_deref())?;
@@ -259,6 +289,8 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
     let mcp_tool_count = mcp.tools.len();
     let mcp_notification_hooks = mcp.notification_hooks;
     let mcp_notification_hook_count = mcp_notification_hooks.len();
+    let mcp_inject_summary_servers = mcp.inject_summary_servers;
+    let mcp_inject_and_run_servers = mcp.inject_and_run_servers;
     tools.extend(mcp.tools);
     let tool_names = tools
         .iter()
@@ -304,8 +336,14 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
     opts.stream_fn = Some(stream_fn.clone());
     opts.before_tool_call =
         Some(PermissionPolicy::default_for_coding_agent().as_before_tool_call());
-    opts.before_trigger_action = Some(triggers::before_trigger_action_hook(
-        dynamic_trigger_registry.clone(),
+    // Triggers from MCP servers configured with `inject_summary` / `inject_and_run` bypass
+    // the sub-agent and inject their pushed summary into chat (the latter also runs one
+    // model turn in the parent context); everything else falls through to the dynamic-rule
+    // hook. The match is structural (server name), no model.
+    opts.before_trigger_action = Some(triggers::direct_inject_action_hook(
+        mcp_inject_summary_servers,
+        mcp_inject_and_run_servers,
+        triggers::before_trigger_action_hook(dynamic_trigger_registry.clone()),
     ));
     // LSP feedback loop (issue #12): attach diagnostics to write/edit tool results when
     // ~/.pie/lsp.toml or <cwd>/.pie/lsp.toml is configured.
@@ -483,6 +521,23 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
     let _unsub_hooks = harness.agent().subscribe(hooks.runner.listener());
     let _unsub_harness_hooks = harness.subscribe_harness(hooks.runner.harness_listener());
 
+    // Inject-and-run delivery (`TriggerDelivery::InjectAndRun`): when a trigger injects a
+    // prompt into the IDLE parent and asks for a model turn, the kernel cannot run the
+    // single-tenant agent itself, so it emits `TriggerRequestsMainRun`. We funnel those into
+    // one channel that the REPL loop drains on the SAME serialized path as user input — so a
+    // triggered turn and a user prompt never race for the agent. The only sender lives in
+    // this listener, so the channel stays open exactly as long as the subscription does.
+    let (main_run_tx, mut main_run_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let _unsub_main_run = harness.subscribe_harness(std::sync::Arc::new(
+        move |ev: pie_agent_core::HarnessEvent| {
+            if let pie_agent_core::HarnessEvent::TriggerRequestsMainRun { trace_id } = ev {
+                // Non-blocking on an unbounded channel; the REPL services it next time it is
+                // waiting for input. The message itself was already injected by the kernel.
+                let _ = main_run_tx.send(trace_id);
+            }
+        },
+    ));
+
     let registry = commands::Registry::with_builtins();
     let slash_completion = readline::SlashCommandHelper::from_registry(&registry);
 
@@ -504,7 +559,7 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
         let prompt_marker = "you> ".to_string();
         let history_path_clone = history_path.clone();
         let slash_completion_clone = slash_completion.clone();
-        let read =
+        let read_handle =
             tokio::task::spawn_blocking(move || -> Result<ReadlineOutcome, anyhow::Error> {
                 let config = rustyline::Config::builder()
                     .completion_type(rustyline::config::CompletionType::List)
@@ -523,8 +578,21 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
                     Err(rustyline::error::ReadlineError::Eof) => Ok(ReadlineOutcome::Eof),
                     Err(e) => Err(e.into()),
                 }
-            })
-            .await;
+            });
+        // While waiting for the user's line, also service inject-and-run requests. Both feed
+        // the single-tenant agent through this one task, so a triggered turn never races a
+        // user prompt. The readline handle (Unpin) stays pending across any triggered turns;
+        // we keep `&mut`-awaiting the same one until the user actually submits a line.
+        tokio::pin!(read_handle);
+        let read = loop {
+            tokio::select! {
+                biased;
+                r = &mut read_handle => break r,
+                Some(trace_id) = main_run_rx.recv() => {
+                    run_triggered_main_turn(&harness, &tui, &trace_id).await;
+                }
+            }
+        };
 
         let outcome = match read {
             Ok(Ok(o)) => o,

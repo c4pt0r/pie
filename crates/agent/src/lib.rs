@@ -28,7 +28,7 @@ pub use harness::{
         AgentHarness, AgentHarnessOptions, BeforeTriggerActionContext, BeforeTriggerActionHook,
         BeforeTriggerContext, BeforeTriggerDecision, BeforeTriggerHook, HarnessEvent,
         HarnessListener, NotificationStatusSnapshot, PromoteAction, PromotionCondition,
-        PromotionConditionSkipReason, RunningTriggerState, TriggerAction,
+        PromotionConditionSkipReason, RunningTriggerState, TriggerAction, TriggerDelivery,
     },
     compaction::{
         branch_summarization::{BranchSummaryResult, summarize_branch},

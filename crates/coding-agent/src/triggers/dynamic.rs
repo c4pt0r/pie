@@ -18,8 +18,8 @@ use pie_agent_core::{
     AgentTool, AgentToolError, AgentToolResult, AgentToolUpdate, BeforeTriggerActionContext,
     BeforeTriggerActionHook, CredentialScope, HarnessEvent, HarnessListener, HookError, HookState,
     NotificationHook, NotificationHookStatus, PayloadVisibility, PromoteAction, ReplacementPolicy,
-    SourceKind, ToolExecutionMode, Trigger, TriggerAction, TriggerAuthority, TriggerSink,
-    TriggerSource,
+    SourceKind, ToolExecutionMode, Trigger, TriggerAction, TriggerAuthority, TriggerDelivery,
+    TriggerSink, TriggerSource,
 };
 use pie_ai::{Tool, UserContentBlock};
 use serde::{Deserialize, Serialize};
@@ -587,8 +587,84 @@ pub fn before_trigger_action_hook(registry: DynamicTriggerRegistry) -> BeforeTri
                         }
                     },
                     promote_requires_approval: false,
+                    delivery: TriggerDelivery::SubAgent,
                 }
             })
+        },
+    )
+}
+
+/// Wrap a `before_trigger_action` hook so triggers from configured MCP servers bypass the
+/// sub-agent. Two structural opt-ins, matched on the MCP `server_name` (never the model):
+///
+/// - `inject_summary_servers` → [`TriggerDelivery::InjectSummary`]: the pushed
+///   `payload_summary` is injected into the parent chat verbatim. No model call.
+/// - `inject_and_run_servers` → [`TriggerDelivery::InjectAndRun`]: the summary is injected
+///   into the parent chat AND one model turn runs in the parent's full context, so the agent
+///   reacts to the notification. `inject_and_run` wins if a server is in both sets.
+///
+/// Every other trigger falls through to `inner` (the dynamic-rule sub-agent path) unchanged.
+/// A configured server is treated as a notification feed: dynamic rules are not consulted for
+/// it. The engine still enforces the `[Trigger <id>] ` prefix on whatever is injected.
+pub fn direct_inject_action_hook(
+    inject_summary_servers: std::collections::HashSet<String>,
+    inject_and_run_servers: std::collections::HashSet<String>,
+    inner: BeforeTriggerActionHook,
+) -> BeforeTriggerActionHook {
+    Arc::new(
+        move |ctx: BeforeTriggerActionContext, cancel: CancellationToken| {
+            let server = match &ctx.trigger.source {
+                TriggerSource::Mcp { server_name, .. } => Some(server_name.clone()),
+                _ => None,
+            };
+            let run = server
+                .as_ref()
+                .is_some_and(|s| inject_and_run_servers.contains(s));
+            let summary_only = !run
+                && server
+                    .as_ref()
+                    .is_some_and(|s| inject_summary_servers.contains(s));
+
+            if run {
+                // Inject the summary as the prompt and run one turn in the parent context.
+                // Fall back to a generic line when the push carried no summary so the agent
+                // still has something to react to.
+                let prompt = ctx.trigger.payload_summary.clone().unwrap_or_else(|| {
+                    format!(
+                        "{} fired: {}",
+                        ctx.trigger.source_label, ctx.trigger.event_label
+                    )
+                });
+                return Box::pin(async move {
+                    TriggerAction {
+                        prompt,
+                        promote: PromoteAction::None,
+                        promote_requires_approval: false,
+                        delivery: TriggerDelivery::InjectAndRun,
+                    }
+                });
+            }
+            if summary_only {
+                let has_summary = ctx.trigger.payload_summary.is_some();
+                return Box::pin(async move {
+                    TriggerAction {
+                        prompt: String::new(),
+                        // Render the raw summary verbatim. If the push carried no summary
+                        // there is nothing to inject, so promote nothing — but still take the
+                        // inject path so the source never spins up a sub-agent.
+                        promote: if has_summary {
+                            PromoteAction::PromoteSummaryNow {
+                                template_body: Some("{{trigger.payload_summary}}".to_string()),
+                            }
+                        } else {
+                            PromoteAction::None
+                        },
+                        promote_requires_approval: false,
+                        delivery: TriggerDelivery::InjectSummary,
+                    }
+                });
+            }
+            inner(ctx, cancel)
         },
     )
 }

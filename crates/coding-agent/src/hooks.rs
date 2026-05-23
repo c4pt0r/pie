@@ -727,6 +727,7 @@ impl EventData {
             | HarnessEvent::TriggerCompleted { .. }
             | HarnessEvent::TriggerFailed { .. }
             | HarnessEvent::TriggerPromoted { .. }
+            | HarnessEvent::TriggerRequestsMainRun { .. }
             | HarnessEvent::PromotionPending { .. } => None,
         }
     }

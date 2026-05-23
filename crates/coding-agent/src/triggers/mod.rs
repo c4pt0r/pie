@@ -16,7 +16,8 @@ pub mod mcp_notification_hook;
 #[allow(unused_imports)]
 pub use dynamic::{
     DynamicTriggerCheckHook, ListTriggersTool, NewTriggerTool, RemoveTriggerTool,
-    SetTriggerStateTool, before_trigger_action_hook, fire_once_harness_listener, global_registry,
+    SetTriggerStateTool, before_trigger_action_hook, direct_inject_action_hook,
+    fire_once_harness_listener, global_registry,
 };
 #[allow(unused_imports)]
 pub use mcp_notification_hook::McpNotificationHook;
