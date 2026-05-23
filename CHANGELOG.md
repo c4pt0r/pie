@@ -282,6 +282,9 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
 
 ### Fixed
 
+- Slash commands that start an agent turn (`/new-trigger` and `/template <name>`) now route
+  through the same REPL-owned Ctrl-C abort path as normal prompts, so thinking/streaming/tool
+  execution can be interrupted consistently instead of being awaited inside command dispatch.
 - Anthropic `input_json_delta` fragments are now assembled into the final
   `ToolCall.arguments` object before `ToolCallEnd` / `Done`. Previously tool calls streamed
   their name and id correctly but ended with empty `{}` arguments, so downstream tools could

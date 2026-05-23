@@ -35,6 +35,7 @@ mod tools;
 mod triggers;
 mod tui;
 
+use std::future::Future;
 use std::io::IsTerminal as _;
 use std::io::Write as _;
 use std::time::{Duration, Instant};
@@ -219,19 +220,46 @@ async fn run_triggered_main_turn(harness: &AgentHarness, tui: &tui::Tui, trace_i
     }
     let short = &trace_id[..trace_id.len().min(8)];
     tui.system_line(&format!("running triggered turn (trace {short})"));
-    let run = harness.continue_();
-    tokio::pin!(run);
-    let res = tokio::select! {
-        biased;
-        res = &mut run => res,
-        _ = tokio::signal::ctrl_c() => {
-            harness.abort();
-            (&mut run).await
-        }
-    };
-    if let Err(e) = res {
+    let (res, aborted) = run_with_ctrl_c(harness, harness.continue_()).await;
+    if aborted {
+        tui.system_line("[aborted]");
+    } else if let Err(e) = res {
         tui.error_line(&format!("triggered turn: {e}"));
     }
+}
+
+/// Await harness work while treating the first Ctrl-C as an abort request.
+///
+/// This is intentionally shared by normal prompts, trigger-driven main turns, and any slash
+/// command that starts an agent turn. The REPL owns this signal handling so those paths do not
+/// accidentally bypass provider stream/tool cancellation.
+async fn run_with_ctrl_c<T, Fut>(harness: &AgentHarness, work: Fut) -> (T, bool)
+where
+    Fut: Future<Output = T>,
+{
+    let aborted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let aborted_for_signal = aborted.clone();
+    let signal_fut = async move {
+        let _ = tokio::signal::ctrl_c().await;
+        harness.abort();
+        aborted_for_signal.store(true, std::sync::atomic::Ordering::SeqCst);
+    };
+
+    tokio::pin!(work);
+    tokio::pin!(signal_fut);
+
+    let res = loop {
+        tokio::select! {
+            biased;
+            res = &mut work => break res,
+            _ = &mut signal_fut, if !aborted.load(std::sync::atomic::Ordering::SeqCst) => {
+                // The signal future is one-shot. Keep polling the work future so provider
+                // streams and tools get a clean cancellation path through the harness.
+            }
+        }
+    };
+
+    (res, aborted.load(std::sync::atomic::Ordering::SeqCst))
 }
 
 async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo) -> Result<()> {
@@ -661,6 +689,26 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
                 commands::CommandOutcome::AttachSkill { name } => {
                     pending_skill = Some(name);
                 }
+                commands::CommandOutcome::RunAgentPrompt {
+                    prompt,
+                    error_context,
+                } => {
+                    let (res, aborted) = run_with_ctrl_c(&harness, harness.prompt(prompt)).await;
+                    if aborted {
+                        tui.system_line("[aborted]");
+                    } else if let Err(e) = res {
+                        tui.error_line(&format!("{error_context}: {e}"));
+                    }
+                }
+                commands::CommandOutcome::RunPromptTemplate { name, vars } => {
+                    let (res, aborted) =
+                        run_with_ctrl_c(&harness, harness.prompt_from_template(&name, vars)).await;
+                    if aborted {
+                        tui.system_line("[aborted]");
+                    } else if let Err(e) = res {
+                        tui.error_line(&format!("template run failed: {e}"));
+                    }
+                }
                 commands::CommandOutcome::LoginSecret { provider } => {
                     match prompt_for_api_key(&provider).await {
                         Ok(token) => {
@@ -709,11 +757,6 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
             cli.image.clear();
         }
 
-        // Run the prompt while watching for Ctrl-C. On signal, ask the harness to abort and
-        // keep awaiting the future so it cleans up; the result tells us whether it aborted.
-        let aborted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let aborted_for_signal = aborted.clone();
-        let harness_for_signal = harness.clone();
         // Append to persistent history before sending. We store the raw user input (without
         // @file expansion) so recall surfaces what the user actually typed.
         history.append(input);
@@ -744,34 +787,13 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
                 session_runner.prompt(prompt_text).await
             }
         };
-        tokio::pin!(prompt_fut);
-        let signal_fut = async move {
-            // First Ctrl-C while a prompt is in flight: abort.
-            let _ = tokio::signal::ctrl_c().await;
-            harness_for_signal.abort();
-            aborted_for_signal.store(true, std::sync::atomic::Ordering::SeqCst);
-        };
-        tokio::pin!(signal_fut);
-
-        // `biased` keeps the prompt future polled first so a fast completion doesn't get
-        // pre-empted by a stale signal future.
-        let res = loop {
-            tokio::select! {
-                biased;
-                res = &mut prompt_fut => break res,
-                _ = &mut signal_fut, if !aborted.load(std::sync::atomic::Ordering::SeqCst) => {
-                    // The signal future will not re-arm after firing; subsequent ctrl_c during
-                    // the same turn falls through to default tokio handling. Loop back to
-                    // continue awaiting the prompt future for clean unwind.
-                }
-            }
-        };
+        let (res, aborted) = run_with_ctrl_c(&harness, prompt_fut).await;
 
         // Idempotent: if the listener already fired, this is a no-op. If the prompt
         // errored or aborted before any agent event, this clears the spinner here.
         spin.stop_sync();
 
-        if aborted.load(std::sync::atomic::Ordering::SeqCst) {
+        if aborted {
             tui.system_line("[aborted]");
         } else if let Err(e) = res {
             tui.error_line(&format!("{e}"));

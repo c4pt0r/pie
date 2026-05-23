@@ -33,6 +33,18 @@ pub enum CommandOutcome {
     /// Attach the named skill to the next user prompt. The REPL owns prompt assembly, so this
     /// stays explicit instead of going through the agent steering queue.
     AttachSkill { name: String },
+    /// Ask the REPL to run a prompt through the same active-turn path as normal user input.
+    /// Commands return this instead of awaiting the harness directly so Ctrl-C can abort
+    /// thinking, streaming, and tool execution consistently.
+    RunAgentPrompt {
+        prompt: String,
+        error_context: &'static str,
+    },
+    /// Ask the REPL to render and run a prompt template through the active-turn path.
+    RunPromptTemplate {
+        name: String,
+        vars: serde_json::Map<String, serde_json::Value>,
+    },
     /// Prompt for a provider credential without echoing the secret in the terminal input line.
     LoginSecret { provider: String },
 }
@@ -552,10 +564,7 @@ impl SlashCommand for TemplateCommand {
                 return CommandOutcome::Error(format!("expected k=v argument; got: {arg}"));
             }
         }
-        match ctx.harness.prompt_from_template(&name, vars).await {
-            Ok(()) => CommandOutcome::Handled,
-            Err(e) => CommandOutcome::Error(format!("template run failed: {e}")),
-        }
+        CommandOutcome::RunPromptTemplate { name, vars }
     }
 }
 
@@ -1167,7 +1176,7 @@ impl SlashCommand for NewTriggerCommand {
         "<natural-language trigger request>"
     }
 
-    async fn run(&self, argv: &[String], ctx: &CommandCtx<'_>) -> CommandOutcome {
+    async fn run(&self, argv: &[String], _ctx: &CommandCtx<'_>) -> CommandOutcome {
         let spec = argv.join(" ");
         if spec.trim().is_empty() {
             return CommandOutcome::Error(
@@ -1178,9 +1187,9 @@ impl SlashCommand for NewTriggerCommand {
         let prompt = format!(
             "The user asked pie to create a dynamic trigger. Extract the trigger condition and action from the request, then call NewTrigger with structured condition and action fields. Dynamic triggers fire once by default; set fire_once=false only when the user explicitly asks for a repeating trigger. Trigger output is shown in the TUI and audit by default; set promote_to_chat=true only when the user explicitly asks for trigger results to enter the main chat context or be visible to future turns. Do not require a fixed syntax. If either the condition or action is missing, ask one concise clarification question instead of calling tools.\n\nUser request:\n{spec}"
         );
-        match ctx.harness.prompt(prompt).await {
-            Ok(()) => CommandOutcome::Handled,
-            Err(e) => CommandOutcome::Error(format!("create trigger: {e}")),
+        CommandOutcome::RunAgentPrompt {
+            prompt,
+            error_context: "create trigger",
         }
     }
 }

@@ -216,6 +216,36 @@ async fn dispatch_unknown_command_returns_error_outcome() {
 }
 
 #[tokio::test]
+async fn dispatch_template_returns_repl_owned_agent_work() {
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage as Arc<dyn SessionStorage>);
+    let opts = AgentHarnessOptions::new(faux_model(), session.clone());
+    let harness = Arc::new(AgentHarness::new(opts));
+
+    let registry = commands::Registry::with_builtins();
+    let cwd = std::env::current_dir().unwrap();
+    let ctx = commands::CommandCtx {
+        harness: &harness,
+        session_id: "test",
+        log_path: None,
+        tool_count: 0,
+        cwd: &cwd,
+    };
+    let outcome = commands::dispatch("/template release version=1.2.3", &registry, &ctx).await;
+    match outcome {
+        commands::CommandOutcome::RunPromptTemplate { name, vars } => {
+            assert_eq!(name, "release");
+            assert_eq!(vars.get("version").and_then(|v| v.as_str()), Some("1.2.3"));
+        }
+        other => panic!("expected RunPromptTemplate outcome, got {other:?}"),
+    }
+    assert!(
+        session.entries().await.unwrap().is_empty(),
+        "/template dispatch should not run the agent directly; the REPL owns Ctrl-C abort handling"
+    );
+}
+
+#[tokio::test]
 async fn dispatch_triggers_status_is_read_only_and_available() {
     triggers::global_registry().clear_for_tests();
 
@@ -272,10 +302,24 @@ async fn dispatch_new_trigger_registers_dynamic_rule() {
         format!("/new-trigger \u{968f}\u{4fbf}\u{8bf4}\u{4e00}\u{53e5}: {condition}; {action}");
 
     let outcome = commands::dispatch(&prompt, &registry, &ctx).await;
+    let agent_prompt = match outcome {
+        commands::CommandOutcome::RunAgentPrompt {
+            prompt,
+            error_context,
+        } => {
+            assert_eq!(error_context, "create trigger");
+            assert!(prompt.contains(condition));
+            assert!(prompt.contains(action));
+            prompt
+        }
+        other => panic!("expected RunAgentPrompt outcome, got {other:?}"),
+    };
     assert!(
-        matches!(outcome, commands::CommandOutcome::Handled),
-        "outcome: {outcome:?}"
+        triggers::global_registry().list().is_empty(),
+        "/new-trigger dispatch should not run the agent directly; the REPL wraps the returned prompt with Ctrl-C abort handling"
     );
+
+    harness.prompt(agent_prompt).await.unwrap();
 
     let rules = triggers::global_registry().list();
     assert_eq!(rules.len(), 1);
