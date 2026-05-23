@@ -3305,3 +3305,226 @@ async fn promote_summary_truncation_final_length_includes_marker_under_cap() {
         summary.len()
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────────────────
+// PromotionCondition — structured authorization gate for
+// PromoteAction::PromoteSummaryWhenResultDetailsMatch. These tests pin the runtime
+// contract directly (not through coding-agent's dynamic.rs path). Coverage:
+//   - pointer-missing / value-not-array / empty-intersection → distinct skip reasons
+//   - matching path → returns the intersection
+//   - skip reasons stringify to stable audit identifiers
+// ─────────────────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn promotion_condition_any_of_returns_intersection_on_match() {
+    use pie_agent_core::PromotionCondition;
+
+    let details = serde_json::json!({
+        "dynamic_trigger": {
+            "matched_rule_ids": ["dyn-keep-a", "dyn-keep-b", "dyn-other"],
+        }
+    });
+    let condition = PromotionCondition::AnyOf {
+        json_pointer: "/dynamic_trigger/matched_rule_ids".into(),
+        any_of: vec!["dyn-keep-a".into(), "dyn-not-present".into()],
+    };
+
+    let matched = condition.evaluate(&details).expect("should match");
+    assert_eq!(
+        matched,
+        vec!["dyn-keep-a".to_string()],
+        "only allow-list members in the marker array intersect"
+    );
+}
+
+#[test]
+fn promotion_condition_any_of_fails_closed_when_pointer_missing() {
+    use pie_agent_core::{PromotionCondition, PromotionConditionSkipReason};
+
+    // Mirrors the runtime default state before any marker tool writes through the builder.
+    let details = serde_json::Value::Null;
+    let condition = PromotionCondition::AnyOf {
+        json_pointer: "/dynamic_trigger/matched_rule_ids".into(),
+        any_of: vec!["dyn-a".into()],
+    };
+    assert_eq!(
+        condition.evaluate(&details),
+        Err(PromotionConditionSkipReason::PointerMissing),
+    );
+    assert_eq!(
+        PromotionConditionSkipReason::PointerMissing.as_audit_str(),
+        "result_details_missing",
+    );
+}
+
+#[test]
+fn promotion_condition_any_of_fails_closed_when_value_not_array() {
+    use pie_agent_core::{PromotionCondition, PromotionConditionSkipReason};
+
+    let details = serde_json::json!({ "dynamic_trigger": { "matched_rule_ids": "dyn-a" } });
+    let condition = PromotionCondition::AnyOf {
+        json_pointer: "/dynamic_trigger/matched_rule_ids".into(),
+        any_of: vec!["dyn-a".into()],
+    };
+    // Even if the scalar value would substring-match, it MUST NOT promote — contract is
+    // "value is an array of IDs that intersect any_of," not free-form text matching.
+    assert_eq!(
+        condition.evaluate(&details),
+        Err(PromotionConditionSkipReason::ValueNotArray),
+    );
+    assert_eq!(
+        PromotionConditionSkipReason::ValueNotArray.as_audit_str(),
+        "result_details_not_array",
+    );
+}
+
+#[test]
+fn promotion_condition_any_of_fails_closed_when_empty_intersection() {
+    use pie_agent_core::{PromotionCondition, PromotionConditionSkipReason};
+
+    let details = serde_json::json!({
+        "dynamic_trigger": {
+            "matched_rule_ids": ["dyn-other-a", "dyn-other-b"],
+        }
+    });
+    let condition = PromotionCondition::AnyOf {
+        json_pointer: "/dynamic_trigger/matched_rule_ids".into(),
+        any_of: vec!["dyn-keep".into()],
+    };
+    assert_eq!(
+        condition.evaluate(&details),
+        Err(PromotionConditionSkipReason::EmptyIntersection),
+    );
+    assert_eq!(
+        PromotionConditionSkipReason::EmptyIntersection.as_audit_str(),
+        "no_matching_rule_id",
+    );
+}
+
+/// Authorization separation invariant: even if `summary` text contains the configured
+/// rule IDs, promotion does NOT fire when `details` is empty. Pins the contract that
+/// `summary` is display-only and never an authorization channel.
+#[tokio::test]
+async fn promote_when_result_details_match_does_not_consult_summary() {
+    use pie_agent_core::{BeforeTriggerActionContext, PromoteAction, PromotionCondition};
+
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage.clone() as Arc<dyn SessionStorage>);
+    let mut opts = AgentHarnessOptions::new(faux_model(), session.clone());
+    // Sub-agent reply embeds the rule id literally — would have triggered the deprecated
+    // substring path. With the structured path it MUST NOT promote because `details` stays
+    // null (no marker tool wired in this test).
+    opts.stream_fn = Some(faux_stream_fn("matched dyn-promote-me explicitly"));
+    opts.before_trigger_action = Some({
+        let hook: pie_agent_core::BeforeTriggerActionHook =
+            Arc::new(move |ctx: BeforeTriggerActionContext, _cancel| {
+                Box::pin(async move {
+                    pie_agent_core::TriggerAction {
+                        prompt: format!(
+                            "{} fired: {}",
+                            ctx.trigger.source_label, ctx.trigger.event_label
+                        ),
+                        promote: PromoteAction::PromoteSummaryWhenResultDetailsMatch {
+                            template_body: None,
+                            condition: PromotionCondition::AnyOf {
+                                json_pointer: "/dynamic_trigger/matched_rule_ids".into(),
+                                any_of: vec!["dyn-promote-me".into()],
+                            },
+                        },
+                        promote_requires_approval: false,
+                    }
+                })
+            });
+        hook
+    });
+    let harness = AgentHarness::new(opts);
+
+    let events = Arc::new(std::sync::Mutex::new(Vec::<HarnessEvent>::new()));
+    let sink = events.clone();
+    let _unsub = harness.subscribe_harness(Arc::new(move |ev| {
+        sink.lock().unwrap().push(ev);
+    }));
+
+    let _ = harness
+        .handle_trigger(sample_trigger("k-struct", "trace-struct"))
+        .await;
+    wait_for_event(&events, 5, |evs| {
+        evs.iter().find_map(|e| match e {
+            HarnessEvent::TriggerCompleted { trace_id, .. } if trace_id == "trace-struct" => {
+                Some(())
+            }
+            _ => None,
+        })
+    })
+    .await
+    .expect("must complete");
+
+    let entries = session.entries().await.unwrap();
+
+    // 1. No parent Message inserted — summary text alone MUST NOT authorize promotion.
+    assert!(
+        !entries
+            .iter()
+            .any(|e| matches!(e, SessionTreeEntry::Message { .. })),
+        "summary substring is not an authorization channel; structured details required",
+    );
+
+    // 2. A trigger_promotion audit recorded the skip with a stable reason ID.
+    let skipped = entries
+        .iter()
+        .find_map(|e| match e {
+            SessionTreeEntry::Custom {
+                custom_type, data, ..
+            } if custom_type == "trigger_promotion" => data.clone(),
+            _ => None,
+        })
+        .expect("skipped promotion must still audit");
+    assert_eq!(skipped["state"], "skipped");
+    assert_eq!(skipped["reason"], "result_details_missing");
+    assert_eq!(
+        skipped["promote_kind"], "promote_summary_when_result_details_match",
+        "audit must identify the structured-promote path"
+    );
+
+    // 3. TriggerCompleted event reports details as null (no marker tool wired yet).
+    let evs = events.lock().unwrap().clone();
+    let completed = evs
+        .iter()
+        .find_map(|e| match e {
+            HarnessEvent::TriggerCompleted {
+                trace_id, details, ..
+            } if trace_id == "trace-struct" => Some(details.clone()),
+            _ => None,
+        })
+        .expect("TriggerCompleted");
+    assert_eq!(
+        completed,
+        serde_json::Value::Null,
+        "details defaults to null until a marker tool writes through the builder",
+    );
+}
+
+/// PermissionCategory::ControlPlaneWrite is added to the enum and defaults to Allow at the
+/// runtime layer. Downstream PRs (Tools-MCP for tools, CLI-TUI for slash commands) plug in
+/// the danger classifier + Prompt path; the runtime stays permissive so adding the category
+/// is a non-breaking infrastructure change.
+#[test]
+fn control_plane_write_category_defaults_to_allow_at_runtime_layer() {
+    use pie_agent_core::{PermissionCategory, PermissionDecision, PermissionPolicy};
+
+    let policy = PermissionPolicy::default_for_coding_agent();
+    // Even with bash-tool name + a normally-dangerous arg, the ControlPlaneWrite category
+    // should fall through to Allow because the runtime policy has no category-specific
+    // classifier wired. Tools-MCP's follow-up PR adds the danger classifier here.
+    let args = serde_json::json!({ "command": "rm -rf /tmp/foo" });
+    match policy.evaluate_with_category(PermissionCategory::ControlPlaneWrite, "bash", &args) {
+        PermissionDecision::Allow => {}
+        other => panic!("ControlPlaneWrite must default to Allow at runtime; got {other:?}"),
+    }
+    // Sanity check the legacy `evaluate` still uses the Tool category (bash classifier)
+    // so backwards compatibility holds.
+    match policy.evaluate("bash", &args) {
+        PermissionDecision::Deny { .. } => {}
+        other => panic!("Tool-category bash danger classifier must still deny; got {other:?}"),
+    }
+}

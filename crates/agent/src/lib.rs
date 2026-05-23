@@ -27,8 +27,8 @@ pub use harness::{
     agent_harness::{
         AgentHarness, AgentHarnessOptions, BeforeTriggerActionContext, BeforeTriggerActionHook,
         BeforeTriggerContext, BeforeTriggerDecision, BeforeTriggerHook, HarnessEvent,
-        HarnessListener, NotificationStatusSnapshot, PromoteAction, RunningTriggerState,
-        TriggerAction,
+        HarnessListener, NotificationStatusSnapshot, PromoteAction, PromotionCondition,
+        PromotionConditionSkipReason, RunningTriggerState, TriggerAction,
     },
     compaction::{
         branch_summarization::{BranchSummaryResult, summarize_branch},
@@ -50,7 +50,7 @@ pub use harness::{
         DynNotificationHook, HookError, HookFuture, HookState, NotificationHook,
         NotificationHookStatus, TriggerSink,
     },
-    permission::{PermissionDecision, PermissionPolicy},
+    permission::{PermissionCategory, PermissionDecision, PermissionPolicy},
     prompt_templates::{LoadTemplatesOutput, PromptTemplateRegistry, load_templates},
     session::{
         jsonl_repo::JsonlSessionRepo,

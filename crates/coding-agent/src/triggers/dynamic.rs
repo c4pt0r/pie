@@ -575,6 +575,12 @@ pub fn before_trigger_action_hook(registry: DynamicTriggerRegistry) -> BeforeTri
                     promote: if promote_rule_ids.is_empty() {
                         PromoteAction::None
                     } else {
+                        // Transitional: still uses the deprecated summary-substring path.
+                        // Tools-MCP's follow-up PR migrates this to
+                        // `PromoteAction::PromoteSummaryWhenResultDetailsMatch` with
+                        // `PromotionCondition::AnyOf` once the `mark_dynamic_rule_matched`
+                        // tool is wired into the sub-agent. Allowed locally until then.
+                        #[allow(deprecated)]
                         PromoteAction::PromoteSummaryWhenSummaryContains {
                             template_body: None,
                             required_substrings: promote_rule_ids,

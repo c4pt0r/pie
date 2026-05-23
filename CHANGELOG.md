@@ -97,6 +97,38 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
 
 ### Added — Framework
 
+- **Trigger promotion — structured authorization (RFC 1 / commit `5397199` fix-forward
+  infra)** Runtime gains a structured promotion-gate path that closes the
+  free-form-summary authorization channel introduced by the dynamic-trigger workflow:
+  `PromoteAction::PromoteSummaryWhenResultDetailsMatch { template_body, condition }` and
+  `PromotionCondition::AnyOf { json_pointer, any_of }` evaluate against the sub-agent's
+  structured `trigger_result.details` (RFC 6901 pointer + array intersection). All four
+  skip paths (`PointerMissing`, `ValueNotArray`, `EmptyIntersection`, plus the matched
+  `Ok(_)` branch) are pinned with unit tests; the audit `state: "skipped"` records a
+  stable machine-readable `reason` (`result_details_missing` / `result_details_not_array`
+  / `no_matching_rule_id`) so downstream tools can compare against an enum rather than a
+  sentence. `HarnessEvent::TriggerCompleted` and the `trigger_result` audit blob gain a
+  `details: serde_json::Value` field — defaults to `Null`; populated through marker tools
+  Tools-MCP wires in a follow-up PR. The previous
+  `PromoteAction::PromoteSummaryWhenSummaryContains` variant is `#[deprecated]` and
+  retained for transition only — coding-agent's `dynamic.rs` keeps using it locally with
+  `#[allow(deprecated)]` until Tools-MCP migrates the path.
+- **Trigger promotion — race fix.** `apply_promotion`'s final step that mirrors the
+  promoted user message into the parent `Agent`'s in-memory state used to push directly
+  into `state.messages`, racing the parent agent loop if the parent was mid-stream.
+  Switched to a `is_streaming()` branch: streaming parent → `enqueue_follow_up(...)` so
+  the loop drains the message at a turn boundary; idle parent → direct push so the next
+  `prompt()` sees it immediately without an explicit rehydrate. Either path the message
+  has already been durably persisted via `Session::append_message`; this just avoids the
+  mid-turn ordering hazard where `[…, user_promoted, assistant_response]` would otherwise
+  look like the assistant answered a question that hadn't been asked.
+- **`PermissionCategory::ControlPlaneWrite`.** New permission category for persistent
+  agent self-modification (trigger rule create/remove/enable/disable, skill / hook
+  install). `PermissionPolicy::evaluate_with_category(category, tool, args)` is the new
+  entry point; the existing `evaluate(tool, args)` delegates to `Tool` for backward
+  compatibility. Runtime defaults `ControlPlaneWrite` to `Allow` so adding the category is
+  non-breaking; Tools-MCP and CLI-TUI follow-up PRs wire the danger classifier + Prompt
+  path when they opt their writers in.
 - **#17** `HarnessEvent` typed bus on `AgentHarness` (SessionStart / Compaction /
   Branch). Prompt-template file loader (`<cwd>/.pie/templates/` overrides
   `~/.pie/templates/`) + `/template <name> [k=v ...]` slash command.

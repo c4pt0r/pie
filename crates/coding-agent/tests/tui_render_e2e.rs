@@ -609,6 +609,7 @@ fn trigger_completion_renders_live_result_line() {
             trace_id: "trace-live-result".into(),
             summary: Some("wrote /tmp/trigger-output".into()),
             cost_usd: None,
+            details: serde_json::Value::Null,
         },
         &mut buf,
     );
@@ -631,6 +632,7 @@ fn trigger_completion_starts_on_new_line_while_readline_prompt_is_idle() {
             trace_id: "trace-idle-result".into(),
             summary: Some("hello from trigger".into()),
             cost_usd: None,
+            details: serde_json::Value::Null,
         },
         &mut buf,
     );
@@ -681,6 +683,7 @@ fn dynamic_poll_no_match_stays_quiet() {
             trace_id: "trace-dynamic-check".into(),
             summary: Some("no dynamic trigger rule matched".into()),
             cost_usd: None,
+            details: serde_json::Value::Null,
         },
         &mut buf,
     );

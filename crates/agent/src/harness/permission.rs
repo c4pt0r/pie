@@ -31,6 +31,28 @@ pub enum PermissionDecision {
     Deny { reason: String },
 }
 
+/// Category of the operation being evaluated. Lets a single policy fan out classification
+/// logic per category instead of conflating the bash danger classifier with persistent
+/// agent self-modification (which has a larger blast radius than a one-shot tool call).
+///
+/// New categories should be added sparingly — each adds a permission surface the user has
+/// to reason about. Today:
+///
+/// - [`Self::Tool`] is the default for all existing tool calls; behavior unchanged.
+/// - [`Self::ControlPlaneWrite`] covers persistent agent self-modification (dynamic
+///   trigger rule create/remove/enable/disable, skill install/uninstall, hook
+///   install/uninstall). The rule body becomes a future agent prompt, so a writer should
+///   apply at least the same scrutiny as a one-shot bash invocation — and often more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionCategory {
+    /// Default for stateless tool calls (read/write/edit/bash/grep/etc).
+    Tool,
+    /// Persistent agent self-modification — trigger rule writes, skill writes, hook
+    /// writes. Tools-MCP and CLI-TUI opt their writers into this category; runtime
+    /// defaults to [`PermissionDecision::Allow`] so adding the category is non-breaking.
+    ControlPlaneWrite,
+}
+
 /// One rule in the dangerous-bash corpus. Cheap predicates run before the regex set so the
 /// expensive case (`RegexSet::matches`) only fires when no targeted classifier already
 /// fired.
@@ -73,8 +95,29 @@ impl PermissionPolicy {
         }
     }
 
-    /// Evaluate a single tool call against the policy. Pure function — no IO.
+    /// Evaluate a single tool call against the policy in the default [`PermissionCategory::Tool`]
+    /// category. Preserved for backwards compatibility — new callers that want to evaluate
+    /// a non-default category should use [`Self::evaluate_with_category`].
     pub fn evaluate(&self, tool_name: &str, args: &serde_json::Value) -> PermissionDecision {
+        self.evaluate_with_category(PermissionCategory::Tool, tool_name, args)
+    }
+
+    /// Evaluate a single tool call against the policy in the given category. Pure function — no IO.
+    ///
+    /// Runtime ships a permissive default for [`PermissionCategory::ControlPlaneWrite`]
+    /// (returns `Allow` unconditionally) so adding the category is non-breaking; downstream
+    /// crates wire a category-specific classifier when they opt their writers in.
+    pub fn evaluate_with_category(
+        &self,
+        category: PermissionCategory,
+        tool_name: &str,
+        args: &serde_json::Value,
+    ) -> PermissionDecision {
+        if category == PermissionCategory::ControlPlaneWrite {
+            // Default policy in runtime: no classifier wired yet. Tools-MCP / CLI-TUI's
+            // follow-up PRs add the danger classifier + Prompt path here.
+            return PermissionDecision::Allow;
+        }
         if !self.bash_tool_names.iter().any(|n| n == tool_name) {
             return PermissionDecision::Allow;
         }
