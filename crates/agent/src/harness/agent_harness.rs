@@ -1385,25 +1385,36 @@ async fn run_trigger_action(
 
     // 5. Compute summary. The sub-agent's final assistant message is our best
     // first-cut summary for 5a (no model-driven self-summary yet — that's a 5b polish).
-    // Cost comes from the sub-agent's CostTracker via state.
     let (success, summary, message_count) = compute_sub_agent_outcome(&sub_agent, &run_outcome);
-    // CostTracker is private to harness; the sub-agent here is bare (no harness wrapper),
-    // so cost is unknown at this layer. Sub-PR 5b can wrap sub-agent in a mini-harness or
-    // expose the agent-side usage totals. For now report 0.0 and rely on parent cost
-    // tracking (parent's tools include the sub-agent's via inheritance — usage flows the
-    // same way through `MessageEnd`).
-    let cost_usd: f64 = 0.0;
+    // Compute failure reason once (used in both the audit and the terminal event so the
+    // jsonl record carries enough context to explain `success: false` after `--resume`).
+    let failure_reason: Option<String> = if success {
+        None
+    } else {
+        Some(match &run_outcome {
+            Err(AgentRunError::Other(msg)) if msg == "aborted" => "aborted".to_string(),
+            Err(e) => format!("{e}"),
+            Ok(_) => "unknown failure".to_string(),
+        })
+    };
 
     // 6. Persist `trigger_result` to PARENT session. Best-effort: on failure we emit a
-    // `PersistenceError` reflux event (same shape as `trigger_audit` failures in
-    // sub-PR 2) but still proceed to remove from registry + emit terminal event.
+    // `PersistenceError` reflux event (same shape as `trigger_audit` failures in sub-PR 2)
+    // but still proceed to remove from registry + emit terminal event.
+    //
+    // `cost_usd` is omitted (Option/null) in 5a because the bare sub-`Agent` here has no
+    // `CostTracker` wrapper — the parent `AgentHarness::cost` only auto-accrues for the
+    // parent's own listener. Sub-PR 5b/5c will add a sub-harness wrapper or hook the
+    // sub-agent's `MessageEnd` events into the parent `CostTracker`. Reporting `0.0`
+    // today would lie about a real measurement; `null` honestly says "unknown".
     let result_data = serde_json::json!({
         "trace_id": trace_id,
         "branch_id": serde_json::Value::Null,
         "success": success,
         "summary": summary,
         "message_count": message_count,
-        "cost_usd": cost_usd,
+        "cost_usd": serde_json::Value::Null,
+        "reason": failure_reason,
     });
     let audit_write_result = parent_session
         .append_custom("trigger_result", Some(result_data))
@@ -1437,20 +1448,15 @@ async fn run_trigger_action(
             HarnessEvent::TriggerCompleted {
                 trace_id: trace_id.clone(),
                 summary,
-                cost_usd,
+                cost_usd: 0.0,
             },
         );
     } else {
-        let reason = match run_outcome {
-            Err(AgentRunError::Other(msg)) if msg == "aborted" => "aborted".to_string(),
-            Err(e) => format!("{e}"),
-            Ok(_) => "unknown failure".to_string(),
-        };
         emit_from_listeners(
             &listeners,
             HarnessEvent::TriggerFailed {
                 trace_id: trace_id.clone(),
-                reason,
+                reason: failure_reason.unwrap_or_else(|| "unknown failure".to_string()),
             },
         );
     }
@@ -1502,9 +1508,14 @@ fn last_assistant_text(state: &AgentState) -> Option<String> {
     }
     const SUMMARY_CAP_BYTES: usize = 4096;
     if text.len() > SUMMARY_CAP_BYTES {
-        // Cap on byte length to honor the audit boundary; we don't worry about cutting
-        // mid-codepoint here because the summary is preview-only and the cap is generous.
-        text.truncate(SUMMARY_CAP_BYTES);
+        // Walk back from the byte cap to the previous UTF-8 char boundary so `truncate`
+        // never lands inside a multi-byte codepoint (which would panic). The cap is
+        // generous; in practice the boundary walk shifts at most 3 bytes.
+        let mut cut = SUMMARY_CAP_BYTES;
+        while cut > 0 && !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
         text.push_str("…[truncated]");
     }
     Some(text)
