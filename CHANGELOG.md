@@ -282,6 +282,12 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
 
 ### Fixed
 
+- TUI tool output is now display-capped independently from the model-facing tool result.
+  Long tool output previews keep the first 20 lines and last 4 lines (errors get a larger
+  40/8-line budget), truncate overlong lines on UTF-8 character boundaries, and show a
+  marker explaining that the full output remains available to the agent. Repeated
+  `ToolExecutionUpdate` progress for the same tool call replaces the existing feed block
+  instead of appending unbounded intermediate output.
 - `McpClient::tools_call` now races the caller's `CancellationToken` against the response
   and request_timeout. When cancel fires before the server replies, the inflight slot is
   released, a best-effort `notifications/cancelled` frame (MCP spec 2025-03-26) is sent to

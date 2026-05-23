@@ -264,7 +264,8 @@ impl App {
                         lines.extend(t.text.lines().map(ToString::to_string));
                     }
                 }
-                self.feed.push_tool_result(lines, tr.is_error);
+                self.feed
+                    .push_tool_result(tr.tool_call_id.clone(), lines, tr.is_error);
             }
             AgentMessage::Custom(_) => {}
         }
@@ -1009,6 +1010,7 @@ fn print_headless_update(update: &FeedUpdate, at_line_start: &mut bool) {
             let _ = writeln!(out, "⚙ {name}{args}");
             *at_line_start = true;
         }
+        FeedUpdate::ToolProgress { .. } => {}
         FeedUpdate::ToolEnd { lines, .. } => {
             for line in lines {
                 let _ = writeln!(out, "    {line}");

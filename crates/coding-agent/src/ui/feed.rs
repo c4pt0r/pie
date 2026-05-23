@@ -37,9 +37,24 @@ pub enum FeedUpdate {
     TurnEnd,
     TextDelta(String),
     ThinkingDelta(String),
-    ToolStart { name: String, args: String },
-    ToolEnd { lines: Vec<String>, is_error: bool },
-    Plain { text: String, level: Level },
+    ToolStart {
+        name: String,
+        args: String,
+    },
+    ToolProgress {
+        tool_call_id: String,
+        lines: Vec<String>,
+        is_error: bool,
+    },
+    ToolEnd {
+        tool_call_id: String,
+        lines: Vec<String>,
+        is_error: bool,
+    },
+    Plain {
+        text: String,
+        level: Level,
+    },
 }
 
 /// One renderable unit in the feed.
@@ -48,9 +63,19 @@ enum Block {
     User(String),
     Assistant(String),
     Thinking(String),
-    Tool { name: String, args: String },
-    ToolResult { lines: Vec<String>, is_error: bool },
-    Plain { text: String, level: Level },
+    Tool {
+        name: String,
+        args: String,
+    },
+    ToolResult {
+        tool_call_id: String,
+        lines: Vec<String>,
+        is_error: bool,
+    },
+    Plain {
+        text: String,
+        level: Level,
+    },
 }
 
 /// Which streaming block (if any) is currently open for appends.
@@ -118,9 +143,40 @@ impl Feed {
         });
     }
 
-    pub fn push_tool_result(&mut self, lines: Vec<String>, is_error: bool) {
+    pub fn push_tool_result(
+        &mut self,
+        tool_call_id: impl Into<String>,
+        lines: Vec<String>,
+        is_error: bool,
+    ) {
         self.open = Open::None;
-        self.blocks.push(Block::ToolResult { lines, is_error });
+        self.blocks.push(Block::ToolResult {
+            tool_call_id: tool_call_id.into(),
+            lines,
+            is_error,
+        });
+    }
+
+    fn upsert_tool_result(&mut self, tool_call_id: String, lines: Vec<String>, is_error: bool) {
+        self.open = Open::None;
+        if let Some(Block::ToolResult {
+            lines: existing,
+            is_error: existing_is_error,
+            ..
+        }) = self.blocks.iter_mut().rev().find(|block| {
+            matches!(
+                block,
+                Block::ToolResult {
+                    tool_call_id: id,
+                    ..
+                } if id == &tool_call_id
+            )
+        }) {
+            *existing = lines;
+            *existing_is_error = is_error;
+            return;
+        }
+        self.push_tool_result(tool_call_id, lines, is_error);
     }
 
     pub fn apply(&mut self, update: FeedUpdate) {
@@ -132,7 +188,16 @@ impl Feed {
             FeedUpdate::TextDelta(delta) => self.text_delta(&delta),
             FeedUpdate::ThinkingDelta(delta) => self.thinking_delta(&delta),
             FeedUpdate::ToolStart { name, args } => self.push_tool(name, args),
-            FeedUpdate::ToolEnd { lines, is_error } => self.push_tool_result(lines, is_error),
+            FeedUpdate::ToolProgress {
+                tool_call_id,
+                lines,
+                is_error,
+            }
+            | FeedUpdate::ToolEnd {
+                tool_call_id,
+                lines,
+                is_error,
+            } => self.upsert_tool_result(tool_call_id, lines, is_error),
             FeedUpdate::Plain { text, level } => self.push_plain(text, level),
         }
     }
@@ -194,7 +259,9 @@ impl Feed {
                     let text = format!("⚙ {name}{args}");
                     push_paragraphs(&mut out, &text, TOOL_STYLE, None, width);
                 }
-                Block::ToolResult { lines, is_error } => {
+                Block::ToolResult {
+                    lines, is_error, ..
+                } => {
                     let style = if *is_error {
                         Style::default().fg(Color::Red)
                     } else {
@@ -227,6 +294,12 @@ const THINKING_STYLE: Style = Style::new()
     .fg(Color::DarkGray)
     .add_modifier(Modifier::ITALIC);
 const TOOL_STYLE: Style = Style::new().fg(Color::Yellow);
+pub const TOOL_OUTPUT_HEAD_LINES: usize = 20;
+pub const TOOL_OUTPUT_TAIL_LINES: usize = 4;
+pub const TOOL_OUTPUT_ERROR_HEAD_LINES: usize = 40;
+pub const TOOL_OUTPUT_ERROR_TAIL_LINES: usize = 8;
+pub const TOOL_OUTPUT_MAX_LINE_CHARS: usize = 200;
+pub const TOOL_OUTPUT_ERROR_MAX_LINE_CHARS: usize = 240;
 
 fn style_for_level(level: Level) -> Style {
     match level {
@@ -326,6 +399,74 @@ pub fn preview(args: &serde_json::Value) -> String {
     format!("({})", parts.join(", "))
 }
 
+/// Build a compact, display-only preview of tool output. The full tool result still flows to
+/// the model/session; this only limits what the TUI/feed shows while tools are running.
+pub fn compact_tool_output_lines(lines: Vec<String>, is_error: bool) -> Vec<String> {
+    let (head_lines, tail_lines, max_line_chars) = if is_error {
+        (
+            TOOL_OUTPUT_ERROR_HEAD_LINES,
+            TOOL_OUTPUT_ERROR_TAIL_LINES,
+            TOOL_OUTPUT_ERROR_MAX_LINE_CHARS,
+        )
+    } else {
+        (
+            TOOL_OUTPUT_HEAD_LINES,
+            TOOL_OUTPUT_TAIL_LINES,
+            TOOL_OUTPUT_MAX_LINE_CHARS,
+        )
+    };
+    let original_line_count = lines.len();
+    let mut hidden_bytes = 0usize;
+    let mut compacted: Vec<String> = lines
+        .into_iter()
+        .map(|line| {
+            let kept_bytes: usize = line.chars().take(max_line_chars).map(char::len_utf8).sum();
+            if kept_bytes < line.len() {
+                hidden_bytes += line.len() - kept_bytes;
+                truncate_chars(&line, max_line_chars)
+            } else {
+                line
+            }
+        })
+        .collect();
+
+    let max_lines = head_lines + tail_lines;
+    let mut hidden_lines = 0usize;
+    if compacted.len() > max_lines {
+        hidden_lines = compacted.len() - max_lines;
+        let tail = compacted.split_off(compacted.len() - tail_lines);
+        let omitted = compacted.split_off(head_lines);
+        hidden_bytes += omitted.iter().map(|line| line.len() + 1).sum::<usize>();
+        compacted.push(truncation_marker(hidden_bytes, hidden_lines));
+        compacted.extend(tail);
+    } else if hidden_bytes > 0 {
+        compacted.push(truncation_marker(hidden_bytes, hidden_lines));
+    }
+
+    if original_line_count == 0 {
+        Vec::new()
+    } else {
+        compacted
+    }
+}
+
+fn truncation_marker(hidden_bytes: usize, hidden_lines: usize) -> String {
+    match (hidden_bytes, hidden_lines) {
+        (0, 0) => {
+            "… truncated for display; full output remains available to the agent …".to_string()
+        }
+        (bytes, 0) => format!(
+            "… truncated {bytes} bytes for display; full output remains available to the agent …"
+        ),
+        (0, lines) => format!(
+            "… truncated {lines} lines for display; full output remains available to the agent …"
+        ),
+        (bytes, lines) => format!(
+            "… truncated {bytes} bytes / {lines} lines for display; full output remains available to the agent …"
+        ),
+    }
+}
+
 /// Truncate to at most `max_chars` characters (not bytes — never splits a multi-byte glyph),
 /// appending an ellipsis when shortened.
 pub fn truncate_chars(s: &str, max_chars: usize) -> String {
@@ -377,6 +518,7 @@ mod tests {
             args: "(path=\"x\")".into(),
         });
         feed.apply(FeedUpdate::ToolEnd {
+            tool_call_id: "tool-1".into(),
             lines: vec!["line a".into(), "line b".into()],
             is_error: false,
         });
@@ -423,5 +565,86 @@ mod tests {
         assert!(rendered.contains("you ▸ do the thing"));
         // a blank line separates the banner from the user turn
         assert!(rendered.contains("\n\nyou ▸"));
+    }
+
+    #[test]
+    fn compact_tool_output_keeps_short_output_unchanged() {
+        let lines = vec!["ok".to_string(), "done".to_string()];
+        assert_eq!(compact_tool_output_lines(lines.clone(), false), lines);
+    }
+
+    #[test]
+    fn compact_tool_output_keeps_head_and_tail_with_summary() {
+        let lines: Vec<String> = (0..40).map(|i| format!("line {i}")).collect();
+        let compacted = compact_tool_output_lines(lines, false);
+
+        assert!(compacted.len() <= TOOL_OUTPUT_HEAD_LINES + TOOL_OUTPUT_TAIL_LINES + 1);
+        assert_eq!(compacted.first().map(String::as_str), Some("line 0"));
+        assert!(compacted.iter().any(|line| line.contains("truncated")));
+        assert!(
+            compacted
+                .iter()
+                .any(|line| line.contains("full output remains available to the agent"))
+        );
+        assert_eq!(compacted.last().map(String::as_str), Some("line 39"));
+    }
+
+    #[test]
+    fn compact_tool_output_allows_more_error_context() {
+        let lines: Vec<String> = (0..36).map(|i| format!("line {i}")).collect();
+
+        assert!(
+            compact_tool_output_lines(lines.clone(), false)
+                .iter()
+                .any(|line| line.contains("truncated"))
+        );
+        assert_eq!(compact_tool_output_lines(lines, true).len(), 36);
+    }
+
+    #[test]
+    fn compact_tool_output_truncates_utf8_safely() {
+        let long = "你好".repeat(TOOL_OUTPUT_MAX_LINE_CHARS + 10);
+        let compacted = compact_tool_output_lines(vec![long], false);
+
+        assert!(compacted[0].ends_with('…'));
+        assert!(compacted.iter().any(|line| line.contains("truncated")));
+    }
+
+    #[test]
+    fn tool_progress_for_same_call_is_replaced_not_appended() {
+        let mut feed = Feed::new();
+        feed.apply(FeedUpdate::ToolProgress {
+            tool_call_id: "tool-1".into(),
+            lines: vec!["old progress".into()],
+            is_error: false,
+        });
+        feed.apply(FeedUpdate::ToolProgress {
+            tool_call_id: "tool-1".into(),
+            lines: vec!["new progress".into()],
+            is_error: false,
+        });
+
+        let rendered = plain_text(&feed.lines(80));
+        assert!(!rendered.contains("old progress"));
+        assert!(rendered.contains("new progress"));
+    }
+
+    #[test]
+    fn final_tool_output_replaces_progress_for_same_call() {
+        let mut feed = Feed::new();
+        feed.apply(FeedUpdate::ToolProgress {
+            tool_call_id: "tool-1".into(),
+            lines: vec!["progress".into()],
+            is_error: false,
+        });
+        feed.apply(FeedUpdate::ToolEnd {
+            tool_call_id: "tool-1".into(),
+            lines: vec!["final result".into()],
+            is_error: false,
+        });
+
+        let rendered = plain_text(&feed.lines(80));
+        assert!(!rendered.contains("progress"));
+        assert!(rendered.contains("final result"));
     }
 }
