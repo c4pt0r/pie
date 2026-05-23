@@ -1,202 +1,97 @@
-use std::borrow::Cow;
-
-use rustyline::completion::{Completer, Pair};
-use rustyline::highlight::Highlighter;
-use rustyline::hint::Hinter;
-use rustyline::validate::Validator;
-use rustyline::{Context, Helper, Result};
+//! Slash-command completion for the TUI input box.
+//!
+//! Previously this wrapped `rustyline`'s `Completer`/`Hinter` traits. The full-screen TUI owns
+//! its own input widget (`tui-textarea`), so this is now a plain matcher: given the current
+//! input line it returns the slash commands whose names share the typed prefix. The app renders
+//! those as a completion popup above the input and cycles/accepts them on Tab.
 
 use crate::commands::Registry;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct SlashCompletion {
-    command: String,
-    display: String,
+/// Precomputed, sorted, de-duplicated list of `/command` strings (canonical names + aliases).
+#[derive(Clone, Debug, Default)]
+pub struct SlashCompleter {
+    commands: Vec<String>,
 }
 
-/// Rustyline helper for slash-command completion and inline hints.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct SlashCommandHelper {
-    completions: Vec<SlashCompletion>,
-}
-
-impl SlashCommandHelper {
+impl SlashCompleter {
     pub fn from_registry(registry: &Registry) -> Self {
-        let mut completions = Vec::new();
+        let mut commands = Vec::new();
         for command in registry.commands() {
-            let canonical = format!("/{}", command.name());
-            completions.push(SlashCompletion {
-                command: canonical.clone(),
-                display: display_for(&canonical, command.description(), command.usage(), None),
-            });
+            commands.push(format!("/{}", command.name()));
             for alias in command.aliases() {
-                let alias_command = format!("/{alias}");
-                completions.push(SlashCompletion {
-                    command: alias_command.clone(),
-                    display: display_for(
-                        &alias_command,
-                        command.description(),
-                        command.usage(),
-                        Some(&canonical),
-                    ),
-                });
+                commands.push(format!("/{alias}"));
             }
         }
-        completions.sort_by(|a, b| a.command.cmp(&b.command));
-        completions.dedup_by(|a, b| a.command == b.command);
-        Self { completions }
+        commands.sort();
+        commands.dedup();
+        Self { commands }
     }
 
-    fn complete_line(&self, line: &str, pos: usize) -> Option<(usize, Vec<Pair>)> {
-        let (start, prefix) = slash_prefix_at_cursor(line, pos)?;
-        let matches = self
-            .completions
+    /// Completions for the current input. Returns matching `/command` strings when `line` is a
+    /// bare slash token (`/`, `/he`, …) with no whitespace yet; otherwise empty.
+    pub fn matches(&self, line: &str) -> Vec<String> {
+        let Some(token) = slash_token(line) else {
+            return Vec::new();
+        };
+        let matches: Vec<String> = self
+            .commands
             .iter()
-            .filter(|entry| entry.command.starts_with(prefix))
-            .map(|entry| Pair {
-                display: entry.display.clone(),
-                replacement: entry.command.clone(),
-            })
-            .collect::<Vec<_>>();
-        Some((start, matches))
-    }
-
-    fn hint_line(&self, line: &str, pos: usize) -> Option<String> {
-        let (_start, prefix) = slash_prefix_at_cursor(line, pos)?;
-        if prefix.len() <= 1 {
-            return None;
+            .filter(|c| c.starts_with(token))
+            .cloned()
+            .collect();
+        // Nothing left to complete when the only match is what the user already typed.
+        if matches.len() == 1 && matches[0] == token {
+            return Vec::new();
         }
-        let mut matches = self
-            .completions
-            .iter()
-            .filter(|entry| entry.command.starts_with(prefix));
-        let first = matches.next()?;
-        if matches.next().is_some() || first.command == prefix {
-            return None;
-        }
-        Some(first.command[prefix.len()..].to_string())
+        matches
     }
 }
 
-impl Completer for SlashCommandHelper {
-    type Candidate = Pair;
-
-    fn complete(
-        &self,
-        line: &str,
-        pos: usize,
-        _ctx: &Context<'_>,
-    ) -> Result<(usize, Vec<Self::Candidate>)> {
-        Ok(self.complete_line(line, pos).unwrap_or((pos, Vec::new())))
-    }
-}
-
-impl Hinter for SlashCommandHelper {
-    type Hint = String;
-
-    fn hint(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> Option<Self::Hint> {
-        self.hint_line(line, pos)
-    }
-}
-
-impl Highlighter for SlashCommandHelper {
-    fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
-        Cow::Borrowed(hint)
-    }
-}
-
-impl Validator for SlashCommandHelper {}
-
-impl Helper for SlashCommandHelper {}
-
-fn display_for(command: &str, description: &str, usage: &str, alias_for: Option<&str>) -> String {
-    let mut display = command.to_string();
-    if !usage.is_empty() {
-        display.push(' ');
-        display.push_str(usage);
-    }
-    if let Some(canonical) = alias_for {
-        display.push_str("  alias for ");
-        display.push_str(canonical);
-    }
-    if !description.is_empty() {
-        display.push_str("  ");
-        display.push_str(description);
-    }
-    display
-}
-
-fn slash_prefix_at_cursor(line: &str, pos: usize) -> Option<(usize, &str)> {
-    if pos > line.len() || !line.is_char_boundary(pos) {
-        return None;
-    }
-    let before_cursor = &line[..pos];
-    let trimmed = before_cursor.trim_start();
-    let start = before_cursor.len() - trimmed.len();
+/// Extract the slash token at the start of `line` (after leading whitespace). Returns `None`
+/// unless the trimmed line begins with `/` and contains no interior whitespace (i.e. the user
+/// is still typing the command name, not its arguments).
+fn slash_token(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
     if !trimmed.starts_with('/') {
         return None;
     }
-    let prefix = &before_cursor[start..pos];
-    if prefix[1..].chars().any(char::is_whitespace) {
+    if trimmed[1..].contains(char::is_whitespace) {
         return None;
     }
-    Some((start, prefix))
+    Some(trimmed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::Registry;
 
-    fn helper() -> SlashCommandHelper {
-        SlashCommandHelper::from_registry(&Registry::with_builtins())
-    }
-
-    fn replacements_for(line: &str) -> Vec<String> {
-        helper()
-            .complete_line(line, line.len())
-            .map(|(_, pairs)| pairs.into_iter().map(|p| p.replacement).collect())
-            .unwrap_or_default()
+    fn completer() -> SlashCompleter {
+        SlashCompleter::from_registry(&Registry::with_builtins())
     }
 
     #[test]
-    fn slash_completion_lists_registry_commands_and_aliases() {
-        let replacements = replacements_for("/");
-        assert!(replacements.contains(&"/help".to_string()));
-        assert!(replacements.contains(&"/thinking".to_string()));
-        assert!(replacements.contains(&"/quit".to_string()));
-        assert!(replacements.contains(&"/q".to_string()));
+    fn lists_commands_and_aliases_for_bare_slash() {
+        let m = completer().matches("/");
+        assert!(m.contains(&"/help".to_string()));
+        assert!(m.contains(&"/quit".to_string()));
+        assert!(m.contains(&"/q".to_string()));
     }
 
     #[test]
-    fn slash_completion_filters_by_prefix() {
-        let replacements = replacements_for("/thi");
-        assert_eq!(replacements, vec!["/thinking".to_string()]);
+    fn filters_by_prefix() {
+        let m = completer().matches("/thi");
+        assert_eq!(m, vec!["/thinking".to_string()]);
     }
 
     #[test]
-    fn slash_completion_returns_replacement_start_after_leading_space() {
-        let (start, pairs) = helper().complete_line("   /thi", "   /thi".len()).unwrap();
-        assert_eq!(start, 3);
-        assert_eq!(pairs[0].replacement, "/thinking");
+    fn no_completion_once_argument_typed() {
+        assert!(completer().matches("/skill test").is_empty());
+        assert!(completer().matches("hello").is_empty());
     }
 
     #[test]
-    fn slash_completion_ignores_normal_prompts_and_command_arguments() {
-        assert!(
-            helper()
-                .complete_line("hello /thi", "hello /thi".len())
-                .is_none()
-        );
-        assert_eq!(replacements_for("/skill test"), Vec::<String>::new());
-    }
-
-    #[test]
-    fn slash_completion_provides_inline_hint_for_unique_prefix() {
-        assert_eq!(
-            helper().hint_line("/thi", "/thi".len()).as_deref(),
-            Some("nking")
-        );
-        assert_eq!(helper().hint_line("/", "/".len()), None);
+    fn exact_unique_match_is_not_offered() {
+        // Already fully typed and unique — nothing left to complete.
+        assert!(completer().matches("/thinking").is_empty());
     }
 }

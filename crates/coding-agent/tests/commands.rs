@@ -247,6 +247,9 @@ async fn dispatch_template_returns_repl_owned_agent_work() {
 
 #[tokio::test]
 async fn dispatch_triggers_status_is_read_only_and_available() {
+    // Serialize with the other trigger tests: they share the process-global rule registry, so
+    // an unlocked `clear_for_tests()` here can wipe another test's rule mid-run.
+    let _guard = DYNAMIC_TRIGGER_LOCK.lock().unwrap();
     triggers::global_registry().clear_for_tests();
 
     let storage = Arc::new(MemorySessionStorage::new());

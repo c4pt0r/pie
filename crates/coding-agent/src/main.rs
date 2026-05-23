@@ -29,30 +29,18 @@ mod otlp;
 mod readline;
 mod session;
 mod skills;
-mod spinner;
 mod templates;
 mod tools;
 mod triggers;
-mod tui;
+mod ui;
 
-use std::future::Future;
 use std::io::IsTerminal as _;
-use std::io::Write as _;
-use std::time::{Duration, Instant};
-
-/// Result of one rustyline readline call. Mapped from rustyline errors so the async REPL
-/// can dispatch on three clean cases.
-enum ReadlineOutcome {
-    Line(String),
-    CtrlC,
-    Eof,
-}
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use pie_agent_core::{
     AgentHarness, AgentHarnessOptions, AgentMessage, JsonlSessionRepo, PermissionPolicy,
-    SessionContext, ThinkingLevel,
+    ThinkingLevel,
 };
 use pie_ai::Message as PiMessage;
 
@@ -205,63 +193,6 @@ async fn delete_session_cmd(repo: &JsonlSessionRepo, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Run ONE model turn requested by an inject-and-run delivery. The kernel has already
-/// injected the `[Trigger …]` prompt into the parent conversation, so we just continue the
-/// loop over the current transcript. Called only from the REPL's readline/select loop, so it
-/// is serialized with user input — there is never concurrent access to the single-tenant
-/// agent. Streamed output renders through the persistent `tui.listener()` like any turn.
-/// Ctrl-C aborts this turn, mirroring the user-prompt path.
-async fn run_triggered_main_turn(harness: &AgentHarness, tui: &tui::Tui, trace_id: &str) {
-    // Defensive: the kernel emits `TriggerRequestsMainRun` only for an idle parent, but a
-    // user prompt may have started in the gap. `continue_` would return `AlreadyStreaming`;
-    // skip rather than error — the injected message is still in the transcript for next time.
-    if harness.agent().is_streaming() {
-        return;
-    }
-    let short = &trace_id[..trace_id.len().min(8)];
-    tui.system_line(&format!("running triggered turn (trace {short})"));
-    let (res, aborted) = run_with_ctrl_c(harness, harness.continue_()).await;
-    if aborted {
-        tui.system_line("[aborted]");
-    } else if let Err(e) = res {
-        tui.error_line(&format!("triggered turn: {e}"));
-    }
-}
-
-/// Await harness work while treating the first Ctrl-C as an abort request.
-///
-/// This is intentionally shared by normal prompts, trigger-driven main turns, and any slash
-/// command that starts an agent turn. The REPL owns this signal handling so those paths do not
-/// accidentally bypass provider stream/tool cancellation.
-async fn run_with_ctrl_c<T, Fut>(harness: &AgentHarness, work: Fut) -> (T, bool)
-where
-    Fut: Future<Output = T>,
-{
-    let aborted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let aborted_for_signal = aborted.clone();
-    let signal_fut = async move {
-        let _ = tokio::signal::ctrl_c().await;
-        harness.abort();
-        aborted_for_signal.store(true, std::sync::atomic::Ordering::SeqCst);
-    };
-
-    tokio::pin!(work);
-    tokio::pin!(signal_fut);
-
-    let res = loop {
-        tokio::select! {
-            biased;
-            res = &mut work => break res,
-            _ = &mut signal_fut, if !aborted.load(std::sync::atomic::Ordering::SeqCst) => {
-                // The signal future is one-shot. Keep polling the work future so provider
-                // streams and tools get a clean cancellation path through the harness.
-            }
-        }
-    };
-
-    (res, aborted.load(std::sync::atomic::Ordering::SeqCst))
-}
-
 async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo) -> Result<()> {
     let local_models = local_models::load_all(&cwd).await?;
     let model = model::auto_detect_model(cli.provider.as_deref(), cli.model.as_deref())?;
@@ -412,12 +343,7 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
         triggers::DynamicTriggerCheckHook::new(dynamic_trigger_registry.clone()),
     ));
 
-    let session_runner =
-        agent_session::AgentSession::new(harness.clone(), agent_session::RetrySettings::default());
-
-    // Banner + replay (if --resume). All resume hydration lives on AgentHarness, so the CLI
-    // just asks for the rebuilt SessionContext and renders it.
-    let tui = tui::Tui::new();
+    // Resume hydration (if --resume) — the rebuilt transcript is replayed into the feed below.
     let replay_context = if resumed {
         Some(harness.rehydrate_from_session().await?)
     } else {
@@ -429,9 +355,39 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
         .model
         .clone()
         .unwrap_or_else(|| model.clone());
-    tui.banner(&display_model, &session_id, resumed, &tool_names);
+
+    // Feed + trigger channels. Agent/harness listeners and the slash-command console sink push
+    // structured updates onto `feed_tx`; the UI loop drains `feed_rx` and renders. Inject-and-run
+    // triggered turns arrive on `main_run_*`. The full-screen TUI is the only terminal writer, so
+    // nothing here writes to stdout directly.
+    let (feed_tx, feed_rx) = tokio::sync::mpsc::unbounded_channel::<ui::FeedUpdate>();
+    {
+        let tx = feed_tx.clone();
+        commands::console::set_sink(Box::new(move |line| {
+            let _ = tx.send(ui::FeedUpdate::Plain {
+                text: line,
+                level: ui::feed::Level::Output,
+            });
+        }));
+    }
+    let (main_run_tx, main_run_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    let mut app = ui::App::new(ui::AppConfig {
+        harness: harness.clone(),
+        retry: agent_session::RetrySettings::default(),
+        registry: commands::Registry::with_builtins(),
+        cwd: cwd.clone(),
+        session_id: session_id.clone(),
+        log_path: logging.as_ref().map(|l| l.log_path.clone()),
+        tool_count: tool_names.len(),
+        history: history::HistoryStore::load(),
+        pending_images: std::mem::take(&mut cli.image),
+        feed_rx,
+        main_run_rx,
+    });
+    app.banner(&display_model, &session_id, resumed, &tool_names);
     if !local_models.models.is_empty() {
-        tui.system_line(&format!(
+        app.system_line(format!(
             "loaded {} local model(s): {}",
             local_models.models.len(),
             local_models
@@ -447,13 +403,13 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
     // a soft warning. Print one line per diagnostic so the user can see what the config
     // ignored.
     for diag in &resolved_builtins.diagnostics {
-        tui.system_line(diag);
+        app.system_line(diag);
     }
     if let Some(diag) = trigger_config_diagnostic {
-        tui.error_line(&diag);
+        app.error_line(diag);
     }
     if !combined_skills.is_empty() {
-        tui.system_line(&format!(
+        app.system_line(format!(
             "loaded {} skill(s): {}",
             combined_skills.len(),
             combined_skills
@@ -464,20 +420,20 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
         ));
     }
     if let Some(err) = &dynamic_trigger_load_error {
-        tui.error_line(&format!("dynamic triggers: {err}"));
+        app.error_line(format!("dynamic triggers: {err}"));
     } else if !dynamic_trigger_registry.list().is_empty() {
         let location = dynamic_trigger_registry
             .storage_path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "memory".into());
-        tui.system_line(&format!(
+        app.system_line(format!(
             "loaded {} dynamic trigger rule(s) from {}",
             dynamic_trigger_registry.list().len(),
             location
         ));
     }
     if !loaded_templates.templates.is_empty() {
-        tui.system_line(&format!(
+        app.system_line(format!(
             "loaded {} template(s): {}",
             loaded_templates.templates.len(),
             loaded_templates
@@ -489,37 +445,37 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
         ));
     }
     if mcp.client_count > 0 {
-        tui.system_line(&format!(
+        app.system_line(format!(
             "mcp: connected to {} server(s), {mcp_tool_count} extra tool(s)",
             mcp.client_count,
         ));
     }
     if mcp_notification_hook_count > 0 {
-        tui.system_line(&format!(
+        app.system_line(format!(
             "trigger sources: watching {} configured MCP push source(s)",
             mcp_notification_hook_count
         ));
     }
-    tui.system_line(&format!(
+    app.system_line(format!(
         "triggers: local dynamic checker polls every {trigger_poll_secs}s while enabled rules exist"
     ));
     if lsp_lang_count > 0 {
-        tui.system_line(&format!(
+        app.system_line(format!(
             "lsp: {lsp_lang_count} language(s) configured; diagnostics attach to edit/write results"
         ));
     }
     for diag in &mcp.diagnostics {
-        tui.error_line(&format!("mcp: {diag}"));
+        app.error_line(format!("mcp: {diag}"));
     }
     if !loaded_templates.diagnostics.is_empty() {
-        tui.system_line(&format!(
+        app.system_line(format!(
             "templates loader: {} diagnostic(s), first: {}",
             loaded_templates.diagnostics.len(),
             loaded_templates.diagnostics[0].message
         ));
     }
     if !loaded_skills.diagnostics.is_empty() {
-        tui.system_line(&format!(
+        app.system_line(format!(
             "skills loader: {} diagnostic(s), first: {}",
             loaded_skills.diagnostics.len(),
             loaded_skills.diagnostics[0].message
@@ -531,18 +487,22 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
     };
     let hooks = hooks::load(&cwd, session_id.clone(), hook_model.as_ref(), hook_thinking).await;
     if !hooks.runner.is_empty() {
-        tui.system_line(&format!("hooks: loaded {} hook(s)", hooks.runner.len()));
+        app.system_line(format!("hooks: loaded {} hook(s)", hooks.runner.len()));
     }
     for diag in &hooks.diagnostics {
-        tui.system_line(&format!("hooks: {diag}"));
+        app.system_line(format!("hooks: {diag}"));
     }
     if let Some(ctx) = replay_context.as_ref() {
-        replay_transcript(ctx, &tui);
+        app.replay(&ctx.messages);
     }
 
-    // Wire the TUI listener so each prompt's events stream live.
-    let _unsub = harness.agent().subscribe(tui.listener());
-    let _unsub_harness_tui = harness.subscribe_harness(tui.harness_listener());
+    // Stream agent + harness events into the feed. These listeners never touch stdout — they
+    // only enqueue structured updates that the UI loop renders.
+    let _unsub = harness
+        .agent()
+        .subscribe(ui::listener::agent_listener(feed_tx.clone()));
+    let _unsub_harness_tui =
+        harness.subscribe_harness(ui::listener::harness_listener(feed_tx.clone()));
     let _unsub_dynamic_fire_once = harness.subscribe_harness(triggers::fire_once_harness_listener(
         dynamic_trigger_registry.clone(),
     ));
@@ -555,254 +515,23 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
     // one channel that the REPL loop drains on the SAME serialized path as user input — so a
     // triggered turn and a user prompt never race for the agent. The only sender lives in
     // this listener, so the channel stays open exactly as long as the subscription does.
-    let (main_run_tx, mut main_run_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let _unsub_main_run = harness.subscribe_harness(std::sync::Arc::new(
         move |ev: pie_agent_core::HarnessEvent| {
             if let pie_agent_core::HarnessEvent::TriggerRequestsMainRun { trace_id } = ev {
-                // Non-blocking on an unbounded channel; the REPL services it next time it is
-                // waiting for input. The message itself was already injected by the kernel.
+                // Non-blocking on an unbounded channel; the UI loop drains it on the same
+                // serialized run slot as user input. The message itself was already injected
+                // by the kernel.
                 let _ = main_run_tx.send(trace_id);
             }
         },
     ));
 
-    let registry = commands::Registry::with_builtins();
-    let slash_completion = readline::SlashCommandHelper::from_registry(&registry);
-
-    // Persistent input history (issue #2). Loaded once at startup; each successful prompt
-    // submission appends + persists.
-    let mut history = history::HistoryStore::load();
-    let mut pending_skill: Option<String> = None;
-
-    // Use rustyline for the readline phase — gives us proper unicode-width-aware editing
-    // (CJK chars correctly consume one logical character per backspace), ↑/↓ recall,
-    // Ctrl-R reverse search, and emacs keybinds. The line read is blocking so we run it
-    // on a tokio blocking-thread.
-    let history_path = history::HistoryStore::default_path();
-    let mut last_idle_ctrlc: Option<Instant> = None;
-
-    loop {
-        // Each iteration spawns a fresh editor. Cheap and avoids cross-iteration borrow
-        // issues with the blocking task. The editor loads existing history on construction.
-        let prompt_marker = "you> ".to_string();
-        let history_path_clone = history_path.clone();
-        let slash_completion_clone = slash_completion.clone();
-        let read_handle =
-            tokio::task::spawn_blocking(move || -> Result<ReadlineOutcome, anyhow::Error> {
-                let config = rustyline::Config::builder()
-                    .completion_type(rustyline::config::CompletionType::List)
-                    .build();
-                let mut editor = rustyline::Editor::<
-                    readline::SlashCommandHelper,
-                    rustyline::history::DefaultHistory,
-                >::with_config(config)?;
-                editor.set_helper(Some(slash_completion_clone));
-                if history_path_clone.exists() {
-                    let _ = editor.load_history(&history_path_clone);
-                }
-                match editor.readline(&format!("\x1b[36m{prompt_marker}\x1b[0m")) {
-                    Ok(line) => Ok(ReadlineOutcome::Line(line)),
-                    Err(rustyline::error::ReadlineError::Interrupted) => Ok(ReadlineOutcome::CtrlC),
-                    Err(rustyline::error::ReadlineError::Eof) => Ok(ReadlineOutcome::Eof),
-                    Err(e) => Err(e.into()),
-                }
-            });
-        // While waiting for the user's line, also service inject-and-run requests. Both feed
-        // the single-tenant agent through this one task, so a triggered turn never races a
-        // user prompt. The readline handle (Unpin) stays pending across any triggered turns;
-        // we keep `&mut`-awaiting the same one until the user actually submits a line.
-        tokio::pin!(read_handle);
-        let read = loop {
-            tokio::select! {
-                biased;
-                r = &mut read_handle => break r,
-                Some(trace_id) = main_run_rx.recv() => {
-                    run_triggered_main_turn(&harness, &tui, &trace_id).await;
-                }
-            }
-        };
-
-        let outcome = match read {
-            Ok(Ok(o)) => o,
-            Ok(Err(e)) => {
-                tui.error_line(&format!("readline: {e}"));
-                break;
-            }
-            Err(e) => {
-                tui.error_line(&format!("readline task: {e}"));
-                break;
-            }
-        };
-
-        let line = match outcome {
-            ReadlineOutcome::Line(l) => l,
-            ReadlineOutcome::Eof => {
-                tui.system_line("eof — exiting");
-                break;
-            }
-            ReadlineOutcome::CtrlC => {
-                let now = Instant::now();
-                if last_idle_ctrlc
-                    .map(|t| now.duration_since(t) < Duration::from_millis(1500))
-                    .unwrap_or(false)
-                {
-                    tui.system_line("bye");
-                    break;
-                }
-                last_idle_ctrlc = Some(now);
-                tui.system_line("press Ctrl-C again within 1.5s to exit, or type /quit");
-                continue;
-            }
-        };
-
-        // Successful input clears the "second-Ctrl-C-to-exit" arming.
-        last_idle_ctrlc = None;
-
-        let input = line.trim();
-        if input.is_empty() {
-            continue;
-        }
-
-        // Slash commands flow through the registry; the special outcomes (Quit / ClearScreen)
-        // affect REPL state, so we handle them here. Everything else falls through to a
-        // prompt.
-        if input.starts_with('/') {
-            let ctx = commands::CommandCtx {
-                harness: &harness,
-                session_id: &session_id,
-                log_path: logging.as_ref().map(|l| &l.log_path),
-                tool_count: tool_names.len(),
-                cwd: &cwd,
-            };
-            match commands::dispatch(input, &registry, &ctx).await {
-                commands::CommandOutcome::Quit => {
-                    tui.system_line("bye");
-                    break;
-                }
-                commands::CommandOutcome::ClearScreen => {
-                    print!("\x1b[2J\x1b[H");
-                    let _ = std::io::stdout().flush();
-                }
-                commands::CommandOutcome::Error(e) => {
-                    tui.error_line(&e);
-                }
-                commands::CommandOutcome::AttachSkill { name } => {
-                    pending_skill = Some(name);
-                }
-                commands::CommandOutcome::RunAgentPrompt {
-                    prompt,
-                    error_context,
-                } => {
-                    let (res, aborted) = run_with_ctrl_c(&harness, harness.prompt(prompt)).await;
-                    if aborted {
-                        tui.system_line("[aborted]");
-                    } else if let Err(e) = res {
-                        tui.error_line(&format!("{error_context}: {e}"));
-                    }
-                }
-                commands::CommandOutcome::RunPromptTemplate { name, vars } => {
-                    let (res, aborted) =
-                        run_with_ctrl_c(&harness, harness.prompt_from_template(&name, vars)).await;
-                    if aborted {
-                        tui.system_line("[aborted]");
-                    } else if let Err(e) = res {
-                        tui.error_line(&format!("template run failed: {e}"));
-                    }
-                }
-                commands::CommandOutcome::LoginSecret { provider } => {
-                    match prompt_for_api_key(&provider).await {
-                        Ok(token) => {
-                            if token.trim().is_empty() {
-                                tui.error_line("empty api key; login cancelled");
-                            } else {
-                                match commands::save_api_key(&provider, &token) {
-                                    Ok(path) => tui.system_line(&format!(
-                                        "saved api key for `{provider}` to {}",
-                                        path.display()
-                                    )),
-                                    Err(e) => tui.error_line(&e),
-                                }
-                            }
-                        }
-                        Err(e) => tui.error_line(&e.to_string()),
-                    }
-                }
-                commands::CommandOutcome::Handled => {}
-            }
-            continue;
-        }
-
-        // Expand `@file` mentions before sending. The original `@path` token stays in the
-        // user's text; the file content is prepended in a small attachment block.
-        let (expanded, _resolved) = mentions::expand(input, &cwd).await;
-        let prompt_text = commands::attach_skill_prompt(expanded, pending_skill.take().as_deref());
-
-        // Attach `--image` payloads to the first prompt only (issue #16 first slice).
-        // Subsequent prompts in the same session can mention files via @path or re-launch
-        // the binary with --image again.
-        let pending_images = if !cli.image.is_empty() {
-            match images::load_all(&cli.image).await {
-                Ok(imgs) => imgs,
-                Err(e) => {
-                    tui.error_line(&format!("--image: {e}"));
-                    cli.image.clear();
-                    Vec::new()
-                }
-            }
-        } else {
-            Vec::new()
-        };
-        let has_images = !pending_images.is_empty();
-        if has_images {
-            cli.image.clear();
-        }
-
-        // Append to persistent history before sending. We store the raw user input (without
-        // @file expansion) so recall surfaces what the user actually typed.
-        history.append(input);
-
-        // Active-prompt spinner. Starts BEFORE the prompt future, gets cancelled on the
-        // first event that means "the LLM is producing user-visible output" — final text
-        // and tool executions. Keep it alive while reasoning/thinking deltas stream.
-        let spin = spinner::start("thinking");
-        let spin_for_listener = spin.clone();
-        let _unsub_spin = harness.agent().subscribe(std::sync::Arc::new(move |ev, _| {
-            let s = spin_for_listener.clone();
-            Box::pin(async move {
-                if should_stop_spinner_on(&ev) {
-                    s.stop_sync();
-                }
-            })
-        }));
-
-        // First-time image attachment goes through harness.prompt_with_images directly; the
-        // session_runner retry/rewind path doesn't need to participate for a one-shot
-        // describe-this-image flow.
-        let prompt_fut = async {
-            if has_images {
-                harness
-                    .prompt_with_images(prompt_text, pending_images)
-                    .await
-            } else {
-                session_runner.prompt(prompt_text).await
-            }
-        };
-        let (res, aborted) = run_with_ctrl_c(&harness, prompt_fut).await;
-
-        // Idempotent: if the listener already fired, this is a no-op. If the prompt
-        // errored or aborted before any agent event, this clears the spinner here.
-        spin.stop_sync();
-
-        if aborted {
-            tui.system_line("[aborted]");
-        } else if let Err(e) = res {
-            tui.error_line(&format!("{e}"));
-        }
-    }
-    Ok(())
+    // Hand off to the full-screen UI. It owns the terminal, the input box, the scrolling feed,
+    // and the serialized run slot (user prompts + inject-and-run triggered turns) until quit.
+    app.run().await
 }
 
-async fn prompt_for_api_key(provider: &str) -> Result<String> {
+pub(crate) async fn prompt_for_api_key(provider: &str) -> Result<String> {
     let provider = provider.to_string();
     tokio::task::spawn_blocking(move || {
         if !std::io::stdin().is_terminal() {
@@ -815,26 +544,6 @@ async fn prompt_for_api_key(provider: &str) -> Result<String> {
     })
     .await
     .context("login prompt task")?
-}
-
-/// Predicate for spinner cancellation. The spinner should remain visible during the gap
-/// between user submission and user-visible output. Thinking deltas are still the model
-/// working, so the spinner stays animated until text/tool output starts. AgentStart /
-/// MessageStart fire too early to be useful here.
-fn should_stop_spinner_on(ev: &pie_agent_core::AgentEvent) -> bool {
-    use pie_agent_core::AgentEvent;
-    use pie_ai::AssistantMessageEvent;
-    match ev {
-        AgentEvent::ToolExecutionStart { .. } | AgentEvent::ToolExecutionEnd { .. } => true,
-        AgentEvent::MessageUpdate {
-            assistant_message_event,
-            ..
-        } => matches!(
-            assistant_message_event,
-            AssistantMessageEvent::TextDelta { .. } | AssistantMessageEvent::ToolCallDelta { .. }
-        ),
-        _ => false,
-    }
 }
 
 fn parse_thinking(s: &str) -> Result<ThinkingLevel> {
@@ -908,24 +617,6 @@ where
     }
     merged
 }
-
-fn replay_transcript(ctx: &SessionContext, tui: &tui::Tui) {
-    if ctx.messages.is_empty() {
-        return;
-    }
-    tui.system_line(&format!(
-        "resumed — replaying {} messages",
-        ctx.messages.len()
-    ));
-    for m in &ctx.messages {
-        tui::render_persisted(m);
-    }
-    // Skip custom variants (compaction_summary etc.); they aren't model-visible here. But the
-    // harness uses them via convert_to_llm filtering — that's already handled by pie-agent-core.
-    drop_unused(&ctx.messages);
-}
-
-fn drop_unused(_: &[AgentMessage]) {}
 
 /// Helper for callers that want to feed a Message (raw pie-ai role variant) into the agent. Not
 /// directly used by the REPL but kept here for the tests.

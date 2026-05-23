@@ -14,6 +14,39 @@ use pie_agent_core::{
 };
 use pie_ai::{Provider, get_model};
 
+/// Sink for slash-command output. The full-screen TUI owns the only terminal writer, so
+/// commands must not `println!` straight to stdout — they route through here. The app installs
+/// a sink that forwards each line into the conversation feed; when none is installed (unit
+/// tests, non-interactive shells) output falls back to stdout.
+pub mod console {
+    use parking_lot::Mutex;
+
+    type Sink = Box<dyn Fn(String) + Send + Sync>;
+    static SINK: Mutex<Option<Sink>> = Mutex::new(None);
+
+    /// Install the line sink. Called once by the UI at startup. Unused when `commands.rs` is
+    /// path-included by integration tests (which never install a sink).
+    #[cfg_attr(test, allow(dead_code))]
+    pub fn set_sink(sink: Sink) {
+        *SINK.lock() = Some(sink);
+    }
+
+    /// Emit one line of command output through the active sink (or stdout when unset).
+    pub fn emit_line(line: String) {
+        match SINK.lock().as_ref() {
+            Some(sink) => sink(line),
+            None => println!("{line}"),
+        }
+    }
+}
+
+/// Drop-in replacement for `println!` inside this module: same call syntax, but the formatted
+/// line is routed through [`console::emit_line`] instead of straight to stdout.
+macro_rules! cprintln {
+    () => { $crate::commands::console::emit_line(String::new()) };
+    ($($arg:tt)*) => { $crate::commands::console::emit_line(std::format!($($arg)*)) };
+}
+
 #[cfg_attr(test, allow(dead_code))]
 pub const THINKING_LEVEL_VALUES: [&str; 6] = ["off", "minimal", "low", "medium", "high", "xhigh"];
 pub const THINKING_LEVEL_USAGE: &str = "[off|minimal|low|medium|high|xhigh]";
@@ -218,27 +251,27 @@ impl SlashCommand for SkillsCommand {
     async fn run(&self, _argv: &[String], ctx: &CommandCtx<'_>) -> CommandOutcome {
         let skills = ctx.harness.skills();
         if skills.is_empty() {
-            println!(
+            cprintln!(
                 "(no skills loaded — drop SKILL.md files under ~/.pie/skills/<name>/ or <cwd>/.pie/skills/<name>/)"
             );
         } else {
-            println!("Loaded skills ({}):", skills.len());
+            cprintln!("Loaded skills ({}):", skills.len());
             for s in &skills {
                 let disabled = if s.disable_model_invocation {
                     "  [disabled: disable_model_invocation=true]"
                 } else {
                     ""
                 };
-                println!(
+                cprintln!(
                     "  - {}  ({}){}",
                     s.name,
                     skill_source_label(s, ctx.cwd),
                     disabled
                 );
                 if !s.description.is_empty() {
-                    println!("      {}", s.description);
+                    cprintln!("      {}", s.description);
                 }
-                println!("      path: {}", s.file_path);
+                cprintln!("      path: {}", s.file_path);
             }
         }
         CommandOutcome::Handled
@@ -293,7 +326,7 @@ impl SlashCommand for SkillCommand {
                 "skill '{name}' is disabled (disable_model_invocation=true); edit the skill frontmatter to enable it"
             ));
         }
-        println!("attached skill: {name} for next turn");
+        cprintln!("attached skill: {name} for next turn");
         CommandOutcome::AttachSkill { name: name.clone() }
     }
 }
@@ -362,8 +395,8 @@ impl SlashCommand for ModelCommand {
         if argv.is_empty() {
             let current = ctx.harness.agent().state().model.clone();
             match current {
-                Some(m) => println!("active model: {}:{}", m.provider.0, m.id),
-                None => println!("(no model active)"),
+                Some(m) => cprintln!("active model: {}:{}", m.provider.0, m.id),
+                None => cprintln!("(no model active)"),
             }
             return CommandOutcome::Handled;
         }
@@ -383,7 +416,7 @@ impl SlashCommand for ModelCommand {
         };
         match ctx.harness.set_model(model.clone()).await {
             Ok(_) => {
-                println!("switched to {provider}:{id}");
+                cprintln!("switched to {provider}:{id}");
                 CommandOutcome::Handled
             }
             Err(e) => CommandOutcome::Error(format!("set_model failed: {e}")),
@@ -407,7 +440,7 @@ impl SlashCommand for ThinkingCommand {
     async fn run(&self, argv: &[String], ctx: &CommandCtx<'_>) -> CommandOutcome {
         if argv.is_empty() {
             let lvl = ctx.harness.agent().state().thinking_level;
-            println!("thinking level: {}", lvl.map(|l| l.as_str()).unwrap_or("?"));
+            cprintln!("thinking level: {}", lvl.map(|l| l.as_str()).unwrap_or("?"));
             return CommandOutcome::Handled;
         }
         let raw = argv[0].to_lowercase();
@@ -419,7 +452,7 @@ impl SlashCommand for ThinkingCommand {
         };
         match ctx.harness.set_thinking_level(level).await {
             Ok(_) => {
-                println!("thinking level: {}", level.as_str());
+                cprintln!("thinking level: {}", level.as_str());
                 CommandOutcome::Handled
             }
             Err(e) => CommandOutcome::Error(format!("set_thinking_level failed: {e}")),
@@ -429,8 +462,8 @@ impl SlashCommand for ThinkingCommand {
 
 // Re-export for `print_help` in main.rs.
 pub fn print_help(registry: &Registry) {
-    println!();
-    println!("Commands:");
+    cprintln!();
+    cprintln!("Commands:");
     for cmd in registry.commands() {
         let aliases = if cmd.aliases().is_empty() {
             String::new()
@@ -442,7 +475,7 @@ pub fn print_help(registry: &Registry) {
         } else {
             format!(" {}", cmd.usage())
         };
-        println!(
+        cprintln!(
             "  /{}{}    {}{}",
             cmd.name(),
             usage,
@@ -450,9 +483,9 @@ pub fn print_help(registry: &Registry) {
             aliases
         );
     }
-    println!();
-    println!("Anything else is sent as a prompt to the agent.");
-    println!();
+    cprintln!();
+    cprintln!("Anything else is sent as a prompt to the agent.");
+    cprintln!();
 }
 
 struct CostCommand;
@@ -471,11 +504,11 @@ impl SlashCommand for CostCommand {
     async fn run(&self, argv: &[String], ctx: &CommandCtx<'_>) -> CommandOutcome {
         if argv.first().map(|s| s.as_str()) == Some("reset") {
             ctx.harness.reset_cost();
-            println!("cost counters reset");
+            cprintln!("cost counters reset");
             return CommandOutcome::Handled;
         }
         let snap = ctx.harness.cost();
-        println!("{}", pie_agent_core::cost_full_breakdown(&snap));
+        cprintln!("{}", pie_agent_core::cost_full_breakdown(&snap));
         CommandOutcome::Handled
     }
 }
@@ -508,19 +541,19 @@ impl SlashCommand for DiagCommand {
             .log_path
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "(logging disabled)".into());
-        println!();
-        println!("Diagnostic snapshot:");
-        println!("  session       {}", ctx.session_id);
-        println!("  model         {model}");
-        println!("  thinking      {thinking}");
-        println!("  tools         {}", ctx.tool_count);
-        println!("  skills        {skill_count}");
-        println!(
+        cprintln!();
+        cprintln!("Diagnostic snapshot:");
+        cprintln!("  session       {}", ctx.session_id);
+        cprintln!("  model         {model}");
+        cprintln!("  thinking      {thinking}");
+        cprintln!("  tools         {}", ctx.tool_count);
+        cprintln!("  skills        {skill_count}");
+        cprintln!(
             "  cost          {}",
             pie_agent_core::cost_one_line_summary(&cost)
         );
-        println!("  log file      {log}");
-        println!();
+        cprintln!("  log file      {log}");
+        cprintln!();
         CommandOutcome::Handled
     }
 }
@@ -542,14 +575,14 @@ impl SlashCommand for TemplateCommand {
         if argv.is_empty() {
             let templates = ctx.harness.templates();
             if templates.is_empty() {
-                println!(
+                cprintln!(
                     "(no templates loaded — drop `.md` files under ~/.pie/templates/ or <cwd>/.pie/templates/)"
                 );
             } else {
-                println!("Loaded templates ({}):", templates.len());
+                cprintln!("Loaded templates ({}):", templates.len());
                 for t in &templates {
                     let desc = t.description.clone().unwrap_or_default();
-                    println!("  /template {}  {}", t.name, desc);
+                    cprintln!("  /template {}  {}", t.name, desc);
                 }
             }
             return CommandOutcome::Handled;
@@ -596,7 +629,7 @@ impl SlashCommand for SaveCommand {
         };
         match crate::export::save(ctx.harness.session(), &dest).await {
             Ok(p) => {
-                println!("saved transcript: {}", p.display());
+                cprintln!("saved transcript: {}", p.display());
                 CommandOutcome::Handled
             }
             Err(e) => CommandOutcome::Error(format!("save failed: {e}")),
@@ -625,11 +658,11 @@ impl SlashCommand for CompactCommand {
         };
         match ctx.harness.force_compact(custom).await {
             Ok(true) => {
-                println!("compaction ran");
+                cprintln!("compaction ran");
                 CommandOutcome::Handled
             }
             Ok(false) => {
-                println!("nothing to compact");
+                cprintln!("nothing to compact");
                 CommandOutcome::Handled
             }
             Err(e) => CommandOutcome::Error(format!("compaction failed: {e}")),
@@ -674,7 +707,7 @@ impl SlashCommand for UndoCommand {
         }
         match ctx.harness.move_to(target_parent.as_deref(), None).await {
             Ok(_) => {
-                println!("undid last turn");
+                cprintln!("undid last turn");
                 CommandOutcome::Handled
             }
             Err(e) => CommandOutcome::Error(format!("undo failed: {e}")),
@@ -721,7 +754,7 @@ impl SlashCommand for BugReportCommand {
         let dest = crate::bug_report::default_dest();
         match crate::bug_report::build(diag, ctx.harness.session(), &dest).await {
             Ok(path) => {
-                println!("wrote bug report: {}", path.display());
+                cprintln!("wrote bug report: {}", path.display());
                 CommandOutcome::Handled
             }
             Err(e) => CommandOutcome::Error(format!("bug-report failed: {e}")),
@@ -746,8 +779,8 @@ impl SlashCommand for NameCommand {
         let session = ctx.harness.session();
         if argv.is_empty() {
             match session.session_name().await {
-                Ok(Some(n)) => println!("session name: {n}"),
-                Ok(None) => println!("(unnamed session)"),
+                Ok(Some(n)) => cprintln!("session name: {n}"),
+                Ok(None) => cprintln!("(unnamed session)"),
                 Err(e) => return CommandOutcome::Error(format!("read name: {e}")),
             }
             return CommandOutcome::Handled;
@@ -759,7 +792,7 @@ impl SlashCommand for NameCommand {
         }
         match session.append_session_name(trimmed.to_string()).await {
             Ok(_) => {
-                println!("session name set to: {trimmed}");
+                cprintln!("session name set to: {trimmed}");
                 CommandOutcome::Handled
             }
             Err(e) => CommandOutcome::Error(format!("set name failed: {e}")),
@@ -784,14 +817,14 @@ impl SlashCommand for SessionsCommand {
             Err(e) => return CommandOutcome::Error(format!("list sessions: {e}")),
         };
         if entries.is_empty() {
-            println!("(no sessions for this cwd)");
+            cprintln!("(no sessions for this cwd)");
             return CommandOutcome::Handled;
         }
-        println!("Sessions:");
+        cprintln!("Sessions:");
         for e in entries {
             let preview = e.preview.as_deref().unwrap_or("");
             let id_short: String = e.id.chars().take(16).collect();
-            println!("  {}  {}  {}", id_short, e.created_at, preview);
+            cprintln!("  {}  {}  {}", id_short, e.created_at, preview);
         }
         CommandOutcome::Handled
     }
@@ -848,7 +881,7 @@ impl SlashCommand for ShareCommand {
             ));
         }
         let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        println!("shared: {url}");
+        cprintln!("shared: {url}");
         CommandOutcome::Handled
     }
 }
@@ -922,13 +955,13 @@ impl SlashCommand for LogoutCommand {
         match store.remove(provider) {
             Some(_) => match store.save() {
                 Ok(()) => {
-                    println!("removed credential for `{provider}`");
+                    cprintln!("removed credential for `{provider}`");
                     CommandOutcome::Handled
                 }
                 Err(e) => CommandOutcome::Error(format!("save auth store: {e}")),
             },
             None => {
-                println!("no credential stored for `{provider}`");
+                cprintln!("no credential stored for `{provider}`");
                 CommandOutcome::Handled
             }
         }
@@ -1000,15 +1033,15 @@ impl SlashCommand for FindCommand {
                             .collect::<String>()
                             .replace('\n', " ");
                         let path_short = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
-                        println!("  {path_short}  {snip}");
+                        cprintln!("  {path_short}  {snip}");
                     }
                 }
             }
         }
         if hits == 0 {
-            println!("(no matches)");
+            cprintln!("(no matches)");
         } else {
-            println!("({hits} match(es))");
+            cprintln!("({hits} match(es))");
         }
         CommandOutcome::Handled
     }
@@ -1032,7 +1065,7 @@ impl SlashCommand for HistoryCommand {
         let store = crate::history::HistoryStore::load();
         let entries = store.entries();
         if entries.is_empty() {
-            println!("(no history yet)");
+            cprintln!("(no history yet)");
             return CommandOutcome::Handled;
         }
         let start = entries.len().saturating_sub(limit);
@@ -1041,7 +1074,7 @@ impl SlashCommand for HistoryCommand {
             // Truncate long entries to 200 chars to keep the listing skimmable.
             let preview: String = e.chars().take(200).collect();
             let suffix = if preview.len() < e.len() { "…" } else { "" };
-            println!("  {n}: {preview}{suffix}");
+            cprintln!("  {n}: {preview}{suffix}");
         }
         CommandOutcome::Handled
     }
@@ -1066,14 +1099,14 @@ impl SlashCommand for TriggersCommand {
             "status" => {
                 let snapshot = ctx.harness.notification_status_snapshot();
                 for line in render_triggers_status(&snapshot) {
-                    println!("{line}");
+                    cprintln!("{line}");
                 }
                 CommandOutcome::Handled
             }
             "rules" => {
                 let rules = crate::triggers::global_registry().list();
                 for line in render_dynamic_trigger_rules(&rules, usize::MAX) {
-                    println!("{line}");
+                    cprintln!("{line}");
                 }
                 CommandOutcome::Handled
             }
@@ -1084,7 +1117,7 @@ impl SlashCommand for TriggersCommand {
                 if target == "--all" {
                     match crate::triggers::global_registry().clear_rules() {
                         Ok(count) => {
-                            println!("removed {count} dynamic trigger rule(s)");
+                            cprintln!("removed {count} dynamic trigger rule(s)");
                             CommandOutcome::Handled
                         }
                         Err(e) => CommandOutcome::Error(e.to_string()),
@@ -1092,9 +1125,9 @@ impl SlashCommand for TriggersCommand {
                 } else {
                     match crate::triggers::global_registry().remove_rule(target) {
                         Ok(Some(rule)) => {
-                            println!("removed trigger {}", rule.id);
-                            println!("  condition: {}", rule.condition);
-                            println!("  action: {}", rule.action);
+                            cprintln!("removed trigger {}", rule.id);
+                            cprintln!("  condition: {}", rule.condition);
+                            cprintln!("  action: {}", rule.action);
                             CommandOutcome::Handled
                         }
                         Ok(None) => CommandOutcome::Error(format!(
@@ -1109,14 +1142,14 @@ impl SlashCommand for TriggersCommand {
             "sources" | "hooks" => {
                 let snapshot = ctx.harness.notification_status_snapshot();
                 for line in render_trigger_sources(&snapshot.hooks) {
-                    println!("{line}");
+                    cprintln!("{line}");
                 }
                 CommandOutcome::Handled
             }
             "running" => {
                 let snapshot = ctx.harness.notification_status_snapshot();
                 for line in render_running_triggers(&snapshot.running) {
-                    println!("{line}");
+                    cprintln!("{line}");
                 }
                 CommandOutcome::Handled
             }
@@ -1128,7 +1161,7 @@ impl SlashCommand for TriggersCommand {
                 };
                 let rows = collect_trigger_audit_rows(&entries, limit);
                 for line in render_trigger_audit(&rows) {
-                    println!("{line}");
+                    cprintln!("{line}");
                 }
                 CommandOutcome::Handled
             }
@@ -1140,7 +1173,7 @@ impl SlashCommand for TriggersCommand {
                 if target == "--all" {
                     let count = snapshot.running.len();
                     ctx.harness.abort_all_triggers();
-                    println!("requested abort for {count} running trigger(s)");
+                    cprintln!("requested abort for {count} running trigger(s)");
                 } else {
                     if !snapshot.running.iter().any(|t| t.trace_id == *target) {
                         return CommandOutcome::Error(format!(
@@ -1148,7 +1181,7 @@ impl SlashCommand for TriggersCommand {
                         ));
                     }
                     ctx.harness.abort_trigger(target);
-                    println!("requested abort for trigger {target}");
+                    cprintln!("requested abort for trigger {target}");
                 }
                 CommandOutcome::Handled
             }
@@ -1285,11 +1318,11 @@ fn set_dynamic_trigger_enabled(target: Option<&String>, enabled: bool) -> Comman
     match crate::triggers::global_registry().set_rule_enabled(id, enabled) {
         Ok(Some(rule)) => {
             let state = if rule.enabled { "enabled" } else { "disabled" };
-            println!("{state} trigger {}", rule.id);
-            println!("  condition: {}", rule.condition);
-            println!("  action: {}", rule.action);
+            cprintln!("{state} trigger {}", rule.id);
+            cprintln!("  condition: {}", rule.condition);
+            cprintln!("  action: {}", rule.action);
             if rule.enabled && rule.fire_once {
-                println!("  fire_once: true (will disable again after the next successful match)");
+                cprintln!("  fire_once: true (will disable again after the next successful match)");
             }
             CommandOutcome::Handled
         }
