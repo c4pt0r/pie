@@ -197,6 +197,56 @@ impl AgentTool for InstallSkillTool {
             .map(|d| format!("{:?}: {}", d.code, d.message))
             .collect();
 
+        // Persistent audit: append `Custom { custom_type: "skill_install" }` to the session
+        // so `--resume`, bug-report, and post-hoc forensics can see model-driven skill
+        // installs. Body is NOT included — only metadata + hashes. Best-effort: if the
+        // session write fails, the install itself already succeeded on disk + in the
+        // catalog, so we log a tracing warning and surface the missing audit id in the
+        // tool result rather than rolling back.
+        let source_kind = match &input.source {
+            Source::Url { .. } => "url",
+            Source::Path { .. } => "path",
+            Source::Content { .. } => "content",
+        };
+        let source_redacted = match &input.source {
+            // URL / path are themselves opaque references, safe to record.
+            Source::Url { url } => json!(url),
+            Source::Path { path } => json!(path),
+            // Inline content body is never echoed into the audit; we just record that the
+            // source was inline so resume can distinguish from URL/path origin.
+            Source::Content { .. } => json!(null),
+        };
+        let audit_payload = json!({
+            "status": "installed",
+            "name": parsed.name,
+            "target_path": target_path.display().to_string(),
+            "source_kind": source_kind,
+            "source": source_redacted,
+            "before_hash": existing_hash,
+            "after_hash": parsed.content_hash,
+            "size": parsed.size,
+            "overwrote": overwrite_required,
+            "idempotent": existing && !overwrite_required,
+            "installed_visible_in_catalog": installed,
+            "diagnostics_count": reload.diagnostics.len(),
+            "warnings": warnings.clone(),
+        });
+        let audit_entry_id = match harness
+            .session()
+            .append_custom("skill_install", Some(audit_payload))
+            .await
+        {
+            Ok(id) => Some(id),
+            Err(e) => {
+                tracing::warn!(
+                    skill = %parsed.name,
+                    error = %e,
+                    "skill_install audit write failed; install itself succeeded"
+                );
+                None
+            }
+        };
+
         Ok(AgentToolResult {
             content: vec![UserContentBlock::text(format!(
                 "installed skill '{}' to {} ({}B). catalog now has {} skill(s).",
@@ -216,6 +266,7 @@ impl AgentTool for InstallSkillTool {
                 "diagnostics_count": reload.diagnostics.len(),
                 "warnings": warnings,
                 "installed_visible_in_catalog": installed,
+                "audit_entry_id": audit_entry_id,
             }),
             terminate: None,
         })
@@ -924,6 +975,65 @@ mod tests {
         );
         // total_skills_after is reported.
         assert!(install.details["total_skills_after"].as_u64().unwrap_or(0) >= 1);
+        // Persistent audit was written (QA acceptance — `--resume`/bug-report path).
+        let audit_id = install.details["audit_entry_id"].as_str();
+        assert!(
+            audit_id.is_some_and(|s| !s.is_empty()),
+            "audit_entry_id must be set after a successful install, got: {install:?}"
+        );
+    }
+
+    /// Audit entry shape: persistent `Custom { custom_type: "skill_install" }` records
+    /// the metadata QA acceptance asks for (name, target_path, source_kind, before/after
+    /// hash, size, overwrite/idempotent flags). Body is NOT included. Read the session
+    /// jsonl back through the harness to confirm.
+    #[tokio::test]
+    async fn install_writes_skill_install_audit_entry() {
+        let (harness, cell, dir) = build_test_harness(vec![]);
+        let tool = test_tool(cell, &dir);
+        let skill_md = make_skill_md("delta", "delta desc", "delta body");
+
+        let _ = execute(
+            &tool,
+            json!({"source": {"type": "content", "content": skill_md.clone()}, "confirm": true}),
+        )
+        .await
+        .expect("install ok");
+
+        // Walk the session entries and find the `skill_install` Custom record.
+        let session = harness.session();
+        let entries = session.entries().await.expect("read session entries");
+        let custom = entries.iter().find_map(|e| match e {
+            pie_agent_core::SessionTreeEntry::Custom {
+                custom_type, data, ..
+            } if custom_type == "skill_install" => data.clone(),
+            _ => None,
+        });
+        let data = custom.expect("skill_install audit entry must be written");
+
+        assert_eq!(data["status"], "installed");
+        assert_eq!(data["name"], "delta");
+        assert_eq!(data["source_kind"], "content");
+        // Inline content source MUST NOT echo the body into the audit (QA invariant).
+        assert!(
+            data["source"].is_null(),
+            "inline content source must not echo body into audit, got: {}",
+            data["source"]
+        );
+        assert!(
+            data["after_hash"].as_str().is_some_and(|s| s.len() == 64),
+            "after_hash should be a 64-char SHA256 hex digest"
+        );
+        assert_eq!(data["before_hash"], Value::Null);
+        assert_eq!(data["overwrote"], false);
+        assert_eq!(data["idempotent"], false);
+        assert_eq!(data["installed_visible_in_catalog"], true);
+        // Body must not leak verbatim.
+        let serialized = serde_json::to_string(&data).unwrap();
+        assert!(
+            !serialized.contains("delta body"),
+            "audit must not contain skill body, got: {serialized}"
+        );
     }
 
     /// Atomic write guarantee: a successful write leaves no `.tmp` sibling in the parent dir.
