@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use pie_agent_core::{AgentEvent, AgentListener, HarnessEvent, HarnessListener};
+use pie_agent_core::{AgentEvent, AgentListener, HarnessEvent, HarnessListener, TriggerState};
 use pie_ai::AssistantMessageEvent;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -88,6 +88,48 @@ pub fn harness_listener(tx: UnboundedSender<FeedUpdate>) -> HarnessListener {
 
 fn map_harness_event(event: &HarnessEvent, quiet: &Mutex<HashSet<String>>) -> Option<FeedUpdate> {
     match event {
+        HarnessEvent::TriggerHandlingStart {
+            trace_id,
+            source_kind,
+            source_label,
+            event_label,
+            ..
+        } => {
+            if source_label == "local:dynamic" && event_label == "dynamic periodic check" {
+                quiet.lock().insert(trace_id.clone());
+                return None;
+            }
+            Some(FeedUpdate::Plain {
+                text: format!(
+                    "[trigger fired] trace={} source={} kind={} event={}",
+                    truncate_chars(trace_id, 24),
+                    truncate_chars(source_label, 48),
+                    source_kind_label(*source_kind),
+                    truncate_chars(event_label, 64)
+                ),
+                level: Level::System,
+            })
+        }
+        HarnessEvent::TriggerHandled {
+            trace_id, state, ..
+        } => match state {
+            TriggerState::Accepted => None,
+            TriggerState::Deduped
+            | TriggerState::CycleSuppressed
+            | TriggerState::PermissionDenied
+            | TriggerState::NeedsApproval => {
+                quiet.lock().remove(trace_id);
+                Some(FeedUpdate::Plain {
+                    text: format!(
+                        "[trigger {}] trace={}",
+                        trigger_state_label(*state),
+                        truncate_chars(trace_id, 24)
+                    ),
+                    level: trigger_state_level(*state),
+                })
+            }
+            _ => None,
+        },
         HarnessEvent::TriggerCompleted {
             trace_id, summary, ..
         } => {
@@ -136,6 +178,41 @@ fn map_harness_event(event: &HarnessEvent, quiet: &Mutex<HashSet<String>>) -> Op
             })
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+fn map_harness_event_for_test(event: &HarnessEvent) -> Option<FeedUpdate> {
+    let quiet = Mutex::new(HashSet::new());
+    map_harness_event(event, &quiet)
+}
+
+fn trigger_state_label(state: TriggerState) -> &'static str {
+    match state {
+        TriggerState::Deduped => "deduped",
+        TriggerState::CycleSuppressed => "cycle-suppressed",
+        TriggerState::PermissionDenied => "permission-denied",
+        TriggerState::NeedsApproval => "needs-approval",
+        TriggerState::Received => "received",
+        TriggerState::Accepted => "accepted",
+        TriggerState::Running => "running",
+        TriggerState::Failed => "failed",
+        TriggerState::Completed => "completed",
+    }
+}
+
+fn trigger_state_level(state: TriggerState) -> Level {
+    match state {
+        TriggerState::PermissionDenied | TriggerState::NeedsApproval => Level::Error,
+        _ => Level::System,
+    }
+}
+
+fn source_kind_label(kind: pie_agent_core::SourceKind) -> &'static str {
+    match kind {
+        pie_agent_core::SourceKind::Local => "local",
+        pie_agent_core::SourceKind::Mcp => "mcp",
+        pie_agent_core::SourceKind::Hub => "hub",
     }
 }
 
@@ -220,30 +297,65 @@ mod tests {
     }
 
     #[test]
+    fn trigger_handling_start_renders_preview_safe_live_line() {
+        let update = map_harness_event_for_test(&HarnessEvent::TriggerHandlingStart {
+            idempotency_key: "idem-key".into(),
+            source_kind: pie_agent_core::SourceKind::Mcp,
+            source_label: "mcp:github".into(),
+            event_label: "pr.merged".into(),
+            trace_id: "trace-start".into(),
+        })
+        .expect("start event should render");
+
+        let FeedUpdate::Plain { text, level } = update else {
+            panic!("expected plain update");
+        };
+        assert_eq!(level, Level::System);
+        assert!(text.contains("[trigger fired] trace=trace-start"));
+        assert!(text.contains("source=mcp:github"));
+        assert!(text.contains("event=pr.merged"));
+    }
+
+    #[test]
     fn trigger_completed_summary_is_not_display_truncated() {
         let summary = (0..30)
             .map(|i| format!("trigger result line {i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let quiet = Mutex::new(HashSet::new());
-        let update = map_harness_event(
-            &HarnessEvent::TriggerCompleted {
-                trace_id: "trace-full-trigger-result".into(),
-                summary: Some(summary.clone()),
-                cost_usd: None,
-                details: serde_json::Value::Null,
-            },
-            &quiet,
-        )
-        .expect("trigger completion should render");
+        let update = map_harness_event_for_test(&HarnessEvent::TriggerCompleted {
+            trace_id: "trace-full-trigger-result".into(),
+            summary: Some(summary.clone()),
+            cost_usd: None,
+            details: serde_json::Value::Null,
+        })
+        .expect("completion should render");
 
         let FeedUpdate::Plain { text, level } = update else {
-            panic!("expected plain trigger completion line");
+            panic!("expected plain update");
         };
         assert_eq!(level, Level::Note);
         assert!(text.contains("[trigger completed] trace=trace-full-trigger-resu"));
         assert!(text.contains("trigger result line 0"));
         assert!(text.contains("trigger result line 29"));
         assert!(text.ends_with(&summary));
+        assert!(!text.contains("truncated"));
+    }
+
+    #[test]
+    fn trigger_deduped_renders_terminal_status_line() {
+        let update = map_harness_event_for_test(&HarnessEvent::TriggerHandled {
+            idempotency_key: "idem-key".into(),
+            trace_id: "trace-deduped".into(),
+            state: TriggerState::Deduped,
+            audit_entry_id: None,
+            evaluator_decision: Some(serde_json::json!({ "outcome": "deduped" })),
+        })
+        .expect("deduped state should render");
+
+        let FeedUpdate::Plain { text, level } = update else {
+            panic!("expected plain update");
+        };
+        assert_eq!(level, Level::System);
+        assert_eq!(text, "[trigger deduped] trace=trace-deduped");
     }
 }

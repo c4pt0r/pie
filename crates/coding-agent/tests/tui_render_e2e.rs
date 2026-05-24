@@ -7,7 +7,9 @@
 
 use std::sync::Arc;
 
-use pie_agent_core::{AgentEvent, AgentMessage, AgentTool, AgentToolResult, HarnessEvent};
+use pie_agent_core::{
+    AgentEvent, AgentMessage, AgentTool, AgentToolResult, HarnessEvent, SourceKind, TriggerState,
+};
 use pie_ai::{
     AssistantMessage, AssistantMessageEvent, AssistantRole, ContentBlock, ImageContent, Message,
     StopReason, ToolCall, ToolResultMessage, ToolResultRole, Usage, UserContentBlock,
@@ -619,6 +621,82 @@ fn trigger_completion_renders_live_result_line() {
     assert!(
         plain.contains("[trigger completed] trace=trace-live-result wrote /tmp/trigger-output"),
         "{plain}"
+    );
+}
+
+#[test]
+fn trigger_start_renders_live_fired_line() {
+    let tui = tui::Tui::new();
+    let mut buf: Vec<u8> = Vec::new();
+
+    tui.render_harness_event(
+        &HarnessEvent::TriggerHandlingStart {
+            idempotency_key: "idem-key".into(),
+            source_kind: SourceKind::Mcp,
+            source_label: "mcp:github".into(),
+            event_label: "pr.merged".into(),
+            trace_id: "trace-trigger-start".into(),
+        },
+        &mut buf,
+    );
+
+    let plain = strip_ansi(&String::from_utf8(buf).unwrap());
+    assert!(
+        plain.contains(
+            "[trigger fired] trace=trace-trigger-start source=mcp:github kind=mcp event=pr.merged"
+        ),
+        "{plain}"
+    );
+}
+
+#[test]
+fn trigger_terminal_non_running_state_renders_live_status_line() {
+    let tui = tui::Tui::new();
+    let mut buf: Vec<u8> = Vec::new();
+
+    tui.render_harness_event(
+        &HarnessEvent::TriggerHandled {
+            idempotency_key: "idem-key".into(),
+            trace_id: "trace-deduped".into(),
+            state: TriggerState::Deduped,
+            audit_entry_id: None,
+            evaluator_decision: Some(serde_json::json!({ "outcome": "deduped" })),
+        },
+        &mut buf,
+    );
+
+    let plain = strip_ansi(&String::from_utf8(buf).unwrap());
+    assert!(
+        plain.contains("[trigger deduped] trace=trace-deduped"),
+        "{plain}"
+    );
+}
+
+#[test]
+fn trigger_completion_summary_is_not_display_truncated() {
+    let tui = tui::Tui::new();
+    let mut buf: Vec<u8> = Vec::new();
+    let long_summary = (0..40)
+        .map(|i| format!("result-line-{i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    tui.render_harness_event(
+        &HarnessEvent::TriggerCompleted {
+            trace_id: "trace-long-result".into(),
+            summary: Some(long_summary),
+            cost_usd: None,
+            details: serde_json::Value::Null,
+        },
+        &mut buf,
+    );
+
+    let plain = strip_ansi(&String::from_utf8(buf).unwrap());
+    assert!(plain.contains("result-line-0"), "{plain}");
+    assert!(plain.contains("result-line-39"), "{plain}");
+    assert!(
+        !plain.contains("truncated") && !plain.contains('…'),
+        "trigger completion is final output and should not use preview truncation:\n{plain}"
     );
 }
 

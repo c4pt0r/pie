@@ -212,6 +212,57 @@ impl Tui {
 
     pub fn render_harness_event(&self, event: &HarnessEvent, out: &mut dyn std::io::Write) {
         match event {
+            HarnessEvent::TriggerHandlingStart {
+                trace_id,
+                source_kind,
+                source_label,
+                event_label,
+                ..
+            } => {
+                if source_label == "local:dynamic" && event_label == "dynamic periodic check" {
+                    self.state
+                        .lock()
+                        .quiet_dynamic_trigger_traces
+                        .insert(trace_id.clone());
+                    return;
+                }
+                self.begin_async_status_line(out);
+                let _ = writeln!(
+                    out,
+                    "{DARK_GREY}[trigger fired] trace={} source={} kind={} event={}{}",
+                    truncate_chars(trace_id, 24),
+                    truncate_chars(source_label, 48),
+                    source_kind_label(*source_kind),
+                    truncate_chars(event_label, 64),
+                    RESET
+                );
+                let _ = out.flush();
+            }
+            HarnessEvent::TriggerHandled {
+                trace_id, state, ..
+            } => match state {
+                pie_agent_core::TriggerState::Accepted => {}
+                pie_agent_core::TriggerState::Deduped
+                | pie_agent_core::TriggerState::CycleSuppressed
+                | pie_agent_core::TriggerState::PermissionDenied
+                | pie_agent_core::TriggerState::NeedsApproval => {
+                    self.state
+                        .lock()
+                        .quiet_dynamic_trigger_traces
+                        .remove(trace_id);
+                    self.begin_async_status_line(out);
+                    let color = trigger_state_color(*state);
+                    let _ = writeln!(
+                        out,
+                        "{color}[trigger {}] trace={}{}",
+                        trigger_state_label(*state),
+                        truncate_chars(trace_id, 24),
+                        RESET
+                    );
+                    let _ = out.flush();
+                }
+                _ => {}
+            },
             HarnessEvent::TriggerCompleted {
                 trace_id, summary, ..
             } => {
@@ -304,6 +355,36 @@ impl Tui {
         if !self.close_open_block(out) {
             let _ = writeln!(out);
         }
+    }
+}
+
+fn trigger_state_label(state: pie_agent_core::TriggerState) -> &'static str {
+    match state {
+        pie_agent_core::TriggerState::Deduped => "deduped",
+        pie_agent_core::TriggerState::CycleSuppressed => "cycle-suppressed",
+        pie_agent_core::TriggerState::PermissionDenied => "permission-denied",
+        pie_agent_core::TriggerState::NeedsApproval => "needs-approval",
+        pie_agent_core::TriggerState::Received => "received",
+        pie_agent_core::TriggerState::Accepted => "accepted",
+        pie_agent_core::TriggerState::Running => "running",
+        pie_agent_core::TriggerState::Failed => "failed",
+        pie_agent_core::TriggerState::Completed => "completed",
+    }
+}
+
+fn trigger_state_color(state: pie_agent_core::TriggerState) -> &'static str {
+    match state {
+        pie_agent_core::TriggerState::PermissionDenied
+        | pie_agent_core::TriggerState::NeedsApproval => RED,
+        _ => DARK_GREY,
+    }
+}
+
+fn source_kind_label(kind: pie_agent_core::SourceKind) -> &'static str {
+    match kind {
+        pie_agent_core::SourceKind::Local => "local",
+        pie_agent_core::SourceKind::Mcp => "mcp",
+        pie_agent_core::SourceKind::Hub => "hub",
     }
 }
 
