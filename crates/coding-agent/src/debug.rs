@@ -13,7 +13,7 @@ use pie_ai::{
 };
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::ui::feed::{FeedUpdate, Level, preview, truncate_chars};
+use crate::ui::feed::{FeedUpdate, Level};
 
 pub fn wrap_stream_fn(base: StreamFn, tx: UnboundedSender<FeedUpdate>) -> StreamFn {
     let seq = Arc::new(AtomicU64::new(1));
@@ -46,10 +46,7 @@ pub fn wrap_stream_fn(base: StreamFn, tx: UnboundedSender<FeedUpdate>) -> Stream
                             format!(
                                 "[debug llm #{call_id} error] reason={reason:?} elapsed={} message=\"{}\"",
                                 elapsed_ms(started_at),
-                                truncate_chars(
-                                    error.error_message.as_deref().unwrap_or("unknown error"),
-                                    220
-                                )
+                                error.error_message.as_deref().unwrap_or("unknown error")
                             ),
                         );
                     }
@@ -96,7 +93,7 @@ fn start_line(
         .unwrap_or_else(|| "off".into());
     let session = options
         .and_then(|o| o.base.session_id.as_deref())
-        .map(|s| truncate_chars(s, 24))
+        .map(ToString::to_string)
         .unwrap_or_else(|| "-".into());
     format!(
         "[debug llm #{call_id} start] provider={} api={} model={} messages={} tools={} system_chars={} reasoning={} session={}",
@@ -114,19 +111,19 @@ fn start_line(
 fn context_line(call_id: u64, context: &PiContext) -> Option<String> {
     let last = context.messages.last()?;
     Some(format!(
-        "[debug llm #{call_id} context] last_{}=\"{}\"",
+        "[debug llm #{call_id} context] last_{}:\n{}",
         role_label(last),
-        truncate_chars(&message_preview(last), 260)
+        message_log(last)
     ))
 }
 
 fn tool_call_line(call_id: u64, tool_call: &ToolCall) -> String {
     let args = serde_json::Value::Object(tool_call.arguments.clone());
     format!(
-        "[debug llm #{call_id} tool-call] id={} name={} args={}",
-        truncate_chars(&tool_call.id, 40),
+        "[debug llm #{call_id} tool-call] id={} name={} args=\n{}",
+        tool_call.id,
         tool_call.name,
-        preview(&args)
+        serde_json::to_string_pretty(&args).unwrap_or_else(|_| args.to_string())
     )
 }
 
@@ -140,10 +137,10 @@ fn done_line(
     let response_id = message
         .response_id
         .as_deref()
-        .map(|s| truncate_chars(s, 48))
+        .map(ToString::to_string)
         .unwrap_or_else(|| "-".into());
     format!(
-        "[debug llm #{call_id} done] reason={reason:?} stop={:?} elapsed={} usage=input:{} output:{} cache_read:{} cache_write:{} total:{} cost:${:.6} response_id={} text=\"{}\"",
+        "[debug llm #{call_id} done] reason={reason:?} stop={:?} elapsed={} usage=input:{} output:{} cache_read:{} cache_write:{} total:{} cost:${:.6} response_id={} text:\n{}",
         message.stop_reason,
         elapsed_ms(started_at),
         usage.input,
@@ -153,7 +150,7 @@ fn done_line(
         usage.total_tokens,
         usage.cost.total,
         response_id,
-        truncate_chars(&assistant_preview(message), 220)
+        assistant_log(message)
     )
 }
 
@@ -169,53 +166,49 @@ fn role_label(message: &PiMessage) -> &'static str {
     }
 }
 
-fn message_preview(message: &PiMessage) -> String {
+fn message_log(message: &PiMessage) -> String {
     match message {
-        PiMessage::User(user) => user_content_preview(&user.content),
-        PiMessage::Assistant(assistant) => assistant_preview(assistant),
+        PiMessage::User(user) => user_content_log(&user.content),
+        PiMessage::Assistant(assistant) => assistant_log(assistant),
         PiMessage::ToolResult(result) => result
             .content
             .iter()
-            .map(user_content_block_preview)
+            .map(user_content_block_log)
             .collect::<Vec<_>>()
-            .join(" "),
+            .join("\n"),
     }
 }
 
-fn user_content_preview(content: &UserContent) -> String {
+fn user_content_log(content: &UserContent) -> String {
     match content {
-        UserContent::Text(text) => normalize_ws(text),
+        UserContent::Text(text) => text.clone(),
         UserContent::Blocks(blocks) => blocks
             .iter()
-            .map(user_content_block_preview)
+            .map(user_content_block_log)
             .collect::<Vec<_>>()
-            .join(" "),
+            .join("\n"),
     }
 }
 
-fn user_content_block_preview(block: &UserContentBlock) -> String {
+fn user_content_block_log(block: &UserContentBlock) -> String {
     match block {
-        UserContentBlock::Text(text) => normalize_ws(&text.text),
+        UserContentBlock::Text(text) => text.text.clone(),
         UserContentBlock::Image(image) => format!("[image:{}]", image.mime_type),
     }
 }
 
-fn assistant_preview(message: &AssistantMessage) -> String {
+fn assistant_log(message: &AssistantMessage) -> String {
     message
         .content
         .iter()
         .map(|block| match block {
-            ContentBlock::Text(text) => normalize_ws(&text.text),
-            ContentBlock::Thinking(thinking) => normalize_ws(&thinking.thinking),
+            ContentBlock::Text(text) => text.text.clone(),
+            ContentBlock::Thinking(thinking) => thinking.thinking.clone(),
             ContentBlock::Image(image) => format!("[image:{}]", image.mime_type),
             ContentBlock::ToolCall(tool_call) => {
                 format!("[tool-call:{}:{}]", tool_call.id, tool_call.name)
             }
         })
         .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn normalize_ws(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+        .join("\n")
 }

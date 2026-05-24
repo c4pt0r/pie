@@ -107,10 +107,10 @@ fn map_harness_event(
             Some(FeedUpdate::Plain {
                 text: format!(
                     "[trigger fired] trace={} source={} kind={} event={}",
-                    truncate_chars(trace_id, 24),
-                    truncate_chars(source_label, 48),
+                    debug_text(debug, trace_id, 24),
+                    debug_text(debug, source_label, 48),
                     source_kind_label(*source_kind),
-                    truncate_chars(event_label, 64)
+                    debug_text(debug, event_label, 64)
                 ),
                 level: Level::System,
             })
@@ -128,7 +128,7 @@ fn map_harness_event(
                     text: format!(
                         "[trigger {}] trace={}",
                         trigger_state_label(*state),
-                        truncate_chars(trace_id, 24)
+                        debug_text(debug, trace_id, 24)
                     ),
                     level: trigger_state_level(*state),
                 })
@@ -146,7 +146,7 @@ fn map_harness_event(
             Some(FeedUpdate::Plain {
                 text: format!(
                     "[trigger completed] trace={} {}",
-                    truncate_chars(trace_id, 24),
+                    debug_text(debug, trace_id, 24),
                     summary
                 ),
                 level: Level::Note,
@@ -157,8 +157,8 @@ fn map_harness_event(
             Some(FeedUpdate::Plain {
                 text: format!(
                     "[trigger failed] trace={} {}",
-                    truncate_chars(trace_id, 24),
-                    truncate_chars(reason, 180)
+                    debug_text(debug, trace_id, 24),
+                    debug_text(debug, reason, 180)
                 ),
                 level: Level::Error,
             })
@@ -177,13 +177,21 @@ fn map_harness_event(
             Some(FeedUpdate::Plain {
                 text: format!(
                     "[trigger running] trace={} {}",
-                    truncate_chars(trace_id, 24),
-                    truncate_chars(prompt_preview, 120)
+                    debug_text(debug, trace_id, 24),
+                    debug_text(debug, prompt_preview, 120)
                 ),
                 level: Level::System,
             })
         }
         _ => None,
+    }
+}
+
+fn debug_text(debug: bool, s: &str, max_chars: usize) -> String {
+    if debug {
+        s.to_string()
+    } else {
+        truncate_chars(s, max_chars)
     }
 }
 
