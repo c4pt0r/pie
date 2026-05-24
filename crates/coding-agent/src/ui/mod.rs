@@ -759,9 +759,9 @@ impl App {
         let input_rows = self.input.lines().len().clamp(1, MAX_INPUT_ROWS) as u16;
         let chunks = Layout::vertical([
             Constraint::Min(1),
-            Constraint::Length(1),          // status separator
-            Constraint::Length(input_rows), // input box
-            Constraint::Length(1),          // hint line
+            Constraint::Length(1),              // status separator
+            Constraint::Length(input_rows + 2), // input box with border
+            Constraint::Length(1),              // hint line
         ])
         .split(area);
         let feed_area = chunks[0];
@@ -792,8 +792,35 @@ impl App {
             status_area,
         );
 
-        // Input box.
-        frame.render_widget(&self.input, input_area);
+        // Input box. Keep the cursor away from the terminal edge and reserve a visible prompt
+        // column so the typing surface feels intentional instead of cramped.
+        let input_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan));
+        let inner = input_block.inner(input_area);
+        frame.render_widget(input_block, input_area);
+        if inner.width > 0 && inner.height > 0 {
+            let prompt_width = inner.width.min(2);
+            let prompt_area = Rect {
+                x: inner.x,
+                y: inner.y,
+                width: prompt_width,
+                height: inner.height,
+            };
+            frame.render_widget(
+                Paragraph::new(Line::styled("> ", Style::default().fg(Color::Cyan))),
+                prompt_area,
+            );
+            let text_area = Rect {
+                x: inner.x + prompt_width,
+                y: inner.y,
+                width: inner.width.saturating_sub(prompt_width),
+                height: inner.height,
+            };
+            if text_area.width > 0 {
+                frame.render_widget(&self.input, text_area);
+            }
+        }
 
         // Hint line.
         let hint = "Enter send · Alt+Enter newline · ↑↓ history · PgUp/PgDn scroll · Tab complete · Ctrl-C abort/exit";
@@ -962,11 +989,6 @@ fn new_textarea() -> TextArea<'static> {
     let mut textarea = TextArea::default();
     textarea.set_cursor_line_style(Style::default());
     textarea.set_placeholder_text("type a message, or /help");
-    textarea.set_block(
-        Block::default()
-            .borders(Borders::LEFT)
-            .border_style(Style::default().fg(Color::Cyan)),
-    );
     textarea
 }
 
@@ -1134,13 +1156,29 @@ mod tests {
             text.contains("ready"),
             "status should read ready when idle:\n{text}"
         );
-        // The status rule and the hint line live in the bottom three rows — the input box is
-        // between them, pinned to the bottom.
+        // The status rule and the hint line live in the bottom five rows — the bordered input
+        // box is between them, pinned to the bottom.
         let status_row = lines.iter().position(|l| l.contains("pie ·")).unwrap();
         assert!(
-            status_row >= lines.len() - 3,
+            status_row >= lines.len() - 5,
             "status rule should be pinned near the bottom (row {status_row} of {}):\n{text}",
             lines.len()
+        );
+    }
+
+    #[test]
+    fn input_box_has_breathing_room_and_prompt() {
+        let mut app = test_app();
+        let backend = TestBackend::new(50, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+
+        assert!(text.contains("┌"), "input border missing:\n{text}");
+        assert!(text.contains("└"), "input border missing:\n{text}");
+        assert!(
+            text.contains("│>  type a message, or /help"),
+            "input should have a prompt and horizontal padding:\n{text}"
         );
     }
 

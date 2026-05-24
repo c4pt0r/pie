@@ -242,12 +242,13 @@ impl Feed {
     pub fn lines(&self, width: usize) -> Vec<Line<'static>> {
         let width = width.max(1);
         let mut out: Vec<Line<'static>> = Vec::new();
+        let mut previous: Option<&Block> = None;
         for block in &self.blocks {
+            if should_separate(previous, block, !out.is_empty()) {
+                out.push(Line::raw(""));
+            }
             match block {
                 Block::User(text) => {
-                    if !out.is_empty() {
-                        out.push(Line::raw(""));
-                    }
                     push_paragraphs(&mut out, text, USER_STYLE, Some("you ▸ "), width);
                 }
                 Block::Assistant(text) => {
@@ -279,6 +280,7 @@ impl Feed {
                     push_paragraphs(&mut out, text, style_for_level(*level), None, width);
                 }
             }
+            previous = Some(block);
         }
         out
     }
@@ -301,6 +303,20 @@ pub const TOOL_OUTPUT_ERROR_HEAD_LINES: usize = 40;
 pub const TOOL_OUTPUT_ERROR_TAIL_LINES: usize = 8;
 pub const TOOL_OUTPUT_MAX_LINE_CHARS: usize = 200;
 pub const TOOL_OUTPUT_ERROR_MAX_LINE_CHARS: usize = 240;
+
+fn should_separate(previous: Option<&Block>, current: &Block, has_output: bool) -> bool {
+    if !has_output {
+        return false;
+    }
+    matches!(
+        (previous, current),
+        (_, Block::User(_))
+            | (
+                Some(Block::User(_)),
+                Block::Assistant(_) | Block::Thinking(_) | Block::Tool { .. }
+            )
+    )
+}
 
 fn style_for_level(level: Level) -> Style {
     match level {
@@ -579,6 +595,33 @@ mod tests {
         assert!(rendered.contains("you ▸ do the thing"));
         // a blank line separates the banner from the user turn
         assert!(rendered.contains("\n\nyou ▸"));
+    }
+
+    #[test]
+    fn user_and_assistant_blocks_have_breathing_room() {
+        let mut feed = Feed::new();
+        feed.push_user("tight?");
+        feed.push_assistant("not anymore");
+        let rendered = plain_text(&feed.lines(80));
+
+        assert!(
+            rendered.contains("you ▸ tight?\n\nnot anymore"),
+            "assistant reply should not be glued to the user prompt:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn user_and_tool_first_reply_have_breathing_room() {
+        let mut feed = Feed::new();
+        feed.push_user("inspect");
+        feed.push_tool("read", "(path=\"x\")");
+        feed.push_tool_result("tool-1", vec!["contents".into()], false);
+        let rendered = plain_text(&feed.lines(80));
+
+        assert!(
+            rendered.contains("you ▸ inspect\n\n⚙ read(path=\"x\")\n    contents"),
+            "tool-first assistant activity should not be glued to the user prompt, but tool result should stay with the tool call:\n{rendered}"
+        );
     }
 
     #[test]
