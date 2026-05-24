@@ -151,41 +151,49 @@ fn html_to_text(html: &str) -> String {
     let mut in_tag = false;
     let mut in_script_or_style: Option<&'static str> = None;
     let lower = html.to_ascii_lowercase();
+    let lower_bytes = lower.as_bytes();
     let bytes = html.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         // Inside <script> or <style>, skip everything until matching close tag.
         if let Some(close) = in_script_or_style {
-            if lower[i..].starts_with(close) {
+            if starts_with_at(lower_bytes, i, close.as_bytes()) {
                 in_script_or_style = None;
                 i += close.len();
                 continue;
             }
-            i += 1;
+            let ch = html[i..]
+                .chars()
+                .next()
+                .expect("loop index must be at a char boundary");
+            i += ch.len_utf8();
             continue;
         }
-        let c = bytes[i] as char;
+        let c = html[i..]
+            .chars()
+            .next()
+            .expect("loop index must be at a char boundary");
         if !in_tag && c == '<' {
-            if lower[i..].starts_with("<script") {
+            if starts_with_at(lower_bytes, i, b"<script") {
                 in_script_or_style = Some("</script>");
                 i += "<script".len();
                 continue;
             }
-            if lower[i..].starts_with("<style") {
+            if starts_with_at(lower_bytes, i, b"<style") {
                 in_script_or_style = Some("</style>");
                 i += "<style".len();
                 continue;
             }
             in_tag = true;
             // Treat block-level boundaries as newlines for readability.
-            if lower[i..].starts_with("<br")
-                || lower[i..].starts_with("<p")
-                || lower[i..].starts_with("</p")
-                || lower[i..].starts_with("<div")
-                || lower[i..].starts_with("</div")
-                || lower[i..].starts_with("<li")
-                || lower[i..].starts_with("</li")
-                || lower[i..].starts_with("<h")
+            if starts_with_at(lower_bytes, i, b"<br")
+                || starts_with_at(lower_bytes, i, b"<p")
+                || starts_with_at(lower_bytes, i, b"</p")
+                || starts_with_at(lower_bytes, i, b"<div")
+                || starts_with_at(lower_bytes, i, b"</div")
+                || starts_with_at(lower_bytes, i, b"<li")
+                || starts_with_at(lower_bytes, i, b"</li")
+                || starts_with_at(lower_bytes, i, b"<h")
             {
                 out.push('\n');
             }
@@ -196,11 +204,11 @@ fn html_to_text(html: &str) -> String {
             if c == '>' {
                 in_tag = false;
             }
-            i += 1;
+            i += c.len_utf8();
             continue;
         }
         out.push(c);
-        i += 1;
+        i += c.len_utf8();
     }
     // Decode a tiny set of HTML entities — full table is overkill for v1.
     let out = out
@@ -211,6 +219,10 @@ fn html_to_text(html: &str) -> String {
         .replace("&#39;", "'")
         .replace("&nbsp;", " ");
     collapse_whitespace(&out)
+}
+
+fn starts_with_at(bytes: &[u8], i: usize, pat: &[u8]) -> bool {
+    bytes.get(i..).is_some_and(|tail| tail.starts_with(pat))
 }
 
 fn collapse_whitespace(s: &str) -> String {
@@ -269,6 +281,33 @@ mod tests {
         assert!(text.contains("Title"));
         assert!(text.contains("Hello & world"));
         assert!(!text.contains("alert"));
+    }
+
+    #[test]
+    fn html_to_text_preserves_non_ascii_text() {
+        let html = "<html><body><p>你好，世界</p><div>emoji: 🦀</div></body></html>";
+        let text = html_to_text(html);
+
+        assert!(text.contains("你好，世界"));
+        assert!(text.contains("emoji: 🦀"));
+    }
+
+    #[test]
+    fn html_to_text_handles_replacement_char_from_truncated_utf8() {
+        let html =
+            "<html><body><script>const x = 'ignored � text';</script><p>done �</p></body></html>";
+        let text = html_to_text(html);
+
+        assert_eq!(text, "done �");
+    }
+
+    #[test]
+    fn html_to_text_handles_nbsp_inside_script_without_byte_boundary_panic() {
+        let html =
+            "<html><body><script>const x = 'ignored\u{a0}text';</script><p>done</p></body></html>";
+        let text = html_to_text(html);
+
+        assert_eq!(text, "done");
     }
 
     #[test]
