@@ -281,6 +281,37 @@ mod tests {
     }
 
     #[test]
+    fn web_fetch_blank_lines_are_compacted_for_display_without_mutating_result() {
+        let original = "\n\nstatus: 200\ncontent-type: text/html\n\n\nTitle\n\n\n\nBody\n\n";
+        let result = text_result(original);
+        let event = AgentEvent::ToolExecutionEnd {
+            tool_call_id: "call-1".into(),
+            tool_name: "web_fetch".into(),
+            result: result.clone(),
+            is_error: false,
+        };
+
+        let updates = map_agent_event(&event);
+        let [FeedUpdate::ToolEnd { lines, .. }] = updates.as_slice() else {
+            panic!("expected one tool end update");
+        };
+        assert_eq!(
+            lines,
+            &vec![
+                "status: 200".to_string(),
+                "content-type: text/html".to_string(),
+                String::new(),
+                "Title".to_string(),
+                String::new(),
+                "Body".to_string(),
+            ]
+        );
+        if let UserContentBlock::Text(text) = &result.content[0] {
+            assert_eq!(text.text, original);
+        }
+    }
+
+    #[test]
     fn short_tool_output_display_stays_unchanged() {
         let event = AgentEvent::ToolExecutionEnd {
             tool_call_id: "call-1".into(),

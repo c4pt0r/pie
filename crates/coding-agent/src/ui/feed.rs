@@ -434,7 +434,7 @@ pub fn compact_tool_output_lines(lines: Vec<String>, is_error: bool) -> Vec<Stri
     };
     let original_line_count = lines.len();
     let mut hidden_bytes = 0usize;
-    let mut compacted: Vec<String> = lines
+    let mut compacted: Vec<String> = compact_blank_lines(lines)
         .into_iter()
         .map(|line| {
             let kept_bytes: usize = line.chars().take(max_line_chars).map(char::len_utf8).sum();
@@ -465,6 +465,25 @@ pub fn compact_tool_output_lines(lines: Vec<String>, is_error: bool) -> Vec<Stri
     } else {
         compacted
     }
+}
+
+fn compact_blank_lines(lines: Vec<String>) -> Vec<String> {
+    let mut compacted = Vec::with_capacity(lines.len());
+    let mut pending_blank = false;
+    for line in lines {
+        if line.trim().is_empty() {
+            if !compacted.is_empty() {
+                pending_blank = true;
+            }
+            continue;
+        }
+        if pending_blank {
+            compacted.push(String::new());
+            pending_blank = false;
+        }
+        compacted.push(line);
+    }
+    compacted
 }
 
 /// Extract text blocks from a tool result and build the same display-only compact preview used
@@ -628,6 +647,25 @@ mod tests {
     fn compact_tool_output_keeps_short_output_unchanged() {
         let lines = vec!["ok".to_string(), "done".to_string()];
         assert_eq!(compact_tool_output_lines(lines.clone(), false), lines);
+    }
+
+    #[test]
+    fn compact_tool_output_collapses_blank_line_runs_for_display() {
+        let lines = vec![
+            String::new(),
+            "title".to_string(),
+            String::new(),
+            "   ".to_string(),
+            "\t".to_string(),
+            "body".to_string(),
+            String::new(),
+            String::new(),
+        ];
+
+        assert_eq!(
+            compact_tool_output_lines(lines, false),
+            vec!["title".to_string(), String::new(), "body".to_string()]
+        );
     }
 
     #[test]
