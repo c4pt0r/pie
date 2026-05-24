@@ -126,17 +126,7 @@ impl AuthStore {
     /// Resolve a credential for `provider`. Env var wins; auth.json is the fallback. Returns
     /// the bare API-key string for `api_key` and the access token for `oauth`.
     pub fn resolve_for_provider(&self, provider: &str) -> Option<String> {
-        let env_var = match provider {
-            "anthropic" => "ANTHROPIC_API_KEY",
-            "openai" => "OPENAI_API_KEY",
-            "openrouter" => "OPENROUTER_API_KEY",
-            "groq" => "GROQ_API_KEY",
-            "mistral" => "MISTRAL_API_KEY",
-            "google" => "GEMINI_API_KEY",
-            "ds4" => "DS4_API_KEY",
-            _ => "",
-        };
-        if !env_var.is_empty() {
+        for env_var in pie_ai::env_api_keys::env_var_names(provider) {
             if let Ok(v) = std::env::var(env_var) {
                 if !v.trim().is_empty() {
                     return Some(v);
@@ -153,7 +143,38 @@ impl AuthStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use tempfile::TempDir;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        key: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let original = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, original }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let original = std::env::var_os(key);
+            unsafe { std::env::remove_var(key) };
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.original.take() {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
 
     #[test]
     fn round_trip_api_key() {
@@ -227,6 +248,23 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = AuthStore::load_from(&dir.path().join("nope.json")).unwrap();
         assert!(store.providers.is_empty());
+    }
+
+    #[test]
+    fn resolve_for_provider_uses_shared_provider_env_map() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _deepseek = EnvGuard::set("DEEPSEEK_API_KEY", "sk-deepseek-env");
+        let _openai = EnvGuard::set("OPENAI_API_KEY", "sk-openai-should-not-count");
+
+        let store = AuthStore::default();
+        assert_eq!(
+            store.resolve_for_provider("deepseek").as_deref(),
+            Some("sk-deepseek-env")
+        );
+
+        drop(_deepseek);
+        let _deepseek_removed = EnvGuard::remove("DEEPSEEK_API_KEY");
+        assert_eq!(store.resolve_for_provider("deepseek"), None);
     }
 
     #[cfg(unix)]

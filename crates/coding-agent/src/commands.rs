@@ -416,13 +416,14 @@ impl SlashCommand for ModelCommand {
             }
             return CommandOutcome::Handled;
         }
-        // Accept either `provider:id` or two separate args `provider id`.
+        // Accept `provider:id`, the user's natural `provider/model-id`, or two separate
+        // args `provider id`.
         let spec = argv.join(" ");
-        let (provider, id) = match spec.split_once(':') {
+        let (provider, id) = match parse_model_spec(&spec) {
             Some((p, i)) => (p.to_string(), i.to_string()),
             None => {
                 return CommandOutcome::Error(
-                    "expected provider:model-id, e.g. /model anthropic:claude-haiku-4-5".into(),
+                    "expected provider:model-id (provider/model-id also works), e.g. /model anthropic:claude-haiku-4-5".into(),
                 );
             }
         };
@@ -432,12 +433,57 @@ impl SlashCommand for ModelCommand {
         };
         match ctx.harness.set_model(model.clone()).await {
             Ok(_) => {
-                cprintln!("switched to {provider}:{id}");
+                if let Some(hint) = model_credential_hint(&provider) {
+                    cprintln!("selected {provider}:{id}, but login is required: {hint}");
+                } else {
+                    cprintln!("switched to {provider}:{id}");
+                }
                 CommandOutcome::Handled
             }
             Err(e) => CommandOutcome::Error(format!("set_model failed: {e}")),
         }
     }
+}
+
+fn parse_model_spec(spec: &str) -> Option<(&str, &str)> {
+    let spec = spec.trim();
+    let (provider, id) = spec
+        .split_once(':')
+        .or_else(|| spec.split_once('/'))
+        .or_else(|| spec.split_once(char::is_whitespace))?;
+    let provider = provider.trim();
+    let id = id.trim();
+    if provider.is_empty() || id.is_empty() {
+        return None;
+    }
+    Some((provider, id))
+}
+
+fn model_credential_hint(provider: &str) -> Option<String> {
+    let vars = pie_ai::env_api_keys::env_var_names(provider);
+    let has_env = vars.iter().any(|var| {
+        std::env::var(var)
+            .ok()
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+    });
+    if has_env {
+        return None;
+    }
+    let has_stored = crate::auth::AuthStore::load()
+        .ok()
+        .and_then(|store| store.get(provider).cloned())
+        .is_some();
+    if has_stored {
+        return None;
+    }
+
+    let env_hint = if vars.is_empty() {
+        "set the provider API key env var".to_string()
+    } else {
+        format!("set {}", vars.join(" or "))
+    };
+    Some(format!("{env_hint} or run /login {provider}"))
 }
 
 struct ThinkingCommand;
@@ -1786,6 +1832,37 @@ pub async fn dispatch(input: &str, registry: &Registry, ctx: &CommandCtx<'_>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        key: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let original = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, original }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let original = std::env::var_os(key);
+            unsafe { std::env::remove_var(key) };
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.original.take() {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
 
     fn custom_test_model(provider: &str, id: &str) -> Model {
         Model {
@@ -1826,6 +1903,58 @@ mod tests {
     fn parse_returns_none_for_non_slash() {
         assert!(parse("hello world").is_none());
         assert!(parse("/").is_none());
+    }
+
+    #[test]
+    fn model_spec_accepts_colon_slash_and_two_args() {
+        assert_eq!(
+            parse_model_spec("deepseek:deepseek-v4-pro"),
+            Some(("deepseek", "deepseek-v4-pro"))
+        );
+        assert_eq!(
+            parse_model_spec("deepseek/deepseek-v4-pro"),
+            Some(("deepseek", "deepseek-v4-pro"))
+        );
+        assert_eq!(
+            parse_model_spec("deepseek deepseek-v4-pro"),
+            Some(("deepseek", "deepseek-v4-pro"))
+        );
+        assert_eq!(parse_model_spec("deepseek"), None);
+    }
+
+    #[test]
+    fn model_credential_hint_uses_only_selected_provider_credentials() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let _pie_dir = EnvGuard::set("PIE_DIR", temp.path());
+        let _deepseek = EnvGuard::remove("DEEPSEEK_API_KEY");
+        let _openai = EnvGuard::set("OPENAI_API_KEY", "sk-openai-should-not-count");
+
+        let hint = model_credential_hint("deepseek").expect("deepseek key is missing");
+        assert!(hint.contains("DEEPSEEK_API_KEY"), "{hint}");
+        assert!(hint.contains("/login deepseek"), "{hint}");
+        assert!(!hint.contains("OPENAI_API_KEY"), "{hint}");
+        assert!(!hint.contains("sk-openai-should-not-count"), "{hint}");
+    }
+
+    #[test]
+    fn model_credential_hint_accepts_env_or_auth_store_for_selected_provider() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let _pie_dir = EnvGuard::set("PIE_DIR", temp.path());
+        let _deepseek = EnvGuard::set("DEEPSEEK_API_KEY", "sk-deepseek-present");
+        assert!(model_credential_hint("deepseek").is_none());
+        drop(_deepseek);
+
+        let mut store = crate::auth::AuthStore::default();
+        store.set(
+            "deepseek",
+            crate::auth::ProviderCredential::ApiKey {
+                value: "stored-deepseek".into(),
+            },
+        );
+        store.save().unwrap();
+        assert!(model_credential_hint("deepseek").is_none());
     }
 
     #[test]

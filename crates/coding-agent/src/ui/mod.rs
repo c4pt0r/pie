@@ -1153,7 +1153,7 @@ impl App {
             lines.push(panel_line("none".to_string(), Color::DarkGray, width));
         } else {
             for point in &self.panel_status.hook_points {
-                lines.push(panel_line(format!("✓ {point}"), Color::Green, width));
+                lines.push(panel_line(format!("· {point}"), Color::DarkGray, width));
             }
         }
 
@@ -1615,6 +1615,10 @@ mod tests {
         assert!(
             text.contains("before_tool_call"),
             "hook point status missing:\n{text}"
+        );
+        assert!(
+            !text.contains("✓ before_tool_call"),
+            "hook point rows should not use success checkmarks:\n{text}"
         );
         // Trigger runtime features render as their own section, separate from `Hooks`, so users
         // can't mistake `dedup` / `cycle suppress` etc. for pluggable callbacks.

@@ -329,6 +329,12 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
 
 ### Fixed
 
+- `/model` now accepts the natural `provider/model-id` form as an alias for
+  `provider:model-id` and, after selecting a model, immediately checks whether that exact
+  provider has an env or auth-store credential. Missing credentials now produce a
+  user-actionable message such as `selected deepseek:deepseek-v4-pro, but login is required:
+  set DEEPSEEK_API_KEY or run /login deepseek` instead of a misleading bare `switched`
+  followed by a failure on the next prompt.
 - TUI tool output is now display-capped independently from the model-facing tool result.
   Long tool output previews keep the first 20 lines and last 4 lines (errors get a larger
   40/8-line budget), truncate overlong lines on UTF-8 character boundaries, and show a
