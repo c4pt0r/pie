@@ -392,8 +392,9 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
         panel_status: ui::PanelStatus {
             mcp_servers: mcp.client_count,
             mcp_tools: mcp_tool_count,
-            mcp_push_hooks: mcp_notification_hook_count,
-            hook_points: active_hook_points(lsp_lang_count, !hooks.runner.is_empty()),
+            mcp_notification_hooks: mcp_notification_hook_count,
+            hook_points: active_hook_registrations(lsp_lang_count, !hooks.runner.is_empty()),
+            trigger_features: active_trigger_features(),
         },
     });
     app.banner(&display_model, &session_id, resumed, &tool_names);
@@ -537,12 +538,14 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
     app.run().await
 }
 
-fn active_hook_points(lsp_lang_count: usize, cli_hooks_loaded: bool) -> Vec<String> {
+/// Real `*Hook` trait registrations active in this binary. Only names that map to an actual
+/// `AgentHarness` extension point — so users reading the panel learn what hooks they could
+/// plug into. `dedup` / `cycle suppress` / `fire-once rules` / `inject-and-run` are
+/// trigger-runtime *features*, not hooks, and live in [`active_trigger_features`] instead.
+fn active_hook_registrations(lsp_lang_count: usize, cli_hooks_loaded: bool) -> Vec<String> {
     let mut points = vec![
         "before_tool_call".to_string(),
         "before_trigger_action".to_string(),
-        "dynamic_fire_once".to_string(),
-        "main_run_requests".to_string(),
     ];
     if lsp_lang_count > 0 {
         points.push("after_tool_call".to_string());
@@ -551,6 +554,18 @@ fn active_hook_points(lsp_lang_count: usize, cli_hooks_loaded: bool) -> Vec<Stri
         points.push("cli_hooks".to_string());
     }
     points
+}
+
+/// Trigger-runtime features always wired in the current binary. Distinct from hook
+/// registrations — these are pipeline behaviors (dedup, cycle suppression, fire-once rules,
+/// inject-and-run delivery), not pluggable callbacks.
+fn active_trigger_features() -> Vec<String> {
+    vec![
+        "dedup".to_string(),
+        "cycle suppress".to_string(),
+        "fire-once rules".to_string(),
+        "inject-and-run".to_string(),
+    ]
 }
 
 pub(crate) async fn prompt_for_api_key(provider: &str) -> Result<String> {

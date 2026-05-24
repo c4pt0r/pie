@@ -92,8 +92,16 @@ const TRIGGER_PANEL_RULE_LIMIT: usize = 5;
 pub struct PanelStatus {
     pub mcp_servers: usize,
     pub mcp_tools: usize,
-    pub mcp_push_hooks: usize,
+    /// Count of `McpNotificationHook` instances (RFC 1 §4.2.3) — server-pushed notification
+    /// adapters fanning MCP frames into the trigger runtime. Distinct from `hook_points`,
+    /// which lists `*Hook` trait registrations (e.g. `before_tool_call`).
+    pub mcp_notification_hooks: usize,
+    /// Real `AgentHarness` `*Hook` trait registrations active in this binary.
     pub hook_points: Vec<String>,
+    /// Trigger-runtime pipeline features wired in this binary (dedup, cycle, etc.). Not
+    /// pluggable callbacks — labelled separately from `hook_points` so users can't mistake
+    /// them for extension points.
+    pub trigger_features: Vec<String>,
 }
 
 /// Everything the app needs to run a session, assembled by `main.rs` after the harness is built.
@@ -942,7 +950,10 @@ impl App {
             }
         }
 
-        let status_rows = 6 + self.panel_status.hook_points.len().max(1);
+        let hook_rows = self.panel_status.hook_points.len().max(1);
+        let feature_rows = self.panel_status.trigger_features.len().max(1);
+        // 2 section gaps + 2 section titles + 2 mcp body rows + hook rows + feature rows + 1 trigger-runtime gap/title
+        let status_rows = 2 + 2 + 2 + hook_rows + 2 + feature_rows;
         while lines.len() + status_rows < height {
             lines.push(Line::raw(""));
         }
@@ -961,7 +972,10 @@ impl App {
                 width,
             ));
             lines.push(panel_line(
-                format!("push hooks {}", self.panel_status.mcp_push_hooks),
+                format!(
+                    "notification hooks {}",
+                    self.panel_status.mcp_notification_hooks
+                ),
                 Color::DarkGray,
                 width,
             ));
@@ -974,6 +988,20 @@ impl App {
         } else {
             for point in &self.panel_status.hook_points {
                 lines.push(panel_line(format!("✓ {point}"), Color::Green, width));
+            }
+        }
+
+        lines.push(Line::raw(""));
+        lines.push(panel_line(
+            "Trigger runtime".to_string(),
+            Color::Cyan,
+            width,
+        ));
+        if self.panel_status.trigger_features.is_empty() {
+            lines.push(panel_line("none".to_string(), Color::DarkGray, width));
+        } else {
+            for feature in &self.panel_status.trigger_features {
+                lines.push(panel_line(format!("• {feature}"), Color::DarkGray, width));
             }
         }
         lines
@@ -1358,14 +1386,18 @@ mod tests {
         app.panel_status = PanelStatus {
             mcp_servers: 1,
             mcp_tools: 2,
-            mcp_push_hooks: 1,
+            mcp_notification_hooks: 1,
             hook_points: vec!["before_tool_call".into(), "after_tool_call".into()],
+            trigger_features: vec!["dedup".into(), "cycle suppress".into()],
         };
         crate::triggers::global_registry()
             .add_rule("a build finishes", "summarize the result")
             .unwrap();
 
-        let backend = TestBackend::new(120, 20);
+        // Tall enough that all three sections (MCP / Hooks / Trigger runtime) clear the
+        // right-rail clip — see `trigger_panel_lines`'s `status_rows` budget. The Trigger
+        // runtime bullets render at the bottom of the panel; a 20-row buffer cuts them off.
+        let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| app.render(f)).unwrap();
         let text = buffer_text(terminal.backend().buffer());
@@ -1385,10 +1417,24 @@ mod tests {
             text.contains("servers 1 · tools 2"),
             "mcp status missing:\n{text}"
         );
+        assert!(
+            text.contains("notification hooks 1"),
+            "renamed mcp notification-hook label missing:\n{text}"
+        );
         assert!(text.contains("Hooks"), "hooks section missing:\n{text}");
         assert!(
             text.contains("before_tool_call"),
             "hook point status missing:\n{text}"
+        );
+        // Trigger runtime features render as their own section, separate from `Hooks`, so users
+        // can't mistake `dedup` / `cycle suppress` etc. for pluggable callbacks.
+        assert!(
+            text.contains("Trigger runtime"),
+            "trigger-runtime feature section title missing:\n{text}"
+        );
+        assert!(
+            text.contains("dedup"),
+            "trigger-runtime feature label missing:\n{text}"
         );
     }
 
