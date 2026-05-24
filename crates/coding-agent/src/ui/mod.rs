@@ -28,6 +28,7 @@ pub mod listener;
 
 pub use feed::FeedUpdate;
 
+use std::collections::VecDeque;
 use std::io::{IsTerminal, Write as _};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -84,6 +85,40 @@ const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "�
 const MAX_INPUT_ROWS: usize = 6;
 const SCROLL_STEP: usize = 3;
 const COMPLETION_POPUP_MAX: usize = 8;
+const QUEUED_PREVIEW_CHARS: usize = 80;
+
+enum QueuedTurn {
+    UserPrompt {
+        display: String,
+        prompt: String,
+        images: Vec<ImageContent>,
+    },
+    AgentPrompt {
+        display: String,
+        prompt: String,
+        error_context: &'static str,
+    },
+    PromptTemplate {
+        display: String,
+        name: String,
+        vars: serde_json::Map<String, serde_json::Value>,
+    },
+    Compaction {
+        display: String,
+        custom: Option<String>,
+    },
+}
+
+impl QueuedTurn {
+    fn display(&self) -> &str {
+        match self {
+            Self::UserPrompt { display, .. }
+            | Self::AgentPrompt { display, .. }
+            | Self::PromptTemplate { display, .. }
+            | Self::Compaction { display, .. } => display,
+        }
+    }
+}
 const TRIGGER_PANEL_MIN_TOTAL_WIDTH: u16 = 100;
 const TRIGGER_PANEL_WIDTH: u16 = 36;
 const TRIGGER_PANEL_RULE_LIMIT: usize = 5;
@@ -152,6 +187,7 @@ pub struct App {
     last_feed_area: Option<Rect>,
 
     busy: bool,
+    queued_turns: VecDeque<QueuedTurn>,
     spinner_frame: usize,
     last_ctrlc: Option<Instant>,
     quit: bool,
@@ -186,6 +222,7 @@ impl App {
             last_viewport_h: 1,
             last_feed_area: None,
             busy: false,
+            queued_turns: VecDeque::new(),
             spinner_frame: 0,
             last_ctrlc: None,
             quit: false,
@@ -369,6 +406,7 @@ impl App {
         }
         turn.aborted = false;
         turn.prefix = "";
+        self.start_next_queued_turn(turn);
     }
 
     // ── event handling ──────────────────────────────────────────────────────────────────
@@ -440,16 +478,20 @@ impl App {
                 self.refresh_completions();
             }
             KeyCode::Enter => {
-                if turn.fut.is_none() {
-                    self.submit(turn, terminal).await?;
-                }
+                self.submit(turn, terminal).await?;
             }
             KeyCode::Tab => self.cycle_completion(),
             KeyCode::PageUp => self.scroll_up(self.last_viewport_h.max(1)),
             KeyCode::PageDown => self.scroll_down(self.last_viewport_h.max(1)),
             KeyCode::Up if self.input_is_single_line() => self.history_prev(),
             KeyCode::Down if self.input_is_single_line() => self.history_next(),
-            KeyCode::Char('u') if ctrl => self.clear_input(),
+            KeyCode::Char('u') if ctrl => {
+                if self.input_text().is_empty() && turn.fut.is_some() {
+                    self.cancel_last_queued_turn();
+                } else {
+                    self.clear_input();
+                }
+            }
             _ => {
                 self.input.input(key);
                 self.last_ctrlc = None;
@@ -483,7 +525,6 @@ impl App {
             return Ok(());
         }
 
-        self.feed.push_user(&trimmed);
         let (expanded, _resolved) = mentions::expand(&trimmed, &self.cwd).await;
         let prompt_text =
             commands::attach_skill_prompt(expanded, self.pending_skill.take().as_deref());
@@ -502,25 +543,12 @@ impl App {
             }
         };
 
-        let harness = self.harness.clone();
-        let retry = self.retry.clone();
-        let has_images = !loaded_images.is_empty();
-        turn.fut = Some(Box::pin(async move {
-            if has_images {
-                harness
-                    .prompt_with_images(prompt_text, loaded_images)
-                    .await
-                    .map(|_| None)
-            } else {
-                AgentSession::new(harness, retry)
-                    .prompt(prompt_text)
-                    .await
-                    .map(|_| None)
-            }
-        }));
-        turn.aborted = false;
-        turn.prefix = "";
-        self.busy = true;
+        if turn.fut.is_some() {
+            self.queue_user_prompt(trimmed, prompt_text, loaded_images);
+        } else {
+            self.feed.push_user(&trimmed);
+            self.start_user_prompt_turn(prompt_text, loaded_images, turn);
+        }
         Ok(())
     }
 
@@ -540,6 +568,77 @@ impl App {
         turn.aborted = false;
         turn.prefix = "triggered turn: ";
         self.busy = true;
+    }
+
+    fn queue_user_prompt(&mut self, display: String, prompt: String, images: Vec<ImageContent>) {
+        self.enqueue_turn(QueuedTurn::UserPrompt {
+            display,
+            prompt,
+            images,
+        });
+    }
+
+    fn enqueue_turn(&mut self, job: QueuedTurn) {
+        let preview = queue_preview(job.display());
+        self.queued_turns.push_back(job);
+        self.system_line(format!(
+            "queued next message #{}: {preview}",
+            self.queued_turns.len()
+        ));
+    }
+
+    fn cancel_last_queued_turn(&mut self) {
+        let Some(job) = self.queued_turns.pop_back() else {
+            self.system_line("queue is empty");
+            return;
+        };
+        let preview = queue_preview(job.display());
+        self.system_line(format!("removed queued message: {preview}"));
+    }
+
+    fn start_next_queued_turn(&mut self, turn: &mut TurnState) {
+        if turn.fut.is_some() {
+            return;
+        }
+        let Some(job) = self.queued_turns.pop_front() else {
+            return;
+        };
+        let remaining = self.queued_turns.len();
+        self.system_line(if remaining == 0 {
+            "running queued message".to_string()
+        } else {
+            format!("running queued message ({remaining} still queued)")
+        });
+        match job {
+            QueuedTurn::UserPrompt {
+                display,
+                prompt,
+                images,
+            } => {
+                self.feed.push_user(display);
+                self.start_user_prompt_turn(prompt, images, turn);
+            }
+            QueuedTurn::AgentPrompt {
+                display,
+                prompt,
+                error_context,
+            } => {
+                self.feed.push_user(display);
+                self.start_prompt_turn(prompt, error_context, turn);
+            }
+            QueuedTurn::PromptTemplate {
+                display,
+                name,
+                vars,
+            } => {
+                self.feed.push_user(display);
+                self.start_template_turn(name, vars, turn);
+            }
+            QueuedTurn::Compaction { display, custom } => {
+                self.feed.push_user(display);
+                self.start_compaction_turn(custom, turn);
+            }
+        }
     }
 
     async fn dispatch_slash(
@@ -572,34 +671,36 @@ impl App {
                 prompt,
                 error_context,
             } => {
-                self.start_prompt_turn(prompt, error_context, turn);
+                if turn.fut.is_some() {
+                    self.enqueue_turn(QueuedTurn::AgentPrompt {
+                        display: input.to_string(),
+                        prompt,
+                        error_context,
+                    });
+                } else {
+                    self.start_prompt_turn(prompt, error_context, turn);
+                }
             }
             CommandOutcome::RunPromptTemplate { name, vars } => {
-                let harness = self.harness.clone();
-                turn.fut = Some(Box::pin(async move {
-                    harness
-                        .prompt_from_template(&name, vars)
-                        .await
-                        .map(|_| None)
-                }));
-                turn.aborted = false;
-                turn.prefix = "template run failed: ";
-                self.busy = true;
+                if turn.fut.is_some() {
+                    self.enqueue_turn(QueuedTurn::PromptTemplate {
+                        display: input.to_string(),
+                        name,
+                        vars,
+                    });
+                } else {
+                    self.start_template_turn(name, vars, turn);
+                }
             }
             CommandOutcome::RunCompaction { custom } => {
-                let harness = self.harness.clone();
-                turn.fut = Some(Box::pin(async move {
-                    harness.force_compact(custom).await.map(|ran| {
-                        Some(if ran {
-                            "compaction ran".to_string()
-                        } else {
-                            "nothing to compact".to_string()
-                        })
-                    })
-                }));
-                turn.aborted = false;
-                turn.prefix = "compaction failed: ";
-                self.busy = true;
+                if turn.fut.is_some() {
+                    self.enqueue_turn(QueuedTurn::Compaction {
+                        display: input.to_string(),
+                        custom,
+                    });
+                } else {
+                    self.start_compaction_turn(custom, turn);
+                }
             }
             CommandOutcome::LoginSecret { provider } => {
                 self.login(&provider, terminal).await;
@@ -620,6 +721,67 @@ impl App {
         }));
         turn.aborted = false;
         turn.prefix = error_context;
+        self.busy = true;
+    }
+
+    fn start_user_prompt_turn(
+        &mut self,
+        prompt_text: String,
+        loaded_images: Vec<ImageContent>,
+        turn: &mut TurnState,
+    ) {
+        let harness = self.harness.clone();
+        let retry = self.retry.clone();
+        let has_images = !loaded_images.is_empty();
+        turn.fut = Some(Box::pin(async move {
+            if has_images {
+                harness
+                    .prompt_with_images(prompt_text, loaded_images)
+                    .await
+                    .map(|_| None)
+            } else {
+                AgentSession::new(harness, retry)
+                    .prompt(prompt_text)
+                    .await
+                    .map(|_| None)
+            }
+        }));
+        turn.aborted = false;
+        turn.prefix = "";
+        self.busy = true;
+    }
+
+    fn start_template_turn(
+        &mut self,
+        name: String,
+        vars: serde_json::Map<String, serde_json::Value>,
+        turn: &mut TurnState,
+    ) {
+        let harness = self.harness.clone();
+        turn.fut = Some(Box::pin(async move {
+            harness
+                .prompt_from_template(&name, vars)
+                .await
+                .map(|_| None)
+        }));
+        turn.aborted = false;
+        turn.prefix = "template run failed: ";
+        self.busy = true;
+    }
+
+    fn start_compaction_turn(&mut self, custom: Option<String>, turn: &mut TurnState) {
+        let harness = self.harness.clone();
+        turn.fut = Some(Box::pin(async move {
+            harness.force_compact(custom).await.map(|ran| {
+                Some(if ran {
+                    "compaction ran".to_string()
+                } else {
+                    "nothing to compact".to_string()
+                })
+            })
+        }));
+        turn.aborted = false;
+        turn.prefix = "compaction failed: ";
         self.busy = true;
     }
 
@@ -880,7 +1042,11 @@ impl App {
         }
 
         // Hint line.
-        let hint = "Enter send · Alt+Enter newline · ↑↓ history · Wheel/PgUp scroll · Shift/Option-drag select · Ctrl-C abort";
+        let hint = if self.busy {
+            "Enter queue next · Alt+Enter newline · Ctrl-C abort current · empty Ctrl-U removes last queued · Wheel/PgUp scroll"
+        } else {
+            "Enter send · Alt+Enter newline · ↑↓ history · Wheel/PgUp scroll · Shift/Option-drag select · Ctrl-C abort"
+        };
         frame.render_widget(
             Paragraph::new(Line::styled(
                 feed::truncate_chars(hint, hint_area.width as usize),
@@ -1016,13 +1182,18 @@ impl App {
                 .map(|m| format!("{}:{}", m.provider.0, m.id))
                 .unwrap_or_else(|| "no-model".into())
         };
+        let queue = if self.queued_turns.is_empty() {
+            String::new()
+        } else {
+            format!(" · {} queued", self.queued_turns.len())
+        };
         let status = if self.busy {
             format!(
-                "{} working (Ctrl-C aborts)",
-                SPINNER_FRAMES[self.spinner_frame % SPINNER_FRAMES.len()]
+                "{} working (Ctrl-C aborts){queue}",
+                SPINNER_FRAMES[self.spinner_frame % SPINNER_FRAMES.len()],
             )
         } else {
-            "ready".to_string()
+            format!("ready{queue}")
         };
         let scrolled = if self.follow { "" } else { " ↑scrolled" };
         let label = format!(" pie · {model} · {status}{scrolled} ");
@@ -1168,6 +1339,11 @@ fn panel_rule_preview(text: &str, width: usize) -> String {
     feed::truncate_chars(&redacted, width.max(1))
 }
 
+fn queue_preview(text: &str) -> String {
+    let redacted = crate::bug_report::redact(text).replace('\n', " ");
+    feed::truncate_chars(&redacted, QUEUED_PREVIEW_CHARS)
+}
+
 fn new_textarea() -> TextArea<'static> {
     let mut textarea = TextArea::default();
     textarea.set_cursor_line_style(Style::default());
@@ -1307,6 +1483,20 @@ mod tests {
             rows.push(row.trim_end().to_string());
         }
         rows.join("\n")
+    }
+
+    fn feed_text(app: &App) -> String {
+        app.feed
+            .lines(100)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .into_iter()
+                    .map(|span| span.content.into_owned())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn feed_lines_text(lines: &[Line<'_>]) -> String {
@@ -1554,6 +1744,90 @@ mod tests {
         assert!(
             text.contains("working"),
             "busy status should say working:\n{text}"
+        );
+    }
+
+    #[test]
+    fn finished_turn_starts_next_queued_prompt_fifo() {
+        let mut app = test_app();
+        let mut turn = TurnState {
+            fut: Some(Box::pin(async {
+                Ok::<Option<String>, AgentRunError>(None)
+            })),
+            aborted: false,
+            prefix: "",
+        };
+
+        app.queue_user_prompt("next question".into(), "next question".into(), Vec::new());
+        assert_eq!(app.queued_turns.len(), 1);
+
+        app.finish_turn(&mut turn, Ok(None));
+
+        assert!(turn.fut.is_some(), "queued prompt should start immediately");
+        assert!(app.busy, "starting queued prompt should mark UI busy");
+        assert!(app.queued_turns.is_empty());
+        let text = feed_text(&app);
+        assert!(text.contains("queued next message #1: next question"));
+        assert!(text.contains("running queued message"));
+        assert!(text.contains("you ▸ next question"));
+    }
+
+    #[test]
+    fn status_rule_shows_queued_count_while_busy() {
+        let mut app = test_app();
+        app.busy = true;
+        app.queue_user_prompt("queued one".into(), "queued one".into(), Vec::new());
+
+        let backend = TestBackend::new(80, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+
+        assert!(text.contains("working"), "{text}");
+        assert!(text.contains("1 queued"), "{text}");
+    }
+
+    #[test]
+    fn empty_ctrl_u_removes_last_queued_prompt_while_busy() {
+        let mut app = test_app();
+        let turn = TurnState {
+            fut: Some(Box::pin(async {
+                Ok::<Option<String>, AgentRunError>(None)
+            })),
+            aborted: false,
+            prefix: "",
+        };
+        app.queue_user_prompt("first".into(), "first".into(), Vec::new());
+        app.queue_user_prompt("second".into(), "second".into(), Vec::new());
+
+        app.cancel_last_queued_turn();
+
+        assert_eq!(app.queued_turns.len(), 1);
+        assert_eq!(app.queued_turns[0].display(), "first");
+        assert!(
+            feed_text(&app).contains("removed queued message: second"),
+            "feed should explain queue cancellation"
+        );
+        assert!(
+            turn.fut.is_some(),
+            "canceling queued item must not abort current turn"
+        );
+    }
+
+    #[test]
+    fn queued_prompt_preview_redacts_token_like_text() {
+        let mut app = test_app();
+        app.queue_user_prompt(
+            "use sk-abcdefghijklmnopqrstuvwxyz123456".into(),
+            "use sk-abcdefghijklmnopqrstuvwxyz123456".into(),
+            Vec::new(),
+        );
+
+        let text = feed_text(&app);
+        assert!(text.contains("[REDACTED:openai_anthropic_key]"), "{text}");
+        assert!(
+            !text.contains("sk-abcdefghijklmnopqrstuvwxyz123456"),
+            "{text}"
         );
     }
 

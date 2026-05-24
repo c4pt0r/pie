@@ -48,6 +48,10 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
   counters, hook health, running trigger actions, recent trigger audit rows, and supports
   aborting one or all in-flight trigger actions from the terminal while rendering only
   preview-safe fields.
+- Interactive TUI prompts can now be queued while a turn is already running. Enter during
+  an active agent turn appends the next user prompt or agent-running slash command to a FIFO
+  queue, the status bar shows the queued count, queued previews are redacted/truncated for
+  display, and empty Ctrl-U removes the last queued item without aborting the active turn.
 - **#4** Dangerous-bash detector wired through `before_tool_call`. 11-pattern corpus
   (`rm -rf /`, `sudo`, `curl|sh`, etc.) returns deny reason as the synthesized tool result.
 - **#5** `@file` mention injection. Files are read, capped at 64 KiB, prepended to the
