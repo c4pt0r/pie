@@ -11,6 +11,7 @@ mod bug_report;
 mod builtin_skills;
 mod commands;
 mod config;
+mod debug;
 mod export;
 mod extensions;
 mod history;
@@ -106,6 +107,10 @@ struct Cli {
     /// `[triggers] poll_interval_secs` from `~/.pie/config.toml`, or 60 when unset.
     #[arg(long = "trigger-poll-secs", value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..))]
     trigger_poll_secs: Option<u64>,
+
+    /// Show LLM call debug logs in the conversation feed, including trigger/sub-agent calls.
+    #[arg(long)]
+    debug: bool,
 }
 
 #[tokio::main]
@@ -245,8 +250,16 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
     // Install the tracing subscriber. Failure is non-fatal — we keep running without logs.
     let logging = logging::init(&session_id);
 
+    // Feed channel is created before the harness so debug stream wrappers and trigger hooks can
+    // buffer UI-visible diagnostics even if they fire during startup.
+    let (feed_tx, feed_rx) = tokio::sync::mpsc::unbounded_channel::<ui::FeedUpdate>();
+
     // Build the harness.
-    let stream_fn = stream_fn_with_auth_store();
+    let stream_fn = if cli.debug {
+        debug::wrap_stream_fn(stream_fn_with_auth_store(), feed_tx.clone())
+    } else {
+        stream_fn_with_auth_store()
+    };
     let dynamic_trigger_registry = triggers::global_registry().clone();
     let dynamic_trigger_load_error = dynamic_trigger_registry
         .load_from_path(dynamic_trigger_path)
@@ -419,7 +432,6 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
     // structured updates onto `feed_tx`; the UI loop drains `feed_rx` and renders. Inject-and-run
     // triggered turns arrive on `main_run_*`. The full-screen TUI is the only terminal writer, so
     // nothing here writes to stdout directly.
-    let (feed_tx, feed_rx) = tokio::sync::mpsc::unbounded_channel::<ui::FeedUpdate>();
     {
         let tx = feed_tx.clone();
         commands::console::set_sink(Box::new(move |line| {
@@ -522,6 +534,9 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
             mcp_notification_hook_count
         ));
     }
+    if cli.debug {
+        app.system_line("debug: LLM call logging is enabled");
+    }
     app.system_line(format!(
         "triggers: local dynamic checker polls every {trigger_poll_secs}s while enabled rules exist"
     ));
@@ -563,7 +578,7 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
         .agent()
         .subscribe(ui::listener::agent_listener(feed_tx.clone()));
     let _unsub_harness_tui =
-        harness.subscribe_harness(ui::listener::harness_listener(feed_tx.clone()));
+        harness.subscribe_harness(ui::listener::harness_listener(feed_tx.clone(), cli.debug));
     let _unsub_dynamic_fire_once = harness.subscribe_harness(triggers::fire_once_harness_listener(
         dynamic_trigger_registry.clone(),
     ));
@@ -849,6 +864,7 @@ mod tests {
             image: Vec::new(),
             builtin_skill: Vec::new(),
             trigger_poll_secs: None,
+            debug: false,
         };
         let err = validate_base_url_override(&cli).unwrap_err().to_string();
         assert!(
