@@ -30,7 +30,7 @@ pub fn auto_detect_model(
         if let Some(m) = get_model(&provider, id) {
             return Ok(m);
         }
-        bail!("model not found in catalog: provider={p} id={id}");
+        bail!("{}", explicit_model_not_found_message(p, id));
     }
     // Detect by env, with the auth.json store as fallback (issue #13).
     let store = crate::auth::AuthStore::load().unwrap_or_default();
@@ -60,6 +60,44 @@ pub fn auto_detect_model(
             .collect::<Vec<_>>()
             .join(", ")
     );
+}
+
+fn explicit_model_not_found_message(provider: &str, id: &str) -> String {
+    let mut by_provider = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for model in pie_ai::list_models() {
+        by_provider
+            .entry(model.provider.0)
+            .or_default()
+            .push(model.id);
+    }
+    let Some(models) = by_provider.get_mut(provider) else {
+        let providers = by_provider
+            .iter()
+            .map(|(provider, models)| format!("{provider}({})", models.len()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return format!(
+            "model provider not found in catalog: provider={provider}. Known providers: {providers}"
+        );
+    };
+    models.sort();
+    let candidates = models
+        .iter()
+        .take(12)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = if models.len() > 12 {
+        format!(
+            "; run `/model list {provider}` inside pie for all {} models",
+            models.len()
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "model not found in catalog: provider={provider} id={id}. Candidates: {candidates}{more}"
+    )
 }
 
 fn first_model_for_provider(provider: &str) -> Option<Model> {

@@ -4,6 +4,7 @@
 //! `/model`, `/thinking`. The trait is shaped so future extensions (issue #10 Part B) can
 //! register additional commands without touching this file.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -12,7 +13,7 @@ use pie_agent_core::{
     AgentHarness, HookState, NotificationHookStatus, NotificationStatusSnapshot,
     RunningTriggerState, SessionTreeEntry, Skill, ThinkingLevel,
 };
-use pie_ai::{Provider, get_model};
+use pie_ai::{Model, Provider, get_model, list_models};
 
 /// Sink for slash-command output. The full-screen TUI owns the only terminal writer, so
 /// commands must not `println!` straight to stdout — they route through here. The app installs
@@ -216,7 +217,10 @@ impl SlashCommand for HelpCommand {
         "help"
     }
     fn description(&self) -> &'static str {
-        "show available commands"
+        "show available commands and model catalog help"
+    }
+    fn usage(&self) -> &'static str {
+        "[models|model]"
     }
     async fn run(&self, _argv: &[String], _ctx: &CommandCtx<'_>) -> CommandOutcome {
         // The REPL's `print_help` walks the registry — see main.rs. This handler is a stub
@@ -392,7 +396,7 @@ impl SlashCommand for ModelCommand {
         "show or switch the active model"
     }
     fn usage(&self) -> &'static str {
-        "[provider:model-id]"
+        "[provider:model-id|list [provider]]"
     }
     async fn run(&self, argv: &[String], ctx: &CommandCtx<'_>) -> CommandOutcome {
         if argv.is_empty() {
@@ -400,6 +404,15 @@ impl SlashCommand for ModelCommand {
             match current {
                 Some(m) => cprintln!("active model: {}:{}", m.provider.0, m.id),
                 None => cprintln!("(no model active)"),
+            }
+            cprintln!("Use /model list [provider] to show supported providers and models.");
+            return CommandOutcome::Handled;
+        }
+        if matches!(argv.first().map(|s| s.as_str()), Some("list" | "ls")) {
+            let provider = argv.get(1).map(String::as_str);
+            match model_catalog_text(provider) {
+                Ok(text) => emit_multiline(&text),
+                Err(e) => return CommandOutcome::Error(e),
             }
             return CommandOutcome::Handled;
         }
@@ -415,7 +428,7 @@ impl SlashCommand for ModelCommand {
         };
         let provider_obj = Provider::from(provider.as_str());
         let Some(model) = get_model(&provider_obj, &id) else {
-            return CommandOutcome::Error(format!("unknown model in catalog: {provider}:{id}"));
+            return CommandOutcome::Error(unknown_model_error(&provider, &id));
         };
         match ctx.harness.set_model(model.clone()).await {
             Ok(_) => {
@@ -464,7 +477,14 @@ impl SlashCommand for ThinkingCommand {
 }
 
 // Re-export for `print_help` in main.rs.
-pub fn print_help(registry: &Registry) {
+pub fn print_help(registry: &Registry, topic: Option<&str>) {
+    if matches!(topic, Some("model" | "models")) {
+        match model_catalog_text(None) {
+            Ok(text) => emit_multiline(&text),
+            Err(e) => cprintln!("{e}"),
+        }
+        return;
+    }
     cprintln!();
     cprintln!("Commands:");
     for cmd in registry.commands() {
@@ -487,8 +507,141 @@ pub fn print_help(registry: &Registry) {
         );
     }
     cprintln!();
+    cprintln!("Models:");
+    for line in model_help_summary_lines() {
+        cprintln!("{line}");
+    }
+    cprintln!();
     cprintln!("Anything else is sent as a prompt to the agent.");
     cprintln!();
+}
+
+pub fn cli_model_help_text() -> String {
+    let mut out = String::new();
+    out.push_str("Model catalog:\n");
+    for line in model_help_summary_lines() {
+        out.push_str("  ");
+        out.push_str(line.trim_start());
+        out.push('\n');
+    }
+    out
+}
+
+fn emit_multiline(text: &str) {
+    for line in text.lines() {
+        cprintln!("{line}");
+    }
+}
+
+fn model_help_summary_lines() -> Vec<String> {
+    let groups = model_groups();
+    let total = groups.values().map(Vec::len).sum::<usize>();
+    vec![
+        format!(
+            "  Supported providers ({}), models ({}): {}",
+            groups.len(),
+            total,
+            provider_summary(&groups)
+        ),
+        "  Full list: /help models or /model list [provider]".into(),
+        "  Custom models: ~/.pie/models.json and <cwd>/.pie/models.json".into(),
+        "  Credentials: set provider env vars or run /login <provider>.".into(),
+    ]
+}
+
+fn model_catalog_text(provider_filter: Option<&str>) -> Result<String, String> {
+    let groups = model_groups();
+    let total = groups.values().map(Vec::len).sum::<usize>();
+    let mut out = Vec::new();
+    match provider_filter {
+        Some(provider) => {
+            let Some(models) = groups.get(provider) else {
+                return Err(unknown_provider_error(provider, &groups));
+            };
+            out.push(format!(
+                "Supported models for provider '{provider}' ({}):",
+                models.len()
+            ));
+            append_model_lines(&mut out, models);
+        }
+        None => {
+            out.push(format!(
+                "Supported providers/models: {} providers, {} models",
+                groups.len(),
+                total
+            ));
+            out.push(
+                "Custom models are loaded from ~/.pie/models.json and <cwd>/.pie/models.json."
+                    .into(),
+            );
+            for (provider, models) in &groups {
+                out.push(format!("  {provider} ({})", models.len()));
+                append_model_lines(&mut out, models);
+            }
+        }
+    }
+    Ok(out.join("\n"))
+}
+
+fn model_groups() -> BTreeMap<String, Vec<Model>> {
+    let mut groups: BTreeMap<String, Vec<Model>> = BTreeMap::new();
+    for model in list_models() {
+        groups
+            .entry(model.provider.0.clone())
+            .or_default()
+            .push(model);
+    }
+    for models in groups.values_mut() {
+        models.sort_by(|a, b| a.id.cmp(&b.id));
+    }
+    groups
+}
+
+fn provider_summary(groups: &BTreeMap<String, Vec<Model>>) -> String {
+    groups
+        .iter()
+        .map(|(provider, models)| format!("{provider}({})", models.len()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn append_model_lines(out: &mut Vec<String>, models: &[Model]) {
+    for model in models {
+        if model.name.trim().is_empty() || model.name == model.id {
+            out.push(format!("    - {}", model.id));
+        } else {
+            out.push(format!("    - {} — {}", model.id, model.name));
+        }
+    }
+}
+
+fn unknown_provider_error(provider: &str, groups: &BTreeMap<String, Vec<Model>>) -> String {
+    format!(
+        "unknown provider '{provider}'. Known providers: {}",
+        provider_summary(groups)
+    )
+}
+
+fn unknown_model_error(provider: &str, id: &str) -> String {
+    let groups = model_groups();
+    let Some(models) = groups.get(provider) else {
+        return unknown_provider_error(provider, &groups);
+    };
+    let candidates = models
+        .iter()
+        .take(12)
+        .map(|m| m.id.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = if models.len() > 12 {
+        format!(
+            "; run /model list {provider} for all {} models",
+            models.len()
+        )
+    } else {
+        String::new()
+    };
+    format!("unknown model in catalog: {provider}:{id}. Candidates: {candidates}{more}")
 }
 
 struct CostCommand;
@@ -1621,7 +1774,7 @@ pub async fn dispatch(input: &str, registry: &Registry, ctx: &CommandCtx<'_>) ->
     };
     // Special-case `/help`: the handler can't see the registry, so we render here.
     if name == "help" {
-        print_help(registry);
+        print_help(registry, argv.first().map(String::as_str));
         return CommandOutcome::Handled;
     }
     let Some(cmd) = registry.find(&name) else {
@@ -1633,6 +1786,27 @@ pub async fn dispatch(input: &str, registry: &Registry, ctx: &CommandCtx<'_>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn custom_test_model(provider: &str, id: &str) -> Model {
+        Model {
+            id: id.into(),
+            name: "Secret Free Model".into(),
+            api: pie_ai::Api::from("openai-responses"),
+            provider: Provider::from(provider),
+            base_url: "https://secret-base.example/v1".into(),
+            reasoning: false,
+            thinking_level_map: None,
+            input: vec![pie_ai::InputModality::Text],
+            cost: pie_ai::ModelCost::default(),
+            context_window: 100_000,
+            max_tokens: 4096,
+            headers: Some(std::collections::HashMap::from([(
+                "Authorization".into(),
+                "Bearer sk-secret-should-not-leak".into(),
+            )])),
+            compat: None,
+        }
+    }
 
     #[test]
     fn parse_splits_on_whitespace() {
@@ -1662,6 +1836,52 @@ mod tests {
         assert!(r.find("exit").is_some());
         assert!(r.find("triggers").is_some());
         assert!(r.find("nope").is_none());
+    }
+
+    #[test]
+    fn model_help_summary_lists_builtin_providers_without_secrets() {
+        let text = cli_model_help_text();
+        assert!(text.contains("Supported providers"), "{text}");
+        assert!(text.contains("anthropic("), "{text}");
+        assert!(text.contains("openai("), "{text}");
+        assert!(text.contains("~/.pie/models.json"), "{text}");
+        assert!(text.contains("<cwd>/.pie/models.json"), "{text}");
+        assert!(!text.contains("API_KEY"), "{text}");
+        assert!(!text.contains("auth.json"), "{text}");
+    }
+
+    #[test]
+    fn model_catalog_includes_custom_models_without_secret_fields() {
+        let provider = Provider::from("help-test-provider");
+        let id = "secret-free";
+        pie_ai::register_custom_model(custom_test_model(&provider.0, id));
+
+        let text = model_catalog_text(Some(&provider.0)).unwrap();
+        assert!(text.contains("help-test-provider"), "{text}");
+        assert!(text.contains(id), "{text}");
+        assert!(text.contains("Secret Free Model"), "{text}");
+        assert!(!text.contains("secret-base"), "{text}");
+        assert!(!text.contains("sk-secret"), "{text}");
+        assert!(!text.contains("Authorization"), "{text}");
+
+        pie_ai::unregister_custom_model(&provider, id);
+    }
+
+    #[test]
+    fn unknown_model_error_lists_candidates() {
+        let message = unknown_model_error("anthropic", "definitely-not-a-model");
+        assert!(message.contains("unknown model in catalog"), "{message}");
+        assert!(message.contains("Candidates:"), "{message}");
+        assert!(message.contains("claude"), "{message}");
+    }
+
+    #[test]
+    fn unknown_provider_error_lists_provider_candidates() {
+        let groups = model_groups();
+        let message = unknown_provider_error("definitely-not-a-provider", &groups);
+        assert!(message.contains("unknown provider"), "{message}");
+        assert!(message.contains("anthropic("), "{message}");
+        assert!(message.contains("openai("), "{message}");
     }
 
     #[test]

@@ -37,7 +37,7 @@ mod ui;
 use std::io::IsTerminal as _;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use pie_agent_core::{
     AgentHarness, AgentHarnessOptions, AgentMessage, JsonlSessionRepo, PermissionPolicy,
     ThinkingLevel,
@@ -106,6 +106,7 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    print_dynamic_help_and_exit_if_requested()?;
     let cli = Cli::parse();
     let cwd = std::env::current_dir().context("getting cwd")?;
     let repo = session::open_repo(&cwd).await;
@@ -121,6 +122,19 @@ async fn main() -> Result<()> {
     }
 
     run_repl(cli, cwd, repo).await
+}
+
+fn print_dynamic_help_and_exit_if_requested() -> Result<()> {
+    if !std::env::args_os()
+        .skip(1)
+        .any(|arg| arg == "--help" || arg == "-h")
+    {
+        return Ok(());
+    }
+    let mut command = Cli::command().after_help(commands::cli_model_help_text());
+    command.print_help()?;
+    println!();
+    std::process::exit(0);
 }
 
 async fn list_sessions_cmd(repo: &JsonlSessionRepo) -> Result<()> {
