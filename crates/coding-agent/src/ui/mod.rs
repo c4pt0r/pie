@@ -60,7 +60,7 @@ use crate::readline::SlashCompleter;
 use crate::{images, mentions};
 use feed::{Feed, Level};
 use pie_agent_core::{AgentHarness, AgentMessage, AgentRunError};
-use pie_ai::{ContentBlock, ImageContent, Message, UserContent, UserContentBlock};
+use pie_ai::{ContentBlock, ImageContent, InputModality, Message, UserContent, UserContentBlock};
 
 /// In-flight model turn, polled in the event loop's `select!`. Running it as a local future
 /// (not `tokio::spawn`) sidesteps the `Send` bound — `AgentSession::prompt` briefly holds a
@@ -171,6 +171,7 @@ pub struct App {
     draft: String,
     pending_skill: Option<String>,
     pending_images: Vec<PathBuf>,
+    pending_pasted_images: Vec<ImageContent>,
 
     feed: Feed,
     feed_rx: Option<UnboundedReceiver<FeedUpdate>>,
@@ -210,6 +211,7 @@ impl App {
             draft: String::new(),
             pending_skill: None,
             pending_images: config.pending_images,
+            pending_pasted_images: Vec::new(),
             feed: Feed::new(),
             feed_rx: Some(config.feed_rx),
             main_run_rx: Some(config.main_run_rx),
@@ -480,6 +482,9 @@ impl App {
             KeyCode::Enter => {
                 self.submit(turn, terminal).await?;
             }
+            KeyCode::Char('v') if ctrl => {
+                self.paste_clipboard().await;
+            }
             KeyCode::Tab => self.cycle_completion(),
             KeyCode::PageUp => self.scroll_up(self.last_viewport_h.max(1)),
             KeyCode::PageDown => self.scroll_down(self.last_viewport_h.max(1)),
@@ -510,13 +515,17 @@ impl App {
     ) -> Result<()> {
         let text = self.input_text();
         let trimmed = text.trim().to_string();
-        if trimmed.is_empty() {
+        let has_pending_images =
+            !self.pending_images.is_empty() || !self.pending_pasted_images.is_empty();
+        if trimmed.is_empty() && !has_pending_images {
             return Ok(());
         }
         self.clear_input();
         self.history_idx = None;
         self.last_ctrlc = None;
-        self.history.append(&trimmed);
+        if !trimmed.is_empty() {
+            self.history.append(&trimmed);
+        }
         self.follow = true;
 
         if trimmed.starts_with('/') {
@@ -525,16 +534,20 @@ impl App {
             return Ok(());
         }
 
-        let (expanded, _resolved) = mentions::expand(&trimmed, &self.cwd).await;
+        let expanded = if trimmed.is_empty() {
+            String::new()
+        } else {
+            mentions::expand(&trimmed, &self.cwd).await.0
+        };
         let prompt_text =
             commands::attach_skill_prompt(expanded, self.pending_skill.take().as_deref());
 
         // `--image` payloads attach to the first prompt only.
-        let images = std::mem::take(&mut self.pending_images);
-        let loaded_images = if images.is_empty() {
+        let image_paths = std::mem::take(&mut self.pending_images);
+        let mut loaded_images = if image_paths.is_empty() {
             Vec::new()
         } else {
-            match images::load_all(&images).await {
+            match images::load_all(&image_paths).await {
                 Ok(imgs) => imgs,
                 Err(e) => {
                     self.error_line(format!("--image: {e}"));
@@ -542,11 +555,17 @@ impl App {
                 }
             }
         };
+        loaded_images.append(&mut self.pending_pasted_images);
+        if prompt_text.trim().is_empty() && loaded_images.is_empty() {
+            return Ok(());
+        }
+
+        let display = prompt_display(&trimmed, loaded_images.len());
 
         if turn.fut.is_some() {
-            self.queue_user_prompt(trimmed, prompt_text, loaded_images);
+            self.queue_user_prompt(display, prompt_text, loaded_images);
         } else {
-            self.feed.push_user(&trimmed);
+            self.feed.push_user(display);
             self.start_user_prompt_turn(prompt_text, loaded_images, turn);
         }
         Ok(())
@@ -568,6 +587,58 @@ impl App {
         turn.aborted = false;
         turn.prefix = "triggered turn: ";
         self.busy = true;
+    }
+
+    async fn paste_clipboard(&mut self) {
+        match crate::clipboard_image::read_clipboard().await {
+            Ok(crate::clipboard_image::ClipboardPaste::Image(image)) => {
+                self.attach_clipboard_image(image);
+            }
+            Ok(crate::clipboard_image::ClipboardPaste::Text(text)) => {
+                self.input.insert_str(&text);
+                self.refresh_completions();
+            }
+            Ok(crate::clipboard_image::ClipboardPaste::Empty) => {
+                self.system_line("clipboard is empty");
+            }
+            Err(e) => {
+                self.error_line(format!("clipboard paste failed: {e}"));
+            }
+        }
+    }
+
+    fn attach_clipboard_image(&mut self, image: crate::clipboard_image::ClipboardImage) {
+        if !self.current_model_accepts_images() {
+            self.error_line("current model does not support image input; switch to a vision-capable model before pasting an image");
+            return;
+        }
+        if self.pending_pasted_images.len() + self.pending_images.len()
+            >= images::MAX_IMAGES_PER_MESSAGE
+        {
+            self.error_line(format!(
+                "image attachment limit reached (max {} per message)",
+                images::MAX_IMAGES_PER_MESSAGE
+            ));
+            return;
+        }
+
+        let size = human_bytes(image.encoded_bytes);
+        let index = self.pending_pasted_images.len() + 1;
+        let label = format!(
+            "attached clipboard image #{index} ({}x{}, {size}); it will be sent with your next prompt",
+            image.width, image.height
+        );
+        self.pending_pasted_images.push(image.image);
+        self.system_line(label);
+    }
+
+    fn current_model_accepts_images(&self) -> bool {
+        let state = self.harness.agent().state();
+        state
+            .model
+            .as_ref()
+            .map(|model| model.input.contains(&InputModality::Image))
+            .unwrap_or(false)
     }
 
     fn queue_user_prompt(&mut self, display: String, prompt: String, images: Vec<ImageContent>) {
@@ -1344,6 +1415,37 @@ fn queue_preview(text: &str) -> String {
     feed::truncate_chars(&redacted, QUEUED_PREVIEW_CHARS)
 }
 
+fn prompt_display(text: &str, image_count: usize) -> String {
+    if image_count == 0 {
+        return text.to_string();
+    }
+    let suffix = image_attachment_display(image_count);
+    if text.is_empty() {
+        suffix
+    } else {
+        format!("{text}\n{suffix}")
+    }
+}
+
+fn image_attachment_display(image_count: usize) -> String {
+    match image_count {
+        1 => "[1 image attachment]".to_string(),
+        n => format!("[{n} image attachments]"),
+    }
+}
+
+fn human_bytes(bytes: usize) -> String {
+    const KIB: usize = 1024;
+    const MIB: usize = 1024 * 1024;
+    if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 fn new_textarea() -> TextArea<'static> {
     let mut textarea = TextArea::default();
     textarea.set_cursor_line_style(Style::default());
@@ -1447,12 +1549,22 @@ mod tests {
         }
     }
 
+    fn faux_vision_model() -> pie_ai::Model {
+        let mut model = faux_model();
+        model.input = vec![InputModality::Text, InputModality::Image];
+        model
+    }
+
     static TRIGGER_REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn test_app() -> App {
+        test_app_with_model(faux_model())
+    }
+
+    fn test_app_with_model(model: pie_ai::Model) -> App {
         let storage = Arc::new(MemorySessionStorage::new());
         let session = Session::new(storage as Arc<dyn SessionStorage>);
-        let opts = AgentHarnessOptions::new(faux_model(), session);
+        let opts = AgentHarnessOptions::new(model, session);
         let harness = Arc::new(AgentHarness::new(opts));
         let (_ftx, feed_rx) = tokio::sync::mpsc::unbounded_channel();
         let (_mtx, main_run_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1470,6 +1582,10 @@ mod tests {
             main_run_rx,
             panel_status: PanelStatus::default(),
         })
+    }
+
+    fn one_pixel_clipboard_image() -> crate::clipboard_image::ClipboardImage {
+        crate::clipboard_image::encode_rgba_clipboard_image(1, 1, vec![255, 0, 0, 255]).unwrap()
     }
 
     fn buffer_text(buf: &Buffer) -> String {
@@ -1815,6 +1931,69 @@ mod tests {
         assert!(
             turn.fut.is_some(),
             "canceling queued item must not abort current turn"
+        );
+    }
+
+    #[test]
+    fn attaching_clipboard_image_requires_vision_model() {
+        let mut app = test_app();
+        app.attach_clipboard_image(one_pixel_clipboard_image());
+
+        assert!(app.pending_pasted_images.is_empty());
+        let text = feed_text(&app);
+        assert!(
+            text.contains("current model does not support image input"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn attaching_clipboard_image_adds_pending_image_without_blob_echo() {
+        let mut app = test_app_with_model(faux_vision_model());
+        app.attach_clipboard_image(one_pixel_clipboard_image());
+
+        assert_eq!(app.pending_pasted_images.len(), 1);
+        let text = feed_text(&app);
+        assert!(text.contains("attached clipboard image #1"), "{text}");
+        assert!(text.contains("1x1"), "{text}");
+        assert!(
+            !text.contains(&app.pending_pasted_images[0].data),
+            "clipboard image base64 leaked into feed"
+        );
+    }
+
+    #[test]
+    fn queued_prompt_carries_pending_clipboard_image() {
+        let mut app = test_app_with_model(faux_vision_model());
+        app.attach_clipboard_image(one_pixel_clipboard_image());
+        let data = app.pending_pasted_images[0].data.clone();
+        let images = std::mem::take(&mut app.pending_pasted_images);
+
+        app.queue_user_prompt(
+            "describe this image".into(),
+            "describe this image".into(),
+            images,
+        );
+
+        assert!(app.pending_pasted_images.is_empty());
+        let Some(QueuedTurn::UserPrompt { images, .. }) = app.queued_turns.front() else {
+            panic!("expected queued user prompt");
+        };
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].mime_type, "image/png");
+        assert_eq!(images[0].data, data);
+    }
+
+    #[test]
+    fn prompt_display_surfaces_image_only_attachment_without_blob() {
+        assert_eq!(
+            prompt_display("", 1),
+            "[1 image attachment]",
+            "image-only prompts need a visible feed label"
+        );
+        assert_eq!(
+            prompt_display("describe this", 2),
+            "describe this\n[2 image attachments]"
         );
     }
 

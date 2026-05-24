@@ -9,6 +9,7 @@ mod agent_session;
 mod auth;
 mod bug_report;
 mod builtin_skills;
+mod clipboard_image;
 mod commands;
 mod config;
 mod export;

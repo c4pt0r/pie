@@ -7,8 +7,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
-const MAX_PER_IMAGE_BYTES: usize = 10 * 1024 * 1024;
-const MAX_IMAGES_PER_MESSAGE: usize = 10;
+pub const MAX_PER_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+pub const MAX_IMAGES_PER_MESSAGE: usize = 10;
 
 /// Detect a supported image's mime type from its leading bytes. Supported: PNG, JPEG, WebP,
 /// GIF — matches the providers' general intersection.
@@ -33,22 +33,28 @@ pub async fn load_one(path: &Path) -> Result<pie_ai::ImageContent> {
     let bytes = tokio::fs::read(path)
         .await
         .with_context(|| format!("read image {}", path.display()))?;
+    load_bytes(&path.display().to_string(), &bytes)
+}
+
+/// Build an image attachment from already-read bytes. Used by both `--image` paths and
+/// clipboard paste, so format and size validation stay identical.
+pub fn load_bytes(label: &str, bytes: &[u8]) -> Result<pie_ai::ImageContent> {
     if bytes.len() > MAX_PER_IMAGE_BYTES {
         bail!(
             "image {} exceeds {}MB cap ({} bytes)",
-            path.display(),
+            label,
             MAX_PER_IMAGE_BYTES / 1024 / 1024,
             bytes.len()
         );
     }
-    let mime = infer_mime(&bytes).ok_or_else(|| {
+    let mime = infer_mime(bytes).ok_or_else(|| {
         anyhow::anyhow!(
             "unsupported image format for {}; expected PNG/JPEG/WebP/GIF",
-            path.display()
+            label
         )
     })?;
     use base64::Engine;
-    let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let data = base64::engine::general_purpose::STANDARD.encode(bytes);
     Ok(pie_ai::ImageContent {
         data,
         mime_type: mime.to_string(),
@@ -108,14 +114,16 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let p = dir.path().join("x.png");
         // Minimal valid PNG header bytes — enough for magic-byte detection.
-        std::fs::write(
-            &p,
-            b"\x89PNG\r\n\x1a\nthe rest is not a real png but this test only checks load + mime",
-        )
-        .unwrap();
+        let bytes =
+            b"\x89PNG\r\n\x1a\nthe rest is not a real png but this test only checks load + mime";
+        std::fs::write(&p, bytes).unwrap();
         let img = load_one(&p).await.unwrap();
         assert_eq!(img.mime_type, "image/png");
         assert!(!img.data.is_empty());
+
+        let from_bytes = load_bytes("clipboard", bytes).unwrap();
+        assert_eq!(from_bytes.mime_type, "image/png");
+        assert_eq!(from_bytes.data, img.data);
     }
 
     #[tokio::test]

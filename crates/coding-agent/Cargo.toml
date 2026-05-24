@@ -45,6 +45,8 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 ratatui = "0.29"
 tui-textarea = "0.7"
 unicode-width = "0.2"
+arboard = "3"
+image = { version = "0.25", default-features = false, features = ["png"] }
 clap = { version = "4", features = ["derive"] }
 ignore = "0.4"
 sha2 = "0.10"
