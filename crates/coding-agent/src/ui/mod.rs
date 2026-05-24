@@ -35,8 +35,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEvent,
+    KeyEventKind, KeyModifiers, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -972,24 +972,22 @@ fn new_textarea() -> TextArea<'static> {
 
 fn enter_tui() -> Result<()> {
     enable_raw_mode()?;
-    execute!(
-        std::io::stdout(),
-        EnterAlternateScreen,
-        EnableMouseCapture,
-        EnableBracketedPaste
-    )?;
+    write_enter_tui_commands(&mut std::io::stdout())?;
     Ok(())
 }
 
 fn leave_tui() -> Result<()> {
-    execute!(
-        std::io::stdout(),
-        DisableBracketedPaste,
-        DisableMouseCapture,
-        LeaveAlternateScreen
-    )?;
+    write_leave_tui_commands(&mut std::io::stdout())?;
     disable_raw_mode()?;
     Ok(())
+}
+
+fn write_enter_tui_commands(out: &mut impl std::io::Write) -> std::io::Result<()> {
+    execute!(out, EnterAlternateScreen, EnableBracketedPaste)
+}
+
+fn write_leave_tui_commands(out: &mut impl std::io::Write) -> std::io::Result<()> {
+    execute!(out, DisableBracketedPaste, LeaveAlternateScreen)
 }
 
 fn print_headless_update(update: &FeedUpdate, at_line_start: &mut bool) {
@@ -1203,6 +1201,37 @@ mod tests {
         assert!(msg.contains("/login ds4"));
         assert!(!msg.contains("api key for"));
         assert!(!msg.contains("sk-"));
+    }
+
+    #[test]
+    fn tui_enter_leave_do_not_enable_mouse_capture() {
+        let mut enter = Vec::new();
+        write_enter_tui_commands(&mut enter).unwrap();
+        let enter = String::from_utf8(enter).unwrap();
+        assert!(enter.contains("\x1b[?1049h"));
+        assert!(enter.contains("\x1b[?2004h"));
+        assert!(
+            !enter.contains("?1000h")
+                && !enter.contains("?1002h")
+                && !enter.contains("?1003h")
+                && !enter.contains("?1006h")
+                && !enter.contains("?1015h"),
+            "TUI should not capture mouse by default; terminal text selection must keep working: {enter:?}"
+        );
+
+        let mut leave = Vec::new();
+        write_leave_tui_commands(&mut leave).unwrap();
+        let leave = String::from_utf8(leave).unwrap();
+        assert!(leave.contains("\x1b[?2004l"));
+        assert!(leave.contains("\x1b[?1049l"));
+        assert!(
+            !leave.contains("?1000l")
+                && !leave.contains("?1002l")
+                && !leave.contains("?1003l")
+                && !leave.contains("?1006l")
+                && !leave.contains("?1015l"),
+            "leave path should not emit mouse-capture toggles either: {leave:?}"
+        );
     }
 
     #[test]
