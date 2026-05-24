@@ -7,6 +7,7 @@ pub mod edit;
 pub mod find;
 pub mod git;
 pub mod grep;
+pub mod install_skill;
 pub mod ls;
 pub mod mcp_adapter;
 pub mod memory;
@@ -77,6 +78,15 @@ pub fn task_tool(
 /// `AgentToolError`, never a panic.
 pub fn skill_tool(harness_cell: skill::SkillHarnessCell) -> Arc<dyn AgentTool> {
     Arc::new(skill::SkillTool::new(harness_cell))
+}
+
+/// Build the `InstallSkill` tool. Same harness-cell wiring as `skill_tool` because install
+/// must hot-reload the catalog via `AgentHarness::reload_skills_from_disk` after writing.
+/// See `install_skill::InstallSkillTool` for the two-phase safety model
+/// (preview → confirm) and the security note about the in-flight
+/// `PermissionCategory::ControlPlaneWrite` plumbing.
+pub fn install_skill_tool(harness_cell: skill::SkillHarnessCell) -> Arc<dyn AgentTool> {
+    Arc::new(install_skill::InstallSkillTool::new(harness_cell))
 }
 
 /// Build the dynamic trigger creation tool. This is model-facing counterpart to the

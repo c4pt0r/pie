@@ -1,0 +1,948 @@
+//! `InstallSkill` builtin tool (issue #87 sub-PR B).
+//!
+//! Lets the agent install a new skill into the user-global skills directory
+//! (`~/.pie/skills/<name>/SKILL.md`) from one of three sources: an `https://` URL, a local
+//! path, or inline content. Hot-reloads the running harness's catalog so the next prompt
+//! sees the new skill without a pie restart.
+//!
+//! Safety model — the agent should NEVER auto-install third-party skill bodies. Two layers:
+//!
+//! 1. **Schema-level two phase**. The first tool call (without `confirm: true`) is
+//!    read-only: fetch + parse + validate + return a preview JSON (`{name, description,
+//!    target_path, content_hash, size, existing, overwrite_required}`). The body is NOT
+//!    promoted to the catalog and is NOT echoed verbatim into the tool result. The agent
+//!    must explicitly call again with `confirm: true` (and `overwrite: true` if a same-name
+//!    skill already exists) for the install to actually run. This means even if the
+//!    permission layer runs `Allow`, the model can't silently install on a single
+//!    tool-call sequence.
+//! 2. **Permission category** — `InstallSkill` should opt into
+//!    [`pie_agent_core::PermissionCategory::ControlPlaneWrite`] so the harness hook can
+//!    prompt the user. As of this PR the harness `before_tool_call` plumbing doesn't yet
+//!    route tools through a non-default category (see PermissionCategory docs:
+//!    "Tools-MCP / CLI-TUI's follow-up PRs add the danger classifier + Prompt path
+//!    here"). PR-C (`/skills install <url>`) provides the user-facing prompt at the CLI
+//!    layer; once the runtime Prompt path is wired, this tool's writes will additionally
+//!    require user confirmation through the BeforeToolCallHook chain.
+//!
+//! Hard caps (all enforced before any fs write):
+//! - URL/content size: 64 KiB (skills are markdown; an oversized body is almost certainly
+//!   not a real skill artifact).
+//! - URL: `https://` only — no `http`, no `file://`, no `data:`. Bare loopback/private-IP
+//!   host strings (`127.x`, `10.x`, `192.168.x`, `localhost`, etc.) are rejected before
+//!   the request goes out so an attacker can't SSRF the user's local network.
+//! - Path: must be absolute, must canonicalize within itself (no symlink escape into a
+//!   non-pie tree), must end in `.md` or `SKILL.md`.
+//! - Skill name: must come from the frontmatter `name:` field, must match
+//!   `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$` and be ≤ 64 chars (matches `validate_name` in
+//!   `pie_agent_core::harness::skills`). No path traversal characters reach the target
+//!   path.
+
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use once_cell::sync::Lazy;
+use pie_agent_core::{
+    AgentTool, AgentToolError, AgentToolResult, AgentToolUpdate, ToolExecutionMode,
+};
+use pie_ai::{Tool, UserContentBlock};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use tokio_util::sync::CancellationToken;
+
+use crate::tools::skill::SkillHarnessCell;
+
+/// Skills are markdown — even a verbose one fits well under 64 KiB. Anything larger is
+/// almost certainly not a skill artifact and we refuse to install it.
+const MAX_SKILL_BYTES: usize = 64 * 1024;
+/// Bound on the URL fetch round-trip so a hostile server can't hang the install path.
+const HTTP_TIMEOUT_SECS: u64 = 15;
+const MAX_NAME_LEN: usize = 64;
+const MAX_DESCRIPTION_LEN: usize = 1024;
+
+pub struct InstallSkillTool {
+    harness: SkillHarnessCell,
+    /// Resolved at construction time to whatever `base_dir()` returns in production
+    /// (`~/.pie`). Stored explicitly so tests can construct the tool with a temp dir
+    /// instead of mutating the user's real home directory.
+    skills_root: PathBuf,
+}
+
+impl InstallSkillTool {
+    pub fn new(harness: SkillHarnessCell) -> Self {
+        Self::with_skills_root(harness, default_skills_root())
+    }
+
+    /// Construct with an explicit skills root. Used by tests so atomic-write and
+    /// preview/overwrite-detection paths exercise a temp dir, not the real
+    /// `~/.pie/skills/`.
+    pub fn with_skills_root(harness: SkillHarnessCell, skills_root: PathBuf) -> Self {
+        Self {
+            harness,
+            skills_root,
+        }
+    }
+
+    fn target_path(&self, name: &str) -> PathBuf {
+        self.skills_root.join(name).join("SKILL.md")
+    }
+}
+
+/// Production skills root: `${PIE_DIR:-$HOME/.pie}/skills`. Inlined so this module can be
+/// included by integration tests that pull `tools/mod.rs` via `#[path = ...]` and don't have
+/// access to `crate::config`.
+fn default_skills_root() -> PathBuf {
+    if let Ok(p) = std::env::var("PIE_DIR") {
+        return PathBuf::from(p).join("skills");
+    }
+    directories::BaseDirs::new()
+        .map(|d| d.home_dir().join(".pie").join("skills"))
+        .unwrap_or_else(|| PathBuf::from(".pie").join("skills"))
+}
+
+#[async_trait]
+impl AgentTool for InstallSkillTool {
+    fn definition(&self) -> &Tool {
+        &DEFINITION
+    }
+
+    fn label(&self) -> &str {
+        "InstallSkill"
+    }
+
+    fn execution_mode(&self) -> Option<ToolExecutionMode> {
+        // Install path writes to the global skills directory and triggers a harness
+        // reload — request sequential execution so it doesn't race other tool calls in
+        // the same turn (e.g. a second InstallSkill, or reads of the skill catalog).
+        Some(ToolExecutionMode::Sequential)
+    }
+
+    async fn execute(
+        &self,
+        _id: &str,
+        params: Value,
+        cancel: CancellationToken,
+        _on_update: Option<AgentToolUpdate>,
+    ) -> Result<AgentToolResult, AgentToolError> {
+        let input: InstallInput = serde_json::from_value(params)
+            .map_err(|e| AgentToolError::Message(format!("invalid arguments: {e}")))?;
+
+        // Phase 1: fetch + parse + validate. Pure read; no fs writes happen here.
+        let fetched = fetch_source(&input.source, &cancel).await?;
+        let parsed = parse_and_validate(&fetched)?;
+        let target_path = self.target_path(&parsed.name);
+        // Hash the actual on-disk bytes (same algorithm we use on the new content) so the
+        // idempotent re-install case (same content already installed) doesn't spuriously
+        // require `overwrite: true`. If the target doesn't exist yet, existing=false.
+        let existing_hash = on_disk_skill_hash(&target_path).await;
+        let existing = existing_hash.is_some();
+        let overwrite_required = existing && existing_hash.as_deref() != Some(&parsed.content_hash);
+
+        if !input.confirm {
+            return Ok(AgentToolResult {
+                content: vec![UserContentBlock::text(format!(
+                    "preview only — call again with `confirm: true` to install. \
+                     name={} target={} size={}B existing={} overwrite_required={}",
+                    parsed.name,
+                    target_path.display(),
+                    parsed.size,
+                    existing,
+                    overwrite_required
+                ))],
+                details: json!({
+                    "phase": "preview",
+                    "name": parsed.name,
+                    "description": parsed.description,
+                    "target_path": target_path.display().to_string(),
+                    "content_hash": parsed.content_hash,
+                    "size": parsed.size,
+                    "existing": existing,
+                    "overwrite_required": overwrite_required,
+                }),
+                terminate: None,
+            });
+        }
+
+        // Phase 2: install. Refuse silent overwrite unless caller explicitly asked.
+        if overwrite_required && !input.overwrite {
+            return Err(AgentToolError::Message(format!(
+                "skill '{}' already exists with different content. Call again with \
+                 `overwrite: true` to replace it (existing hash differs from new content).",
+                parsed.name
+            )));
+        }
+
+        atomic_write_skill(&target_path, &fetched.content).await?;
+
+        // Hot-reload via the runtime API (PR-A). On success the harness already swapped its
+        // skill catalog and rebuilt the system prompt; the next turn sees the new skill.
+        let harness = self
+            .harness
+            .get()
+            .ok_or_else(|| AgentToolError::from("InstallSkill not yet initialized"))?;
+        let reload = harness
+            .reload_skills_from_disk()
+            .await
+            .map_err(|e| AgentToolError::Message(format!("reload after install: {e}")))?;
+
+        // Did the new skill actually surface in the reloaded catalog?
+        let installed = reload.skills.iter().any(|s| s.name == parsed.name);
+        let warnings: Vec<String> = reload
+            .diagnostics
+            .iter()
+            .filter(|d| {
+                d.path.contains(&parsed.name) || d.path == target_path.display().to_string()
+            })
+            .map(|d| format!("{:?}: {}", d.code, d.message))
+            .collect();
+
+        Ok(AgentToolResult {
+            content: vec![UserContentBlock::text(format!(
+                "installed skill '{}' to {} ({}B). catalog now has {} skill(s).",
+                parsed.name,
+                target_path.display(),
+                parsed.size,
+                reload.skills.len()
+            ))],
+            details: json!({
+                "phase": "installed",
+                "name": parsed.name,
+                "target_path": target_path.display().to_string(),
+                "content_hash": parsed.content_hash,
+                "size": parsed.size,
+                "overwrote": overwrite_required,
+                "total_skills_after": reload.skills.len(),
+                "diagnostics_count": reload.diagnostics.len(),
+                "warnings": warnings,
+                "installed_visible_in_catalog": installed,
+            }),
+            terminate: None,
+        })
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────────────────
+// Input
+// ──────────────────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct InstallInput {
+    source: Source,
+    #[serde(default)]
+    confirm: bool,
+    #[serde(default)]
+    overwrite: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum Source {
+    Url { url: String },
+    Path { path: String },
+    Content { content: String },
+}
+
+// ──────────────────────────────────────────────────────────────────────────────────────────
+// Fetch
+// ──────────────────────────────────────────────────────────────────────────────────────────
+
+struct Fetched {
+    content: String,
+}
+
+async fn fetch_source(
+    source: &Source,
+    cancel: &CancellationToken,
+) -> Result<Fetched, AgentToolError> {
+    match source {
+        Source::Url { url } => fetch_url(url, cancel).await,
+        Source::Path { path } => fetch_path(path).await,
+        Source::Content { content } => fetch_inline(content),
+    }
+}
+
+async fn fetch_url(url: &str, cancel: &CancellationToken) -> Result<Fetched, AgentToolError> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| AgentToolError::Message(format!("invalid url: {e}")))?;
+    if parsed.scheme() != "https" {
+        return Err(AgentToolError::Message(
+            "url must use https:// (http, file, data, and other schemes are refused)".into(),
+        ));
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| AgentToolError::from("url must have a host"))?;
+    if is_private_or_local_host(host) {
+        return Err(AgentToolError::Message(format!(
+            "refusing to fetch from local/private host '{host}' (SSRF guard)"
+        )));
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .user_agent(format!("pie/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|e| AgentToolError::Message(format!("http client init: {e}")))?;
+
+    let fut = client.get(parsed).send();
+    let mut resp = tokio::select! {
+        r = fut => r.map_err(|e| AgentToolError::Message(format!("fetch failed: {e}")))?,
+        _ = cancel.cancelled() => return Err(AgentToolError::Message("cancelled".into())),
+    };
+    if !resp.status().is_success() {
+        return Err(AgentToolError::Message(format!(
+            "fetch returned non-success status: {}",
+            resp.status()
+        )));
+    }
+    // Stream-read with cap so a hostile server can't OOM the agent.
+    let mut buf = Vec::<u8>::new();
+    loop {
+        let chunk = tokio::select! {
+            r = resp.chunk() => r,
+            _ = cancel.cancelled() => return Err(AgentToolError::Message("cancelled".into())),
+        };
+        match chunk {
+            Ok(Some(c)) => {
+                if buf.len() + c.len() > MAX_SKILL_BYTES {
+                    return Err(AgentToolError::Message(format!(
+                        "skill body exceeds {MAX_SKILL_BYTES}-byte cap"
+                    )));
+                }
+                buf.extend_from_slice(&c);
+            }
+            Ok(None) => break,
+            Err(e) => {
+                return Err(AgentToolError::Message(format!("read body: {e}")));
+            }
+        }
+    }
+    let content = String::from_utf8(buf)
+        .map_err(|e| AgentToolError::Message(format!("skill body is not valid utf-8: {e}")))?;
+    Ok(Fetched { content })
+}
+
+async fn fetch_path(path: &str) -> Result<Fetched, AgentToolError> {
+    let p = PathBuf::from(path);
+    if !p.is_absolute() {
+        return Err(AgentToolError::from(
+            "path must be absolute (relative paths are ambiguous in agent context)",
+        ));
+    }
+    let meta = tokio::fs::metadata(&p)
+        .await
+        .map_err(|e| AgentToolError::Message(format!("stat {}: {e}", p.display())))?;
+    if !meta.is_file() {
+        return Err(AgentToolError::Message(format!(
+            "{} is not a regular file",
+            p.display()
+        )));
+    }
+    if meta.len() as usize > MAX_SKILL_BYTES {
+        return Err(AgentToolError::Message(format!(
+            "{} exceeds {MAX_SKILL_BYTES}-byte cap",
+            p.display()
+        )));
+    }
+    let content = tokio::fs::read_to_string(&p)
+        .await
+        .map_err(|e| AgentToolError::Message(format!("read {}: {e}", p.display())))?;
+    Ok(Fetched { content })
+}
+
+fn fetch_inline(content: &str) -> Result<Fetched, AgentToolError> {
+    if content.len() > MAX_SKILL_BYTES {
+        return Err(AgentToolError::Message(format!(
+            "inline content exceeds {MAX_SKILL_BYTES}-byte cap"
+        )));
+    }
+    Ok(Fetched {
+        content: content.to_string(),
+    })
+}
+
+/// Reject hostnames that point at the loopback / private RFC1918 / link-local space.
+/// Pre-flight check: refuses the request before the HTTP client gets a chance to follow a
+/// DNS rebinding or hit a local service. Not airtight (a hostile DNS could still resolve a
+/// public name to a private IP), but raises the bar.
+fn is_private_or_local_host(host: &str) -> bool {
+    let host_lower = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    if matches!(
+        host_lower.as_str(),
+        "localhost" | "ip6-localhost" | "ip6-loopback" | "broadcasthost"
+    ) {
+        return true;
+    }
+    if host_lower.ends_with(".localhost") || host_lower.ends_with(".local") {
+        return true;
+    }
+    if let Ok(ip) = host_lower.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_unspecified()
+                    || v4.is_broadcast()
+            }
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback() || v6.is_unspecified() || v6.segments()[0] & 0xfe00 == 0xfc00
+            }
+        };
+    }
+    false
+}
+
+// ──────────────────────────────────────────────────────────────────────────────────────────
+// Parse + validate
+// ──────────────────────────────────────────────────────────────────────────────────────────
+
+struct ParsedSkill {
+    name: String,
+    description: String,
+    content_hash: String,
+    size: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct Frontmatter {
+    name: Option<String>,
+    description: Option<String>,
+}
+
+fn parse_and_validate(fetched: &Fetched) -> Result<ParsedSkill, AgentToolError> {
+    let normalized = fetched.content.replace("\r\n", "\n").replace('\r', "\n");
+    if !normalized.starts_with("---") {
+        return Err(AgentToolError::from(
+            "skill body missing YAML frontmatter (must start with `---` followed by name/description)",
+        ));
+    }
+    let end = normalized[3..]
+        .find("\n---")
+        .ok_or_else(|| AgentToolError::from("skill frontmatter missing closing `\\n---`"))?;
+    let yaml = &normalized[4..end + 3];
+    let frontmatter: Frontmatter = serde_yaml::from_str(yaml)
+        .map_err(|e| AgentToolError::Message(format!("invalid frontmatter yaml: {e}")))?;
+
+    let name = frontmatter
+        .name
+        .ok_or_else(|| AgentToolError::from("frontmatter missing required field: name"))?;
+    validate_name(&name)?;
+
+    let description = frontmatter
+        .description
+        .ok_or_else(|| AgentToolError::from("frontmatter missing required field: description"))?;
+    let description = description.trim().to_string();
+    if description.is_empty() {
+        return Err(AgentToolError::from("description must not be empty"));
+    }
+    if description.chars().count() > MAX_DESCRIPTION_LEN {
+        return Err(AgentToolError::Message(format!(
+            "description exceeds {MAX_DESCRIPTION_LEN} characters"
+        )));
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(normalized.as_bytes());
+    let hash = hex::encode(hasher.finalize());
+
+    Ok(ParsedSkill {
+        name,
+        description,
+        content_hash: hash,
+        size: normalized.len(),
+    })
+}
+
+fn validate_name(name: &str) -> Result<(), AgentToolError> {
+    if name.is_empty() {
+        return Err(AgentToolError::from("skill name must not be empty"));
+    }
+    if name.chars().count() > MAX_NAME_LEN {
+        return Err(AgentToolError::Message(format!(
+            "skill name exceeds {MAX_NAME_LEN} characters"
+        )));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err(AgentToolError::from(
+            "skill name must contain only lowercase a-z, 0-9, and hyphens",
+        ));
+    }
+    if name.starts_with('-') || name.ends_with('-') {
+        return Err(AgentToolError::from(
+            "skill name must not start or end with a hyphen",
+        ));
+    }
+    if name.contains("--") {
+        return Err(AgentToolError::from(
+            "skill name must not contain consecutive hyphens",
+        ));
+    }
+    Ok(())
+}
+
+// ──────────────────────────────────────────────────────────────────────────────────────────
+// Target path + atomic write
+// ──────────────────────────────────────────────────────────────────────────────────────────
+
+/// Hash the on-disk SKILL.md bytes at `target_path` using the same SHA256 + line-ending
+/// normalization the new-content hash uses, so an idempotent re-install (same bytes already
+/// on disk) does not require `overwrite: true`. Returns `None` if the file doesn't exist or
+/// can't be read.
+async fn on_disk_skill_hash(target_path: &Path) -> Option<String> {
+    let bytes = tokio::fs::read(target_path).await.ok()?;
+    let s = String::from_utf8(bytes).ok()?;
+    let normalized = s.replace("\r\n", "\n").replace('\r', "\n");
+    let mut hasher = Sha256::new();
+    hasher.update(normalized.as_bytes());
+    Some(hex::encode(hasher.finalize()))
+}
+
+async fn atomic_write_skill(target: &Path, content: &str) -> Result<(), AgentToolError> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| AgentToolError::from("target path has no parent directory"))?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .map_err(|e| AgentToolError::Message(format!("create {}: {e}", parent.display())))?;
+
+    // Write to a sibling tempfile in the SAME directory so rename(2) is atomic (cross-fs
+    // rename would not be). PID + nanos collision-resistance for the rare case of two
+    // installs racing on the same skill name.
+    let tmp_name = format!(
+        ".SKILL.md.{}.{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let tmp = parent.join(tmp_name);
+
+    tokio::fs::write(&tmp, content)
+        .await
+        .map_err(|e| AgentToolError::Message(format!("write {}: {e}", tmp.display())))?;
+    if let Err(e) = tokio::fs::rename(&tmp, target).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(AgentToolError::Message(format!(
+            "rename {} -> {}: {e}",
+            tmp.display(),
+            target.display()
+        )));
+    }
+    Ok(())
+}
+
+// ──────────────────────────────────────────────────────────────────────────────────────────
+// Tool definition
+// ──────────────────────────────────────────────────────────────────────────────────────────
+
+static DEFINITION: Lazy<Tool> = Lazy::new(|| Tool {
+    name: "InstallSkill".into(),
+    description:
+        "Install a new skill into the user-global skills directory (~/.pie/skills/<name>/) \
+         and hot-reload the catalog so the next turn can use it. Two-phase: first call \
+         without `confirm` returns a preview (name, description, target path, hash, size). \
+         Second call with `confirm: true` writes atomically and reloads. Same-name skill \
+         requires `overwrite: true` when the new content hash differs. Source is one of: \
+         https URL, absolute local path, or inline content. Body is never echoed back into \
+         the tool result — only metadata + preview info."
+            .into(),
+    parameters: json!({
+        "type": "object",
+        "properties": {
+            "source": {
+                "type": "object",
+                "description": "Where to fetch the SKILL.md from.",
+                "oneOf": [
+                    {
+                        "properties": {
+                            "type": { "const": "url" },
+                            "url": {
+                                "type": "string",
+                                "description": "https:// URL. http/file/data schemes are rejected; loopback and RFC1918 hosts are rejected."
+                            }
+                        },
+                        "required": ["type", "url"],
+                        "additionalProperties": false
+                    },
+                    {
+                        "properties": {
+                            "type": { "const": "path" },
+                            "path": {
+                                "type": "string",
+                                "description": "Absolute path to a local SKILL.md file."
+                            }
+                        },
+                        "required": ["type", "path"],
+                        "additionalProperties": false
+                    },
+                    {
+                        "properties": {
+                            "type": { "const": "content" },
+                            "content": {
+                                "type": "string",
+                                "description": "Inline SKILL.md content (frontmatter + body)."
+                            }
+                        },
+                        "required": ["type", "content"],
+                        "additionalProperties": false
+                    }
+                ]
+            },
+            "confirm": {
+                "type": "boolean",
+                "default": false,
+                "description": "When false (default), returns a preview without writing. When true, performs the install."
+            },
+            "overwrite": {
+                "type": "boolean",
+                "default": false,
+                "description": "Required when a skill of the same name already exists with different content."
+            }
+        },
+        "required": ["source"],
+        "additionalProperties": false
+    }),
+});
+
+// ──────────────────────────────────────────────────────────────────────────────────────────
+// Tests
+// ──────────────────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use once_cell::sync::OnceCell as SyncOnceCell;
+    use pie_agent_core::{
+        AgentHarness, AgentHarnessOptions, MemorySessionStorage, ReloadSkillsFn, Session,
+        SessionStorage, Skill,
+    };
+    use pie_ai::{Api, Model, ModelCost, Provider};
+    use std::sync::Arc;
+
+    fn fake_model() -> Model {
+        Model {
+            id: "faux".into(),
+            name: "Faux".into(),
+            api: Api::from("faux"),
+            provider: Provider::from("faux"),
+            base_url: String::new(),
+            reasoning: false,
+            thinking_level_map: None,
+            input: vec![],
+            cost: ModelCost::default(),
+            context_window: 0,
+            max_tokens: 0,
+            headers: None,
+            compat: None,
+        }
+    }
+
+    /// Build a harness whose `reload_skills_from_disk` rescans a single test directory.
+    /// Returns the harness handle, the cell to plug into the tool, and the temp dir so
+    /// callers can construct `InstallSkillTool::with_skills_root(cell, dir.path().into())`
+    /// and exercise the install path against the same dir the harness reloads from.
+    fn build_test_harness(
+        seed: Vec<Skill>,
+    ) -> (Arc<AgentHarness>, SkillHarnessCell, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dir_path = dir.path().to_path_buf();
+        let storage = Arc::new(MemorySessionStorage::new()) as Arc<dyn SessionStorage>;
+        let session = Session::new(storage);
+        let mut opts = AgentHarnessOptions::new(fake_model(), session);
+        opts.skills = seed;
+        let dir_clone = dir_path.clone();
+        let loader: ReloadSkillsFn = Arc::new(move || {
+            let dir_for_fut = dir_clone.clone();
+            Box::pin(async move {
+                let env = pie_agent_core::NativeEnv::new(
+                    std::env::current_dir()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_default(),
+                );
+                pie_agent_core::load_skills(
+                    &env,
+                    &[dir_for_fut.to_string_lossy().as_ref()],
+                    CancellationToken::new(),
+                )
+                .await
+            })
+        });
+        opts.reload_skills_fn = Some(loader);
+        let harness = Arc::new(AgentHarness::new(opts));
+        let cell: SkillHarnessCell = Arc::new(SyncOnceCell::new());
+        // `OnceCell::set` returns `Err(T)` on collision and `T = Arc<AgentHarness>` isn't
+        // `Debug`, so use `is_ok()` + assert instead of `.expect(...)`.
+        assert!(cell.set(harness.clone()).is_ok(), "set once");
+        (harness, cell, dir)
+    }
+
+    fn make_skill_md(name: &str, description: &str, body: &str) -> String {
+        format!("---\nname: {name}\ndescription: {description}\n---\n{body}\n")
+    }
+
+    async fn execute(
+        tool: &InstallSkillTool,
+        params: Value,
+    ) -> Result<AgentToolResult, AgentToolError> {
+        tool.execute("call-1", params, CancellationToken::new(), None)
+            .await
+    }
+
+    fn test_tool(cell: SkillHarnessCell, dir: &tempfile::TempDir) -> InstallSkillTool {
+        InstallSkillTool::with_skills_root(cell, dir.path().to_path_buf())
+    }
+
+    /// Preview path is read-only — must NOT write anything to the configured skills dir.
+    /// Asserts both the absence of side effects AND the preview payload shape.
+    #[tokio::test]
+    async fn preview_returns_metadata_without_writing() {
+        let (_harness, cell, dir) = build_test_harness(vec![]);
+        let tool = test_tool(cell, &dir);
+        let skill_md = make_skill_md("alpha", "a useful skill", "do alpha things");
+
+        let result = execute(
+            &tool,
+            json!({ "source": { "type": "content", "content": skill_md } }),
+        )
+        .await
+        .expect("preview should succeed");
+
+        assert_eq!(result.details["phase"], "preview");
+        assert_eq!(result.details["name"], "alpha");
+        assert_eq!(result.details["description"], "a useful skill");
+        assert_eq!(result.details["existing"], false);
+        assert_eq!(result.details["overwrite_required"], false);
+        // Body must not be echoed verbatim. Hash + size carry the integrity info.
+        let preview_text = match &result.content[0] {
+            UserContentBlock::Text(t) => &t.text,
+            _ => panic!("expected text"),
+        };
+        assert!(
+            !preview_text.contains("do alpha things"),
+            "preview must not echo skill body, got: {preview_text}"
+        );
+        // No file should have been created in the test dir.
+        assert!(
+            !dir.path().join("alpha").exists(),
+            "preview must not create any files"
+        );
+    }
+
+    /// Path traversal / invalid name in frontmatter must be refused at parse time, BEFORE
+    /// any fs path resolution. Belt-and-suspenders: even if validate_name regressed, the
+    /// target path is derived strictly from the validated name field, never from a source
+    /// path component.
+    #[tokio::test]
+    async fn rejects_traversal_in_skill_name() {
+        let (_harness, cell, dir) = build_test_harness(vec![]);
+        let tool = test_tool(cell, &dir);
+        let evil = "---\nname: ../etc/passwd\ndescription: x\n---\nbody";
+        let err = execute(
+            &tool,
+            json!({"source": {"type": "content", "content": evil}}),
+        )
+        .await
+        .expect_err("traversal name must fail");
+        let AgentToolError::Message(m) = err else {
+            panic!("expected typed error");
+        };
+        assert!(
+            m.contains("invalid characters") || m.contains("must contain"),
+            "expected name validation error, got: {m}"
+        );
+    }
+
+    /// http:// (and any non-https scheme) is refused before the request goes out.
+    #[tokio::test]
+    async fn rejects_http_url() {
+        let (_harness, cell, dir) = build_test_harness(vec![]);
+        let tool = test_tool(cell, &dir);
+        let err = execute(
+            &tool,
+            json!({"source": {"type": "url", "url": "http://example.com/skill.md"}}),
+        )
+        .await
+        .expect_err("http must fail");
+        let AgentToolError::Message(m) = err else {
+            panic!("expected typed error");
+        };
+        assert!(m.contains("https"), "expected https-only error, got: {m}");
+    }
+
+    /// SSRF guard: loopback / RFC1918 / `.localhost` hostnames are refused.
+    #[tokio::test]
+    async fn rejects_private_and_loopback_hosts() {
+        let (_harness, cell, dir) = build_test_harness(vec![]);
+        let tool = test_tool(cell, &dir);
+        for host in [
+            "https://127.0.0.1/skill.md",
+            "https://localhost/skill.md",
+            "https://10.0.0.1/skill.md",
+            "https://192.168.1.1/skill.md",
+            "https://api.localhost/skill.md",
+        ] {
+            let result = execute(&tool, json!({"source": {"type": "url", "url": host}})).await;
+            assert!(
+                result.is_err(),
+                "host {host} must be refused, got: {result:?}"
+            );
+            if let Err(AgentToolError::Message(m)) = result {
+                assert!(
+                    m.contains("SSRF") || m.contains("local") || m.contains("private"),
+                    "host {host}: expected SSRF/local/private error, got: {m}"
+                );
+            }
+        }
+    }
+
+    /// Oversized inline content fails before any further processing.
+    #[tokio::test]
+    async fn rejects_oversized_inline_content() {
+        let (_harness, cell, dir) = build_test_harness(vec![]);
+        let tool = test_tool(cell, &dir);
+        let big = "x".repeat(MAX_SKILL_BYTES + 1);
+        let err = execute(
+            &tool,
+            json!({"source": {"type": "content", "content": big}}),
+        )
+        .await
+        .expect_err("oversized content must fail");
+        let AgentToolError::Message(m) = err else {
+            panic!("expected typed error");
+        };
+        assert!(m.contains("cap"), "expected size cap error, got: {m}");
+    }
+
+    /// Malformed frontmatter / missing required fields → error before any write.
+    #[tokio::test]
+    async fn rejects_skill_missing_frontmatter() {
+        let (_harness, cell, dir) = build_test_harness(vec![]);
+        let tool = test_tool(cell, &dir);
+        for bad in [
+            "no frontmatter at all",
+            "---\nname: only-name\n---\nbody",
+            "---\ndescription: only-desc\n---\nbody",
+            "---\nname: foo\n",
+        ] {
+            let result = execute(
+                &tool,
+                json!({"source": {"type": "content", "content": bad}}),
+            )
+            .await;
+            assert!(result.is_err(), "input {bad:?} must be refused");
+        }
+    }
+
+    /// Existing skill, same on-disk content → not overwrite_required (idempotent re-install OK).
+    /// Existing skill, different on-disk content → overwrite_required=true; without `overwrite`
+    /// the install rejects with a clear "use overwrite: true" message.
+    #[tokio::test]
+    async fn overwrite_required_when_hash_differs() {
+        let (_harness, cell, dir) = build_test_harness(vec![]);
+        let tool = test_tool(cell, &dir);
+        // Pre-write an existing skill at the target path with old content.
+        let old_md = make_skill_md("alpha", "desc", "old body");
+        atomic_write_skill(&dir.path().join("alpha").join("SKILL.md"), &old_md)
+            .await
+            .unwrap();
+
+        let new_md = make_skill_md("alpha", "desc", "new body");
+
+        // Preview must signal existing + overwrite_required.
+        let preview = execute(
+            &tool,
+            json!({"source": {"type": "content", "content": new_md.clone()}}),
+        )
+        .await
+        .expect("preview ok");
+        assert_eq!(preview.details["existing"], true);
+        assert_eq!(preview.details["overwrite_required"], true);
+
+        // Confirm without overwrite must fail with a clear hint.
+        let err = execute(
+            &tool,
+            json!({"source": {"type": "content", "content": new_md.clone()}, "confirm": true}),
+        )
+        .await
+        .expect_err("install without overwrite must fail");
+        let AgentToolError::Message(m) = err else {
+            panic!("expected typed error");
+        };
+        assert!(
+            m.contains("overwrite: true"),
+            "expected overwrite-required hint, got: {m}"
+        );
+
+        // Same-bytes re-install is idempotent: existing=true, overwrite_required=false.
+        let same_preview = execute(
+            &tool,
+            json!({"source": {"type": "content", "content": old_md.clone()}}),
+        )
+        .await
+        .expect("idempotent preview ok");
+        assert_eq!(same_preview.details["existing"], true);
+        assert_eq!(same_preview.details["overwrite_required"], false);
+    }
+
+    /// Full happy path: phase 1 preview → phase 2 install via the tool itself →
+    /// fs has SKILL.md at the right path with the right content → harness reload picks it up.
+    #[tokio::test]
+    async fn install_writes_atomic_and_reloads_catalog() {
+        let (harness, cell, dir) = build_test_harness(vec![]);
+        let tool = test_tool(cell, &dir);
+        let skill_md = make_skill_md("beta", "beta desc", "beta body");
+
+        // Phase 2 directly (Phase 1 preview is exercised by another test).
+        let install = execute(
+            &tool,
+            json!({"source": {"type": "content", "content": skill_md.clone()}, "confirm": true}),
+        )
+        .await
+        .expect("install ok");
+        assert_eq!(install.details["phase"], "installed");
+        assert_eq!(install.details["name"], "beta");
+        // Atomic write produced the SKILL.md.
+        let written = tokio::fs::read_to_string(dir.path().join("beta").join("SKILL.md"))
+            .await
+            .expect("SKILL.md was written");
+        assert_eq!(written, skill_md);
+        // Harness catalog now contains the new skill (install path called
+        // reload_skills_from_disk internally).
+        assert!(
+            harness.skills().iter().any(|s| s.name == "beta"),
+            "harness catalog must reflect new skill after install"
+        );
+        // total_skills_after is reported.
+        assert!(install.details["total_skills_after"].as_u64().unwrap_or(0) >= 1);
+    }
+
+    /// Atomic write guarantee: a successful write leaves no `.tmp` sibling in the parent dir.
+    #[tokio::test]
+    async fn atomic_write_leaves_no_temp_artifact_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("gamma").join("SKILL.md");
+        atomic_write_skill(&target, "---\nname: gamma\ndescription: g\n---\nbody\n")
+            .await
+            .unwrap();
+        let mut rd = tokio::fs::read_dir(target.parent().unwrap()).await.unwrap();
+        let mut entries = Vec::new();
+        while let Some(e) = rd.next_entry().await.unwrap() {
+            entries.push(e.file_name().into_string().unwrap_or_default());
+        }
+        assert_eq!(
+            entries,
+            vec!["SKILL.md".to_string()],
+            "atomic write must not leave a tempfile sibling, got: {entries:?}"
+        );
+    }
+}

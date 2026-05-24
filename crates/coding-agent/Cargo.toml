@@ -49,6 +49,7 @@ clap = { version = "4", features = ["derive"] }
 ignore = "0.4"
 sha2 = "0.10"
 hex = "0.4"
+serde_yaml = "0.9"
 directories = "5"
 
 [target.'cfg(unix)'.dependencies]

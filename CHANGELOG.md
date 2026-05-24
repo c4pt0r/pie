@@ -97,6 +97,24 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
 
 ### Added — Framework
 
+- **`InstallSkill` builtin tool (issue #87 sub-PR B)** New harness tool that installs a skill
+  into the user-global skills directory (`~/.pie/skills/<name>/SKILL.md`) from one of three
+  sources: an `https://` URL, an absolute local path, or inline content. After the atomic
+  write, the tool calls `AgentHarness::reload_skills_from_disk` (sub-PR A) so the catalog
+  refreshes without a `pie` restart. Two-phase safety model: the first tool call returns a
+  preview JSON (`name`/`description`/`target_path`/`content_hash`/`size`/`existing`/
+  `overwrite_required`) with no filesystem side effects; the agent must explicitly call again
+  with `confirm: true` (and `overwrite: true` if a same-name skill with different on-disk
+  hash exists) for the install to actually run. The skill body is never echoed verbatim into
+  the tool result. Hard caps: 64 KiB body size, `https://`-only URLs (loopback / RFC1918 /
+  `.localhost` hostnames are pre-flight rejected as an SSRF guard), name must validate as
+  lowercase-kebab. Sequential execution mode so concurrent installs in the same turn don't
+  race. The `PermissionCategory::ControlPlaneWrite` Prompt path is a separate follow-up — for
+  now the two-phase schema is the primary defense; PR-C (`/skills install <url>`) adds the
+  CLI-side user confirmation. 9 unit tests cover preview-no-side-effects, name traversal
+  rejection, `http://` rejection, SSRF guard, oversized content cap, malformed frontmatter,
+  overwrite required / idempotent re-install, full atomic-install-and-reload path, and
+  tempfile cleanup.
 - **Skill catalog hot-reload (issue #87 sub-PR A)** New `AgentHarnessOptions::reload_skills_fn:
   Option<ReloadSkillsFn>` closure slot + `AgentHarness::reload_skills_from_disk() ->
   Result<LoadSkillsOutput, ReloadSkillsError>` async API. Lets the install path (forthcoming

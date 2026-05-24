@@ -250,6 +250,11 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
     let skill_harness_cell: tools::skill::SkillHarnessCell =
         std::sync::Arc::new(once_cell::sync::OnceCell::new());
     tools.push(tools::skill_tool(skill_harness_cell.clone()));
+    // InstallSkill tool (issue #87). Shares the same `skill_harness_cell` as `skill_tool`
+    // so post-install it can call `harness.reload_skills_from_disk()` to hot-reload the
+    // catalog. Two-phase preview→confirm safety inside the tool; see
+    // `crates/coding-agent/src/tools/install_skill.rs` for the security model.
+    tools.push(tools::install_skill_tool(skill_harness_cell.clone()));
     tools.push(tools::new_trigger_tool());
     tools.push(tools::list_triggers_tool());
     tools.push(tools::remove_trigger_tool());
