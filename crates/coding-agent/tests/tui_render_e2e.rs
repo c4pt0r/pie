@@ -645,6 +645,35 @@ fn trigger_completion_starts_on_new_line_while_readline_prompt_is_idle() {
 }
 
 #[test]
+fn trigger_completion_renders_full_summary_without_preview_truncation() {
+    let tui = tui::Tui::new();
+    let mut buf: Vec<u8> = Vec::new();
+    let summary = (0..30)
+        .map(|i| format!("trigger output line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    tui.render_harness_event(
+        &HarnessEvent::TriggerCompleted {
+            trace_id: "trace-long-result".into(),
+            summary: Some(summary.clone()),
+            cost_usd: None,
+            details: serde_json::Value::Null,
+        },
+        &mut buf,
+    );
+
+    let plain = strip_ansi(&String::from_utf8(buf).unwrap());
+    assert!(plain.contains("trigger output line 0"), "{plain}");
+    assert!(plain.contains("trigger output line 29"), "{plain}");
+    assert!(
+        !plain.contains('…'),
+        "trigger completion is the only result surface and should not be preview-truncated:\n{plain}"
+    );
+    assert!(plain.ends_with(&format!("{summary}\n")));
+}
+
+#[test]
 fn trigger_failure_renders_live_error_line() {
     let tui = tui::Tui::new();
     let mut buf: Vec<u8> = Vec::new();

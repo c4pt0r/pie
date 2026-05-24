@@ -100,7 +100,7 @@ fn map_harness_event(event: &HarnessEvent, quiet: &Mutex<HashSet<String>>) -> Op
                 text: format!(
                     "[trigger completed] trace={} {}",
                     truncate_chars(trace_id, 24),
-                    truncate_chars(summary, 180)
+                    summary
                 ),
                 level: Level::Note,
             })
@@ -217,5 +217,33 @@ mod tests {
             panic!("expected one tool end update");
         };
         assert_eq!(lines, &vec!["short".to_string(), "output".to_string()]);
+    }
+
+    #[test]
+    fn trigger_completed_summary_is_not_display_truncated() {
+        let summary = (0..30)
+            .map(|i| format!("trigger result line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let quiet = Mutex::new(HashSet::new());
+        let update = map_harness_event(
+            &HarnessEvent::TriggerCompleted {
+                trace_id: "trace-full-trigger-result".into(),
+                summary: Some(summary.clone()),
+                cost_usd: None,
+                details: serde_json::Value::Null,
+            },
+            &quiet,
+        )
+        .expect("trigger completion should render");
+
+        let FeedUpdate::Plain { text, level } = update else {
+            panic!("expected plain trigger completion line");
+        };
+        assert_eq!(level, Level::Note);
+        assert!(text.contains("[trigger completed] trace=trace-full-trigger-resu"));
+        assert!(text.contains("trigger result line 0"));
+        assert!(text.contains("trigger result line 29"));
+        assert!(text.ends_with(&summary));
     }
 }

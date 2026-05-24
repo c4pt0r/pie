@@ -230,7 +230,7 @@ impl Tui {
                     out,
                     "{DARK_GREEN}[trigger completed] trace={} {}{RESET}",
                     truncate_chars(trace_id, 24),
-                    truncate_chars(summary, 180)
+                    summary
                 );
                 let _ = out.flush();
             }
