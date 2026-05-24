@@ -24,18 +24,27 @@
 //!    layer; once the runtime Prompt path is wired, this tool's writes will additionally
 //!    require user confirmation through the BeforeToolCallHook chain.
 //!
-//! Hard caps (all enforced before any fs write):
-//! - URL/content size: 64 KiB (skills are markdown; an oversized body is almost certainly
-//!   not a real skill artifact).
-//! - URL: `https://` only — no `http`, no `file://`, no `data:`. Bare loopback/private-IP
-//!   host strings (`127.x`, `10.x`, `192.168.x`, `localhost`, etc.) are rejected before
-//!   the request goes out so an attacker can't SSRF the user's local network.
-//! - Path: must be absolute, must canonicalize within itself (no symlink escape into a
-//!   non-pie tree), must end in `.md` or `SKILL.md`.
+//! Resource protection — per EdHuang on #skill-loader (2026-05-23), skill body itself has
+//! NO artificial size cap (real skills like `https://db9.ai/skill.md` exceed any
+//! reasonable small cap). Defense lives at network + memory boundaries instead:
+//!
+//! - URL: `https://` only — no `http`, no `file://`, no `data:`. Loopback / RFC1918 /
+//!   link-local / `.localhost` hosts pre-flight rejected as SSRF guard. 15s connect/read
+//!   timeout. 5 redirects max.
+//! - Stream-read with an OOM guard (`SKILL_FETCH_OOM_GUARD_BYTES`) — well above any
+//!   realistic skill (>10 MiB) but bounded so a hostile server can't stream forever.
+//! - Path: must be absolute and a regular file. No 64 KiB artifact cap; the same
+//!   in-memory guard applies before reading unexpectedly huge local files.
+//! - Inline content: no length check; bounded in practice by the LLM provider's context
+//!   window and JSON-RPC frame size.
 //! - Skill name: must come from the frontmatter `name:` field, must match
 //!   `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$` and be ≤ 64 chars (matches `validate_name` in
 //!   `pie_agent_core::harness::skills`). No path traversal characters reach the target
 //!   path.
+//!
+//! Preview / audit / tool result remain bounded even with large skill bodies: only
+//! metadata (name, description, hash, size, target path) is echoed; the body itself never
+//! enters the tool result text or the `skill_install` Custom audit entry.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -53,9 +62,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::tools::skill::SkillHarnessCell;
 
-/// Skills are markdown — even a verbose one fits well under 64 KiB. Anything larger is
-/// almost certainly not a skill artifact and we refuse to install it.
-const MAX_SKILL_BYTES: usize = 64 * 1024;
+/// Pure OOM guard on the URL stream-read path, NOT a per-skill artifact cap. Set well
+/// above any realistic skill size (real-world skills are kilobytes, sometimes hundreds of
+/// kilobytes; we accept up to 16 MiB before refusing). The agent and the LLM provider's
+/// context window will impose smaller effective limits in practice. Per EdHuang's
+/// 2026-05-23 directive on #skill-loader, the install path does NOT gate on a small
+/// skill-body cap — only on memory safety.
+const SKILL_FETCH_OOM_GUARD_BYTES: usize = 16 * 1024 * 1024;
 /// Bound on the URL fetch round-trip so a hostile server can't hang the install path.
 const HTTP_TIMEOUT_SECS: u64 = 15;
 const MAX_NAME_LEN: usize = 64;
@@ -289,9 +302,16 @@ struct InstallInput {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Source {
-    Url { url: String },
-    Path { path: String },
-    Content { content: String },
+    #[serde(alias = "https")]
+    Url {
+        url: String,
+    },
+    Path {
+        path: String,
+    },
+    Content {
+        content: String,
+    },
 }
 
 // ──────────────────────────────────────────────────────────────────────────────────────────
@@ -309,7 +329,7 @@ async fn fetch_source(
     match source {
         Source::Url { url } => fetch_url(url, cancel).await,
         Source::Path { path } => fetch_path(path).await,
-        Source::Content { content } => fetch_inline(content),
+        Source::Content { content } => Ok(fetch_inline(content)),
     }
 }
 
@@ -357,9 +377,13 @@ async fn fetch_url(url: &str, cancel: &CancellationToken) -> Result<Fetched, Age
         };
         match chunk {
             Ok(Some(c)) => {
-                if buf.len() + c.len() > MAX_SKILL_BYTES {
+                if buf.len() + c.len() > SKILL_FETCH_OOM_GUARD_BYTES {
+                    // Pure OOM guard, not a per-skill artifact cap. See module-level docs.
                     return Err(AgentToolError::Message(format!(
-                        "skill body exceeds {MAX_SKILL_BYTES}-byte cap"
+                        "fetched skill body exceeds {SKILL_FETCH_OOM_GUARD_BYTES}-byte \
+                         in-memory guard ({} bytes received so far); refusing to install \
+                         from a stream this large",
+                        buf.len()
                     )));
                 }
                 buf.extend_from_slice(&c);
@@ -391,10 +415,14 @@ async fn fetch_path(path: &str) -> Result<Fetched, AgentToolError> {
             p.display()
         )));
     }
-    if meta.len() as usize > MAX_SKILL_BYTES {
+    // Local fs source is user-trusted (they pointed at this path) — same OOM guard as
+    // the URL stream-read, just to keep memory bounded if the path points at something
+    // unexpectedly huge.
+    if meta.len() as usize > SKILL_FETCH_OOM_GUARD_BYTES {
         return Err(AgentToolError::Message(format!(
-            "{} exceeds {MAX_SKILL_BYTES}-byte cap",
-            p.display()
+            "{} ({} bytes) exceeds {SKILL_FETCH_OOM_GUARD_BYTES}-byte in-memory guard",
+            p.display(),
+            meta.len()
         )));
     }
     let content = tokio::fs::read_to_string(&p)
@@ -403,15 +431,10 @@ async fn fetch_path(path: &str) -> Result<Fetched, AgentToolError> {
     Ok(Fetched { content })
 }
 
-fn fetch_inline(content: &str) -> Result<Fetched, AgentToolError> {
-    if content.len() > MAX_SKILL_BYTES {
-        return Err(AgentToolError::Message(format!(
-            "inline content exceeds {MAX_SKILL_BYTES}-byte cap"
-        )));
-    }
-    Ok(Fetched {
+fn fetch_inline(content: &str) -> Fetched {
+    Fetched {
         content: content.to_string(),
-    })
+    }
 }
 
 /// Reject hostnames that point at the loopback / private RFC1918 / link-local space.
@@ -616,7 +639,10 @@ static DEFINITION: Lazy<Tool> = Lazy::new(|| Tool {
                 "oneOf": [
                     {
                         "properties": {
-                            "type": { "const": "url" },
+                            "type": {
+                                "enum": ["url", "https"],
+                                "description": "Use \"url\" for HTTPS URLs. \"https\" is accepted as a compatibility alias."
+                            },
                             "url": {
                                 "type": "string",
                                 "description": "https:// URL. http/file/data schemes are rejected; loopback and RFC1918 hosts are rejected."
@@ -830,6 +856,22 @@ mod tests {
         assert!(m.contains("https"), "expected https-only error, got: {m}");
     }
 
+    /// The model naturally tried `{type: "https", url: ...}` in the wild. Keep the public
+    /// schema canonical (`url`) but accept `https` as a compatibility alias so the retry
+    /// path succeeds instead of bouncing on argument decoding.
+    #[tokio::test]
+    async fn accepts_https_source_alias_for_url() {
+        let input: InstallInput = serde_json::from_value(json!({
+            "source": { "type": "https", "url": "https://example.com/skill.md" }
+        }))
+        .expect("https alias should decode");
+
+        match input.source {
+            Source::Url { url } => assert_eq!(url, "https://example.com/skill.md"),
+            _ => panic!("https alias should decode as Source::Url"),
+        }
+    }
+
     /// SSRF guard: loopback / RFC1918 / `.localhost` hostnames are refused.
     #[tokio::test]
     async fn rejects_private_and_loopback_hosts() {
@@ -856,22 +898,40 @@ mod tests {
         }
     }
 
-    /// Oversized inline content fails before any further processing.
+    /// Real skills can exceed the old 64 KiB cap (`https://db9.ai/skill.md` was ~95 KiB
+    /// when this regression was added). Inline/local skill bodies are no longer rejected
+    /// by a small fixed artifact-size cap; preview remains metadata-only and bounded.
     #[tokio::test]
-    async fn rejects_oversized_inline_content() {
+    async fn accepts_db9_sized_skill_body_without_echoing_body() {
         let (_harness, cell, dir) = build_test_harness(vec![]);
         let tool = test_tool(cell, &dir);
-        let big = "x".repeat(MAX_SKILL_BYTES + 1);
-        let err = execute(
+        let marker = "large-skill-body-marker";
+        let body = format!("{marker}\n{}", "x".repeat(128 * 1024));
+        let skill_md = make_skill_md("large-skill", "large desc", &body);
+
+        let preview = execute(
             &tool,
-            json!({"source": {"type": "content", "content": big}}),
+            json!({"source": {"type": "content", "content": skill_md.clone()}}),
         )
         .await
-        .expect_err("oversized content must fail");
-        let AgentToolError::Message(m) = err else {
-            panic!("expected typed error");
+        .expect("large skill preview should succeed");
+
+        assert_eq!(preview.details["phase"], "preview");
+        assert_eq!(preview.details["name"], "large-skill");
+        assert_eq!(preview.details["size"], skill_md.len());
+        let preview_text = match &preview.content[0] {
+            UserContentBlock::Text(t) => &t.text,
+            _ => panic!("expected text"),
         };
-        assert!(m.contains("cap"), "expected size cap error, got: {m}");
+        assert!(
+            !preview_text.contains(marker),
+            "preview must not echo large skill body, got: {preview_text}"
+        );
+        let preview_details = serde_json::to_string(&preview.details).unwrap();
+        assert!(
+            !preview_details.contains(marker),
+            "preview details must not echo large skill body, got: {preview_details}"
+        );
     }
 
     /// Malformed frontmatter / missing required fields → error before any write.

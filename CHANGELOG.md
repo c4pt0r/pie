@@ -108,10 +108,12 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
   `overwrite_required`) with no filesystem side effects; the agent must explicitly call again
   with `confirm: true` (and `overwrite: true` if a same-name skill with different on-disk
   hash exists) for the install to actually run. The skill body is never echoed verbatim into
-  the tool result. Hard caps: 64 KiB body size, `https://`-only URLs (loopback / RFC1918 /
-  `.localhost` hostnames are pre-flight rejected as an SSRF guard), name must validate as
-  lowercase-kebab. Sequential execution mode so concurrent installs in the same turn don't
-  race. Persistent audit: every successful install appends a
+  the tool result. Resource protection: no small fixed skill-body cap (real public skills
+  can exceed 64 KiB); URL fetches are `https://` only, stream-read with a 16 MiB memory
+  guard, and pre-flight reject loopback / RFC1918 / `.localhost` hostnames as an SSRF guard.
+  The source schema accepts `type: "https"` as a compatibility alias for the canonical
+  `type: "url"`. Skill names must validate as lowercase-kebab. Sequential execution mode so
+  concurrent installs in the same turn don't race. Persistent audit: every successful install appends a
   `SessionTreeEntry::Custom { custom_type: "skill_install" }` record (status / name /
   target_path / source_kind / source / before_hash / after_hash / size / overwrote /
   idempotent / installed_visible_in_catalog / diagnostics_count / warnings — body is never
@@ -123,10 +125,11 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
   audit via `details.audit_entry_id = null` and a `tracing::warn`. The
   `PermissionCategory::ControlPlaneWrite` Prompt path is a separate cross-cutting follow-up;
   for now the two-phase schema is the primary defense, and PR-C (`/skills install <url>`)
-  adds the CLI-side user confirmation. 10 unit tests cover preview-no-side-effects, name
-  traversal rejection, `http://` rejection, SSRF guard, oversized content cap, malformed
-  frontmatter, overwrite required / idempotent re-install, full atomic-install-and-reload
-  path, `skill_install` Custom audit shape + body-no-leak, and tempfile cleanup.
+  adds the CLI-side user confirmation. 11 unit tests cover preview-no-side-effects, name
+  traversal rejection, `http://` rejection, `https` alias decoding, SSRF guard,
+  db9-sized-large-body preview without body echo, malformed frontmatter, overwrite required /
+  idempotent re-install, full atomic-install-and-reload path, `skill_install` Custom audit
+  shape + body-no-leak, and tempfile cleanup.
 - **Skill catalog hot-reload (issue #87 sub-PR A)** New `AgentHarnessOptions::reload_skills_fn:
   Option<ReloadSkillsFn>` closure slot + `AgentHarness::reload_skills_from_disk() ->
   Result<LoadSkillsOutput, ReloadSkillsError>` async API. Lets the install path (forthcoming
