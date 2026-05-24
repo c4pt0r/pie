@@ -238,14 +238,23 @@ fn collapse_whitespace(s: &str) -> String {
             last_was_space = false;
             continue;
         }
-        consecutive_newlines = 0;
         if c.is_whitespace() {
+            // Whitespace (space/tab) that sits BETWEEN newlines is dropped (we already end
+            // with `\n` so the inter-word space rule skips it). Critically, we must NOT reset
+            // `consecutive_newlines` in that case — the dropped whitespace produced no visible
+            // character, so the next `\n` should still count as the 3rd/4th consecutive
+            // newline and be suppressed. Without this, indented HTML like
+            // `</p>\n   <p>` collapses to `\n\n\n` (two blank lines) instead of the intended
+            // `\n\n` (one blank line), surfacing as visible blank-line spam in the tool
+            // preview. Only reset the counter when a space is actually emitted.
             if !last_was_space && !out.ends_with('\n') {
                 out.push(' ');
                 last_was_space = true;
+                consecutive_newlines = 0;
             }
             continue;
         }
+        consecutive_newlines = 0;
         last_was_space = false;
         out.push(c);
     }
@@ -314,5 +323,43 @@ mod tests {
     fn collapse_whitespace_keeps_paragraph_breaks() {
         let s = "a   b\n\n\n\nc";
         assert_eq!(collapse_whitespace(s), "a b\n\nc");
+    }
+
+    /// Regression: indented HTML between block tags (`</p>\n   <p>`) used to collapse to
+    /// `\n\n\n` because dropping the leading spaces between newlines reset
+    /// `consecutive_newlines`. That surfaced as visible blank-line spam in the tool preview
+    /// for any source-formatted (indented) HTML page. The fix keeps the counter intact when
+    /// the whitespace is dropped, so we still cap at "at most one blank line".
+    #[test]
+    fn collapse_whitespace_caps_blank_lines_through_indented_html() {
+        // Three paragraphs separated by `</p>\n   <p>` — what
+        // `html_to_text` produces from a typical source-indented HTML body.
+        let s = "\npara1\n\n   \npara2\n\n   \npara3\n";
+        let collapsed = collapse_whitespace(s);
+
+        assert_eq!(collapsed, "para1\n\npara2\n\npara3");
+        assert!(
+            !collapsed.contains("\n\n\n"),
+            "must never produce more than one blank line between paragraphs: {collapsed:?}"
+        );
+    }
+
+    /// End-to-end: indented HTML body fed through the full `html_to_text` pipeline must not
+    /// produce visible blank-line spam. Catches the case where `<p>` tag pushes `\n`, the
+    /// source newline pushes another `\n`, and the leading indent spaces previously
+    /// reset the counter so the next `</p>` `\n` slipped past the cap.
+    #[test]
+    fn html_to_text_indented_paragraphs_have_single_blank_line_between() {
+        let html =
+            "<html><body>\n   <p>para1</p>\n   <p>para2</p>\n   <p>para3</p>\n</body></html>";
+        let text = html_to_text(html);
+
+        assert!(text.contains("para1"));
+        assert!(text.contains("para2"));
+        assert!(text.contains("para3"));
+        assert!(
+            !text.contains("\n\n\n"),
+            "indented paragraphs must collapse to at most one blank line between them: {text:?}"
+        );
     }
 }
