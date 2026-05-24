@@ -97,6 +97,16 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
 
 ### Added — Framework
 
+- **Skill catalog hot-reload (issue #87 sub-PR A)** New `AgentHarnessOptions::reload_skills_fn:
+  Option<ReloadSkillsFn>` closure slot + `AgentHarness::reload_skills_from_disk() ->
+  Result<LoadSkillsOutput, ReloadSkillsError>` async API. Lets the install path (forthcoming
+  `InstallSkillTool` / `/skills reload`) refresh the skill catalog without restarting `pie`,
+  while keeping source directories + dedup policy in a single embedder-owned closure (so
+  startup load + runtime reload never disagree on which dirs got scanned). Runtime stays
+  IO-free — the closure owns all filesystem access. In-flight turns aren't interrupted; only
+  the catalog and rebuilt `<skills>` system-prompt block change, surfaced on the next prompt.
+  Pinned by 4 regression tests covering single-call invocation, diagnostic propagation,
+  `NotConfigured` error path, and `state.messages`/`is_streaming` non-perturbation.
 - **Trigger promotion — structured authorization (RFC 1 / commit `5397199` fix-forward
   infra)** Runtime gains a structured promotion-gate path that closes the
   free-form-summary authorization channel introduced by the dynamic-trigger workflow:

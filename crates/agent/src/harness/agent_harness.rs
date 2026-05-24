@@ -568,6 +568,18 @@ pub struct AgentHarnessOptions {
     /// falls back to [`TriggerAction::default_for`] (the stable `format!("{source_label}
     /// fired: {event_label}")` mapping).
     pub before_trigger_action: Option<BeforeTriggerActionHook>,
+    /// Optional async closure invoked by [`AgentHarness::reload_skills_from_disk`] to fetch
+    /// the up-to-date skill catalog from whatever sources the embedder considers
+    /// authoritative (filesystem dirs, registry, …). When `None`,
+    /// `reload_skills_from_disk` returns [`ReloadSkillsError::NotConfigured`].
+    ///
+    /// The closure owns: source directory list, dedup policy (e.g. project-wins),
+    /// per-skill diagnostic aggregation. Runtime stays IO-free — it never inspects the
+    /// filesystem itself. This keeps `~/.pie/skills` vs project `.pie/skills` precedence
+    /// and naming policy in one place (the embedder), so startup loading and runtime
+    /// reload (e.g. after `InstallSkillTool` writes a new `SKILL.md`) share one source of
+    /// truth.
+    pub reload_skills_fn: Option<ReloadSkillsFn>,
 }
 
 impl AgentHarnessOptions {
@@ -588,8 +600,29 @@ impl AgentHarnessOptions {
             trigger_runtime: TriggerRuntimeConfig::default(),
             before_trigger: None,
             before_trigger_action: None,
+            reload_skills_fn: None,
         }
     }
+}
+
+/// Async loader closure invoked by [`AgentHarness::reload_skills_from_disk`]. Returns the
+/// fresh skill catalog (post-dedup, per the embedder's policy) plus any per-skill
+/// diagnostics from the load. See [`AgentHarnessOptions::reload_skills_fn`] for the
+/// design rationale (one source-of-truth across startup load + runtime reload).
+pub type ReloadSkillsFn = std::sync::Arc<
+    dyn Fn() -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = super::skills::LoadSkillsOutput> + Send>,
+        > + Send
+        + Sync,
+>;
+
+/// Why [`AgentHarness::reload_skills_from_disk`] couldn't run.
+#[derive(Debug, thiserror::Error)]
+pub enum ReloadSkillsError {
+    /// [`AgentHarnessOptions::reload_skills_fn`] was `None` at construction. Callers should
+    /// either pass a loader at startup or use [`AgentHarness::replace_skills`] directly.
+    #[error("reload_skills_fn was not configured at harness construction")]
+    NotConfigured,
 }
 
 pub struct AgentHarness {
@@ -611,6 +644,9 @@ pub struct AgentHarness {
     /// internal listener subscribed to `Agent::MessageEnd`. Snapshot via [`Self::cost`].
     cost: CostTracker,
     budget_cap_usd: Option<f64>,
+    /// Embedder-supplied skill catalog loader. See [`AgentHarnessOptions::reload_skills_fn`]
+    /// for ownership of source directories + dedup policy.
+    reload_skills_fn: Option<ReloadSkillsFn>,
     /// In-memory dedup + cycle evaluator shared with [`Self::handle_trigger`]. Exposed via
     /// [`Self::notification_status_snapshot`] for observability.
     trigger_runtime: TriggerRuntime,
@@ -680,6 +716,7 @@ impl AgentHarness {
             session_start_emitted: Mutex::new(false),
             cost,
             budget_cap_usd: options.budget_cap_usd,
+            reload_skills_fn: options.reload_skills_fn,
             trigger_runtime: TriggerRuntime::with_config(options.trigger_runtime),
             notification_hooks: Arc::new(Mutex::new(Vec::new())),
             before_trigger: options.before_trigger,
@@ -1093,6 +1130,34 @@ impl AgentHarness {
         *self.skills.lock() = skills;
         let prompt = build_system_prompt(&self.base_system_prompt, &self.skills.lock());
         self.agent.state().system_prompt = prompt;
+    }
+
+    /// Hot-reload the skill catalog from disk via the embedder-supplied
+    /// [`AgentHarnessOptions::reload_skills_fn`] closure. Used by `InstallSkillTool`,
+    /// `/skills reload`, and any future control-plane that needs to refresh the catalog
+    /// after a filesystem write — they all share the same source directories + dedup
+    /// policy as startup because they go through the same closure.
+    ///
+    /// Returns the loader's [`super::skills::LoadSkillsOutput`] (skills + per-skill
+    /// diagnostics) so the caller can surface a summary to the user. On success the new
+    /// catalog has already been applied via [`Self::replace_skills`] and the system prompt
+    /// rebuilt — the next prompt will see the new `<skills>` block. In-flight turns
+    /// continue against their existing context (no mid-turn prompt mutation).
+    ///
+    /// Errors with [`ReloadSkillsError::NotConfigured`] if no loader was wired at
+    /// construction — embedders that don't need reload simply leave `reload_skills_fn` as
+    /// `None` and use [`Self::replace_skills`] directly.
+    pub async fn reload_skills_from_disk(
+        &self,
+    ) -> Result<super::skills::LoadSkillsOutput, ReloadSkillsError> {
+        let loader = self
+            .reload_skills_fn
+            .as_ref()
+            .ok_or(ReloadSkillsError::NotConfigured)?
+            .clone();
+        let out = loader().await;
+        self.replace_skills(out.skills.clone());
+        Ok(out)
     }
 
     /// Replace the prompt-template registry.

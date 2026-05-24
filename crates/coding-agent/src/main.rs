@@ -307,6 +307,28 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
     opts.skills = combined_skills.clone();
     opts.prompt_templates = loaded_templates.templates.clone();
     opts.stream_fn = Some(stream_fn.clone());
+    // Skill catalog hot-reload. `AgentHarness::reload_skills_from_disk()` invokes this
+    // closure, so every reload entry point (the future `InstallSkillTool`, `/skills
+    // reload`, any control-plane API) shares the same source directories and dedup policy
+    // we used at startup — no path drift between "where skills get loaded from" and
+    // "where reload looks." Built-in skills are re-merged so a user-installed skill of
+    // the same name shadows the built-in just like at startup.
+    opts.reload_skills_fn = Some({
+        let cwd = cwd.clone();
+        let builtins = resolved_builtins.skills.clone();
+        std::sync::Arc::new(move || {
+            let cwd = cwd.clone();
+            let builtins = builtins.clone();
+            Box::pin(async move {
+                let loaded = skills::load_all(&cwd).await;
+                let merged = builtin_skills::merge_with_user_project(builtins, &loaded.skills);
+                pie_agent_core::LoadSkillsOutput {
+                    skills: merged,
+                    diagnostics: loaded.diagnostics,
+                }
+            })
+        })
+    });
     opts.before_tool_call =
         Some(PermissionPolicy::default_for_coding_agent().as_before_tool_call());
     // Triggers from MCP servers configured with `inject_summary` / `inject_and_run` bypass
