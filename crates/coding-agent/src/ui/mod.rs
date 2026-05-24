@@ -35,8 +35,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEvent,
-    KeyEventKind, KeyModifiers, MouseEventKind,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -128,6 +128,7 @@ pub struct App {
     scroll: usize,
     follow: bool,
     last_viewport_h: usize,
+    last_feed_area: Option<Rect>,
 
     busy: bool,
     spinner_frame: usize,
@@ -161,6 +162,7 @@ impl App {
             scroll: 0,
             follow: true,
             last_viewport_h: 1,
+            last_feed_area: None,
             busy: false,
             spinner_frame: 0,
             last_ctrlc: None,
@@ -360,8 +362,8 @@ impl App {
                 self.handle_key(key, turn, terminal).await?;
             }
             Event::Mouse(m) => match m.kind {
-                MouseEventKind::ScrollUp => self.scroll_up(SCROLL_STEP),
-                MouseEventKind::ScrollDown => self.scroll_down(SCROLL_STEP),
+                MouseEventKind::ScrollUp => self.handle_mouse_scroll(m.column, m.row, true),
+                MouseEventKind::ScrollDown => self.handle_mouse_scroll(m.column, m.row, false),
                 _ => {}
             },
             Event::Paste(text) => {
@@ -752,6 +754,27 @@ impl App {
         // render() clamps and re-enables follow when we reach the bottom.
     }
 
+    fn handle_mouse_scroll(&mut self, column: u16, row: u16, up: bool) {
+        if !self.mouse_in_feed(column, row) {
+            return;
+        }
+        if up {
+            self.scroll_up(SCROLL_STEP);
+        } else {
+            self.scroll_down(SCROLL_STEP);
+        }
+    }
+
+    fn mouse_in_feed(&self, column: u16, row: u16) -> bool {
+        let Some(area) = self.last_feed_area else {
+            return false;
+        };
+        column >= area.x
+            && column < area.x.saturating_add(area.width)
+            && row >= area.y
+            && row < area.y.saturating_add(area.height)
+    }
+
     // ── rendering ───────────────────────────────────────────────────────────────────────
 
     fn render(&mut self, frame: &mut ratatui::Frame) {
@@ -768,6 +791,7 @@ impl App {
         let status_area = chunks[1];
         let input_area = chunks[2];
         let hint_area = chunks[3];
+        self.last_feed_area = Some(feed_area);
 
         // Feed (pre-wrapped to width so scroll math is exact).
         let lines = self.feed.lines(feed_area.width as usize);
@@ -796,7 +820,7 @@ impl App {
         frame.render_widget(&self.input, input_area);
 
         // Hint line.
-        let hint = "Enter send · Alt+Enter newline · ↑↓ history · PgUp/PgDn scroll · Tab complete · Ctrl-C abort/exit";
+        let hint = "Enter send · Alt+Enter newline · ↑↓ history · Wheel/PgUp scroll · Shift/Option-drag select · Ctrl-C abort";
         frame.render_widget(
             Paragraph::new(Line::styled(
                 feed::truncate_chars(hint, hint_area.width as usize),
@@ -983,11 +1007,21 @@ fn leave_tui() -> Result<()> {
 }
 
 fn write_enter_tui_commands(out: &mut impl std::io::Write) -> std::io::Result<()> {
-    execute!(out, EnterAlternateScreen, EnableBracketedPaste)
+    execute!(
+        out,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )
 }
 
 fn write_leave_tui_commands(out: &mut impl std::io::Write) -> std::io::Result<()> {
-    execute!(out, DisableBracketedPaste, LeaveAlternateScreen)
+    execute!(
+        out,
+        DisableMouseCapture,
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )
 }
 
 fn print_headless_update(update: &FeedUpdate, at_line_start: &mut bool) {
@@ -1180,6 +1214,27 @@ mod tests {
     }
 
     #[test]
+    fn mouse_wheel_scrolls_only_inside_feed_area() {
+        let mut app = test_app();
+        app.last_feed_area = Some(Rect::new(2, 1, 20, 6));
+        app.scroll = 10;
+        app.follow = true;
+
+        app.handle_mouse_scroll(5, 3, true);
+        assert_eq!(app.scroll, 7);
+        assert!(!app.follow);
+
+        app.handle_mouse_scroll(5, 8, true);
+        assert_eq!(
+            app.scroll, 7,
+            "wheel events outside the feed should not move the conversation scroll"
+        );
+
+        app.handle_mouse_scroll(5, 3, false);
+        assert_eq!(app.scroll, 10);
+    }
+
+    #[test]
     fn status_rule_shows_working_spinner_when_busy() {
         let mut app = test_app();
         app.busy = true;
@@ -1204,19 +1259,15 @@ mod tests {
     }
 
     #[test]
-    fn tui_enter_leave_do_not_enable_mouse_capture() {
+    fn tui_enter_leave_enable_mouse_capture_for_feed_wheel_scroll() {
         let mut enter = Vec::new();
         write_enter_tui_commands(&mut enter).unwrap();
         let enter = String::from_utf8(enter).unwrap();
         assert!(enter.contains("\x1b[?1049h"));
         assert!(enter.contains("\x1b[?2004h"));
         assert!(
-            !enter.contains("?1000h")
-                && !enter.contains("?1002h")
-                && !enter.contains("?1003h")
-                && !enter.contains("?1006h")
-                && !enter.contains("?1015h"),
-            "TUI should not capture mouse by default; terminal text selection must keep working: {enter:?}"
+            enter.contains("\x1b[?1000h") && enter.contains("\x1b[?1006h"),
+            "TUI must capture mouse events so wheel scroll reaches the feed: {enter:?}"
         );
 
         let mut leave = Vec::new();
@@ -1225,12 +1276,8 @@ mod tests {
         assert!(leave.contains("\x1b[?2004l"));
         assert!(leave.contains("\x1b[?1049l"));
         assert!(
-            !leave.contains("?1000l")
-                && !leave.contains("?1002l")
-                && !leave.contains("?1003l")
-                && !leave.contains("?1006l")
-                && !leave.contains("?1015l"),
-            "leave path should not emit mouse-capture toggles either: {leave:?}"
+            leave.contains("\x1b[?1000l") && leave.contains("\x1b[?1006l"),
+            "leave path should restore terminal mouse handling: {leave:?}"
         );
     }
 
