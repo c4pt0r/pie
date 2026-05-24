@@ -57,7 +57,7 @@ use crate::commands::{self, CommandCtx, CommandOutcome, Registry};
 use crate::history::HistoryStore;
 use crate::readline::SlashCompleter;
 use crate::{images, mentions};
-use feed::{Feed, Level};
+use feed::{Feed, Level, compact_tool_output_lines};
 use pie_agent_core::{AgentHarness, AgentMessage, AgentRunError};
 use pie_ai::{ContentBlock, ImageContent, Message, UserContent, UserContentBlock};
 
@@ -264,8 +264,11 @@ impl App {
                         lines.extend(t.text.lines().map(ToString::to_string));
                     }
                 }
-                self.feed
-                    .push_tool_result(tr.tool_call_id.clone(), lines, tr.is_error);
+                self.feed.push_tool_result(
+                    tr.tool_call_id.clone(),
+                    compact_tool_output_lines(lines, tr.is_error),
+                    tr.is_error,
+                );
             }
             AgentMessage::Custom(_) => {}
         }
@@ -1039,6 +1042,7 @@ fn print_headless_update(update: &FeedUpdate, at_line_start: &mut bool) {
 mod tests {
     use super::*;
     use pie_agent_core::{AgentHarnessOptions, MemorySessionStorage, Session, SessionStorage};
+    use pie_ai::{ToolResultMessage, ToolResultRole};
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
 
@@ -1093,6 +1097,19 @@ mod tests {
             rows.push(row.trim_end().to_string());
         }
         rows.join("\n")
+    }
+
+    fn feed_lines_text(lines: &[Line<'_>]) -> String {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// The whole point of the refactor: the input box is pinned at the bottom with the
@@ -1192,5 +1209,34 @@ mod tests {
         assert!(msg.contains("/login ds4"));
         assert!(!msg.contains("api key for"));
         assert!(!msg.contains("sk-"));
+    }
+
+    #[test]
+    fn replayed_tool_results_are_compacted_for_display() {
+        let mut app = test_app();
+        let text = (0..50)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let message = AgentMessage::Llm(Message::ToolResult(ToolResultMessage {
+            role: ToolResultRole::ToolResult,
+            tool_call_id: "tool-1".into(),
+            tool_name: "bash".into(),
+            content: vec![UserContentBlock::text(text)],
+            details: None,
+            is_error: false,
+            timestamp: 0,
+        }));
+
+        app.replay_message(&message);
+
+        let rendered = feed_lines_text(&app.feed.lines(120));
+        assert!(rendered.contains("line 0"));
+        assert!(rendered.contains("line 49"));
+        assert!(rendered.contains("truncated"));
+        assert!(
+            !rendered.contains("line 25"),
+            "middle of long tool output should be hidden in replay display:\n{rendered}"
+        );
     }
 }
