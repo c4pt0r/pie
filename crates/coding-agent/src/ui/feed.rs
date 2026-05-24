@@ -10,6 +10,7 @@
 //! Rendering is width-aware: [`Feed::lines`] word-wraps every block to the available width and
 //! returns ready-to-draw `ratatui` lines, so scroll math operates on real display rows.
 
+use pie_ai::UserContentBlock;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -448,6 +449,19 @@ pub fn compact_tool_output_lines(lines: Vec<String>, is_error: bool) -> Vec<Stri
     } else {
         compacted
     }
+}
+
+/// Extract text blocks from a tool result and build the same display-only compact preview used
+/// for live tool events. This keeps resume replay, headless output, and legacy renderers from
+/// accidentally bypassing the display cap.
+pub fn compact_tool_content_blocks(blocks: &[UserContentBlock], is_error: bool) -> Vec<String> {
+    let mut lines = Vec::new();
+    for block in blocks {
+        if let UserContentBlock::Text(t) = block {
+            lines.extend(t.text.lines().map(ToString::to_string));
+        }
+    }
+    compact_tool_output_lines(lines, is_error)
 }
 
 fn truncation_marker(hidden_bytes: usize, hidden_lines: usize) -> String {

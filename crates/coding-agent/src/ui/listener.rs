@@ -8,10 +8,10 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use pie_agent_core::{AgentEvent, AgentListener, HarnessEvent, HarnessListener};
-use pie_ai::{AssistantMessageEvent, UserContentBlock};
+use pie_ai::AssistantMessageEvent;
 use tokio::sync::mpsc::UnboundedSender;
 
-use super::feed::{FeedUpdate, Level, compact_tool_output_lines, preview, truncate_chars};
+use super::feed::{FeedUpdate, Level, compact_tool_content_blocks, preview, truncate_chars};
 
 /// Build the per-turn agent listener. Maps streaming deltas, tool calls, and turn boundaries
 /// into feed updates.
@@ -53,10 +53,9 @@ fn map_agent_event(event: &AgentEvent) -> Vec<FeedUpdate> {
             partial_result,
             ..
         } => {
-            let lines = text_lines(&partial_result.content);
             vec![FeedUpdate::ToolProgress {
                 tool_call_id: tool_call_id.clone(),
-                lines: compact_tool_output_lines(lines, false),
+                lines: compact_tool_content_blocks(&partial_result.content, false),
                 is_error: false,
             }]
         }
@@ -68,24 +67,12 @@ fn map_agent_event(event: &AgentEvent) -> Vec<FeedUpdate> {
         } => {
             vec![FeedUpdate::ToolEnd {
                 tool_call_id: tool_call_id.clone(),
-                lines: compact_tool_output_lines(text_lines(&result.content), *is_error),
+                lines: compact_tool_content_blocks(&result.content, *is_error),
                 is_error: *is_error,
             }]
         }
         _ => Vec::new(),
     }
-}
-
-fn text_lines(blocks: &[UserContentBlock]) -> Vec<String> {
-    let mut lines = Vec::new();
-    for block in blocks {
-        if let UserContentBlock::Text(t) = block {
-            for line in t.text.lines() {
-                lines.push(line.to_string());
-            }
-        }
-    }
-    lines
 }
 
 /// Build the harness listener for trigger lifecycle lines. Keeps the same "stay quiet unless a

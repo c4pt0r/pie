@@ -57,7 +57,7 @@ use crate::commands::{self, CommandCtx, CommandOutcome, Registry};
 use crate::history::HistoryStore;
 use crate::readline::SlashCompleter;
 use crate::{images, mentions};
-use feed::{Feed, Level, compact_tool_output_lines};
+use feed::{Feed, Level};
 use pie_agent_core::{AgentHarness, AgentMessage, AgentRunError};
 use pie_ai::{ContentBlock, ImageContent, Message, UserContent, UserContentBlock};
 
@@ -258,15 +258,9 @@ impl App {
                 }
             }
             AgentMessage::Llm(Message::ToolResult(tr)) => {
-                let mut lines = Vec::new();
-                for b in &tr.content {
-                    if let UserContentBlock::Text(t) = b {
-                        lines.extend(t.text.lines().map(ToString::to_string));
-                    }
-                }
                 self.feed.push_tool_result(
                     tr.tool_call_id.clone(),
-                    compact_tool_output_lines(lines, tr.is_error),
+                    feed::compact_tool_content_blocks(&tr.content, tr.is_error),
                     tr.is_error,
                 );
             }
