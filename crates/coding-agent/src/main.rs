@@ -355,6 +355,11 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
         .model
         .clone()
         .unwrap_or_else(|| model.clone());
+    let (hook_model, hook_thinking) = {
+        let state = harness.agent().state();
+        (state.model.clone(), state.thinking_level)
+    };
+    let hooks = hooks::load(&cwd, session_id.clone(), hook_model.as_ref(), hook_thinking).await;
 
     // Feed + trigger channels. Agent/harness listeners and the slash-command console sink push
     // structured updates onto `feed_tx`; the UI loop drains `feed_rx` and renders. Inject-and-run
@@ -384,6 +389,12 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
         pending_images: std::mem::take(&mut cli.image),
         feed_rx,
         main_run_rx,
+        panel_status: ui::PanelStatus {
+            mcp_servers: mcp.client_count,
+            mcp_tools: mcp_tool_count,
+            mcp_push_hooks: mcp_notification_hook_count,
+            hook_points: active_hook_points(lsp_lang_count, !hooks.runner.is_empty()),
+        },
     });
     app.banner(&display_model, &session_id, resumed, &tool_names);
     if !local_models.models.is_empty() {
@@ -481,11 +492,6 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
             loaded_skills.diagnostics[0].message
         ));
     }
-    let (hook_model, hook_thinking) = {
-        let state = harness.agent().state();
-        (state.model.clone(), state.thinking_level)
-    };
-    let hooks = hooks::load(&cwd, session_id.clone(), hook_model.as_ref(), hook_thinking).await;
     if !hooks.runner.is_empty() {
         app.system_line(format!("hooks: loaded {} hook(s)", hooks.runner.len()));
     }
@@ -529,6 +535,22 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
     // Hand off to the full-screen UI. It owns the terminal, the input box, the scrolling feed,
     // and the serialized run slot (user prompts + inject-and-run triggered turns) until quit.
     app.run().await
+}
+
+fn active_hook_points(lsp_lang_count: usize, cli_hooks_loaded: bool) -> Vec<String> {
+    let mut points = vec![
+        "before_tool_call".to_string(),
+        "before_trigger_action".to_string(),
+        "dynamic_fire_once".to_string(),
+        "main_run_requests".to_string(),
+    ];
+    if lsp_lang_count > 0 {
+        points.push("after_tool_call".to_string());
+    }
+    if cli_hooks_loaded {
+        points.push("cli_hooks".to_string());
+    }
+    points
 }
 
 pub(crate) async fn prompt_for_api_key(provider: &str) -> Result<String> {

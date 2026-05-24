@@ -48,7 +48,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Padding, Paragraph};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tui_textarea::TextArea;
 
@@ -84,6 +84,17 @@ const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "�
 const MAX_INPUT_ROWS: usize = 6;
 const SCROLL_STEP: usize = 3;
 const COMPLETION_POPUP_MAX: usize = 8;
+const TRIGGER_PANEL_MIN_TOTAL_WIDTH: u16 = 100;
+const TRIGGER_PANEL_WIDTH: u16 = 36;
+const TRIGGER_PANEL_RULE_LIMIT: usize = 5;
+
+#[derive(Clone, Debug, Default)]
+pub struct PanelStatus {
+    pub mcp_servers: usize,
+    pub mcp_tools: usize,
+    pub mcp_push_hooks: usize,
+    pub hook_points: Vec<String>,
+}
 
 /// Everything the app needs to run a session, assembled by `main.rs` after the harness is built.
 pub struct AppConfig {
@@ -99,6 +110,7 @@ pub struct AppConfig {
     pub pending_images: Vec<PathBuf>,
     pub feed_rx: UnboundedReceiver<FeedUpdate>,
     pub main_run_rx: UnboundedReceiver<String>,
+    pub panel_status: PanelStatus,
 }
 
 pub struct App {
@@ -120,6 +132,7 @@ pub struct App {
     feed: Feed,
     feed_rx: Option<UnboundedReceiver<FeedUpdate>>,
     main_run_rx: Option<UnboundedReceiver<String>>,
+    panel_status: PanelStatus,
 
     input: TextArea<'static>,
     completions: Vec<String>,
@@ -156,6 +169,7 @@ impl App {
             feed: Feed::new(),
             feed_rx: Some(config.feed_rx),
             main_run_rx: Some(config.main_run_rx),
+            panel_status: config.panel_status,
             input: new_textarea(),
             completions: Vec::new(),
             completion_idx: 0,
@@ -787,10 +801,18 @@ impl App {
             Constraint::Length(1),              // hint line
         ])
         .split(area);
-        let feed_area = chunks[0];
+        let content_area = chunks[0];
         let status_area = chunks[1];
         let input_area = chunks[2];
         let hint_area = chunks[3];
+        let (feed_area, trigger_area) = if content_area.width >= TRIGGER_PANEL_MIN_TOTAL_WIDTH {
+            let cols =
+                Layout::horizontal([Constraint::Min(40), Constraint::Length(TRIGGER_PANEL_WIDTH)])
+                    .split(content_area);
+            (cols[0], Some(cols[1]))
+        } else {
+            (content_area, None)
+        };
         self.last_feed_area = Some(feed_area);
 
         // Feed (pre-wrapped to width so scroll math is exact).
@@ -809,6 +831,9 @@ impl App {
         }
         let feed = Paragraph::new(lines).scroll((self.scroll as u16, 0));
         frame.render_widget(feed, feed_area);
+        if let Some(area) = trigger_area {
+            self.render_trigger_panel(frame, area);
+        }
 
         // Status separator: rule + model + run state.
         frame.render_widget(
@@ -858,6 +883,100 @@ impl App {
 
         // Completion popup, drawn above the input over the feed.
         self.render_completions(frame, status_area);
+    }
+
+    fn render_trigger_panel(&self, frame: &mut ratatui::Frame, area: Rect) {
+        let lines =
+            self.trigger_panel_lines(area.width.saturating_sub(2) as usize, area.height as usize);
+        let panel = Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::LEFT)
+                .padding(Padding::left(1))
+                .title(" triggers ")
+                .border_style(Style::default().fg(Color::DarkGray))
+                .title_style(Style::default().fg(Color::Magenta)),
+        );
+        frame.render_widget(panel, area);
+    }
+
+    fn trigger_panel_lines(&self, width: usize, height: usize) -> Vec<Line<'static>> {
+        let width = width.max(1);
+        let rules = crate::triggers::global_registry().list();
+
+        let mut lines = Vec::new();
+        lines.push(panel_line("Triggers".to_string(), Color::Cyan, width));
+        if rules.is_empty() {
+            lines.push(panel_line("none".to_string(), Color::DarkGray, width));
+        } else {
+            for rule in rules.iter().take(TRIGGER_PANEL_RULE_LIMIT) {
+                let state_flag = if rule.enabled { "enabled" } else { "disabled" };
+                let mode = if rule.fire_once { "once" } else { "repeat" };
+                let id = feed::truncate_chars(&rule.id, 12);
+                let color = if rule.enabled {
+                    Color::Green
+                } else {
+                    Color::DarkGray
+                };
+                lines.push(panel_line(
+                    format!("{id} [{state_flag}, {mode}]"),
+                    color,
+                    width,
+                ));
+                lines.push(panel_line(
+                    format!("  when {}", rule.condition.replace('\n', " ")),
+                    Color::DarkGray,
+                    width,
+                ));
+                lines.push(panel_line(
+                    format!("  do   {}", rule.action.replace('\n', " ")),
+                    Color::DarkGray,
+                    width,
+                ));
+            }
+            if rules.len() > TRIGGER_PANEL_RULE_LIMIT {
+                lines.push(panel_line(
+                    format!("… {} more", rules.len() - TRIGGER_PANEL_RULE_LIMIT),
+                    Color::DarkGray,
+                    width,
+                ));
+            }
+        }
+
+        let status_rows = 6 + self.panel_status.hook_points.len().max(1);
+        while lines.len() + status_rows < height {
+            lines.push(Line::raw(""));
+        }
+
+        lines.push(Line::raw(""));
+        lines.push(panel_line("MCP".to_string(), Color::Cyan, width));
+        if self.panel_status.mcp_servers == 0 {
+            lines.push(panel_line("none".to_string(), Color::DarkGray, width));
+        } else {
+            lines.push(panel_line(
+                format!(
+                    "servers {} · tools {}",
+                    self.panel_status.mcp_servers, self.panel_status.mcp_tools
+                ),
+                Color::Green,
+                width,
+            ));
+            lines.push(panel_line(
+                format!("push hooks {}", self.panel_status.mcp_push_hooks),
+                Color::DarkGray,
+                width,
+            ));
+        }
+
+        lines.push(Line::raw(""));
+        lines.push(panel_line("Hooks".to_string(), Color::Cyan, width));
+        if self.panel_status.hook_points.is_empty() {
+            lines.push(panel_line("none".to_string(), Color::DarkGray, width));
+        } else {
+            for point in &self.panel_status.hook_points {
+                lines.push(panel_line(format!("✓ {point}"), Color::Green, width));
+            }
+        }
+        lines
     }
 
     fn status_line(&self, width: usize, max_scroll: usize) -> Paragraph<'static> {
@@ -1009,6 +1128,13 @@ impl App {
     }
 }
 
+fn panel_line(text: String, color: Color, width: usize) -> Line<'static> {
+    Line::styled(
+        feed::truncate_chars(&text, width.max(1)),
+        Style::default().fg(color),
+    )
+}
+
 fn new_textarea() -> TextArea<'static> {
     let mut textarea = TextArea::default();
     textarea.set_cursor_line_style(Style::default());
@@ -1112,6 +1238,8 @@ mod tests {
         }
     }
 
+    static TRIGGER_REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn test_app() -> App {
         let storage = Arc::new(MemorySessionStorage::new());
         let session = Session::new(storage as Arc<dyn SessionStorage>);
@@ -1131,6 +1259,7 @@ mod tests {
             pending_images: vec![],
             feed_rx,
             main_run_rx,
+            panel_status: PanelStatus::default(),
         })
     }
 
@@ -1213,6 +1342,68 @@ mod tests {
         assert!(
             text.contains("│>  type a message, or /help"),
             "input should have a prompt and horizontal padding:\n{text}"
+        );
+    }
+
+    #[test]
+    fn wide_layout_renders_trigger_panel() {
+        let _guard = TRIGGER_REGISTRY_TEST_LOCK.lock().unwrap();
+        crate::triggers::global_registry().clear_for_tests();
+        let mut app = test_app();
+        app.panel_status = PanelStatus {
+            mcp_servers: 1,
+            mcp_tools: 2,
+            mcp_push_hooks: 1,
+            hook_points: vec!["before_tool_call".into(), "after_tool_call".into()],
+        };
+        crate::triggers::global_registry()
+            .add_rule("a build finishes", "summarize the result")
+            .unwrap();
+
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+
+        assert!(text.contains("triggers"), "panel title missing:\n{text}");
+        assert!(text.contains("Triggers"), "trigger list missing:\n{text}");
+        assert!(
+            text.contains("[enabled, once]"),
+            "trigger flags missing:\n{text}"
+        );
+        assert!(
+            text.contains("when a build finishes"),
+            "rule condition missing:\n{text}"
+        );
+        assert!(text.contains("MCP"), "mcp section missing:\n{text}");
+        assert!(
+            text.contains("servers 1 · tools 2"),
+            "mcp status missing:\n{text}"
+        );
+        assert!(text.contains("Hooks"), "hooks section missing:\n{text}");
+        assert!(
+            text.contains("before_tool_call"),
+            "hook point status missing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn narrow_layout_hides_trigger_panel() {
+        let _guard = TRIGGER_REGISTRY_TEST_LOCK.lock().unwrap();
+        crate::triggers::global_registry().clear_for_tests();
+        let mut app = test_app();
+        crate::triggers::global_registry()
+            .add_rule("a build finishes", "summarize the result")
+            .unwrap();
+
+        let backend = TestBackend::new(80, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+
+        assert!(
+            !text.contains("Triggers"),
+            "trigger panel should be hidden on narrow terminals:\n{text}"
         );
     }
 
