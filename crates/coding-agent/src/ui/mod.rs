@@ -923,12 +923,12 @@ impl App {
                     width,
                 ));
                 lines.push(panel_line(
-                    format!("  when {}", rule.condition.replace('\n', " ")),
+                    format!("  when {}", panel_rule_preview(&rule.condition, width)),
                     Color::DarkGray,
                     width,
                 ));
                 lines.push(panel_line(
-                    format!("  do   {}", rule.action.replace('\n', " ")),
+                    format!("  do   {}", panel_rule_preview(&rule.action, width)),
                     Color::DarkGray,
                     width,
                 ));
@@ -1133,6 +1133,11 @@ fn panel_line(text: String, color: Color, width: usize) -> Line<'static> {
         feed::truncate_chars(&text, width.max(1)),
         Style::default().fg(color),
     )
+}
+
+fn panel_rule_preview(text: &str, width: usize) -> String {
+    let redacted = crate::bug_report::redact(text).replace('\n', " ");
+    feed::truncate_chars(&redacted, width.max(1))
 }
 
 fn new_textarea() -> TextArea<'static> {
@@ -1384,6 +1389,34 @@ mod tests {
         assert!(
             text.contains("before_tool_call"),
             "hook point status missing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn trigger_panel_redacts_rule_preview_secrets() {
+        let _guard = TRIGGER_REGISTRY_TEST_LOCK.lock().unwrap();
+        crate::triggers::global_registry().clear_for_tests();
+        let mut app = test_app();
+        let secret = "sk-panel-secret-should-not-render-1234567890";
+        crate::triggers::global_registry()
+            .add_rule(
+                &format!("when header is Bearer {secret}"),
+                &format!("call API with {secret}"),
+            )
+            .unwrap();
+
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+
+        assert!(
+            !text.contains(secret),
+            "trigger panel leaked secret:\n{text}"
+        );
+        assert!(
+            text.contains("[REDACTED:"),
+            "trigger panel should show redaction marker:\n{text}"
         );
     }
 
