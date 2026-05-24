@@ -86,12 +86,17 @@ Then run:
 
 ```bash
 export DS4_API_KEY=dsv4-local
-./target/release/pie --provider ds4 --model deepseek-v4-flash
+./target/release/pie --provider ds4 --model deepseek-v4-flash --base-url http://127.0.0.1:8000/v1
 ```
 
 DS4 is local and accepts placeholder bearer tokens. You can also store the same
 local placeholder with `/login ds4 dsv4-local`. Using the `ds4` provider keeps
 local model credentials separate from real `OPENAI_API_KEY` credentials.
+
+`--base-url`, `DS4_BASE_URL` (or `DS4_URL`) registers the conventional `ds4` /
+`deepseek-v4-flash` descriptor without a `models.json` file. CLI `--base-url`
+wins for the current run. Keep `models.json` when you need different limits,
+compatibility flags, or a project-local override.
 
 ## Quick start
 

@@ -30,7 +30,9 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
   `--provider <local-provider> --model <model-id>`. This enables local servers such as
   DS4 (`deepseek-v4-flash` at `http://127.0.0.1:8000/v1`) without adding a one-off
   provider implementation. Project-local model entries override user-global entries with
-  the same provider/model id.
+  the same provider/model id. DS4 also supports CLI `--base-url` plus `DS4_BASE_URL` /
+  `DS4_URL` for the conventional `ds4:deepseek-v4-flash` descriptor, while
+  `DS4_API_KEY` remains only the credential.
 - **#43** Slash-command completion in the interactive prompt. Typing `/` and pressing Tab
   now lists commands and aliases from the same registry used for dispatch; prefixes such
   as `/thi` complete to `/thinking`, while normal prompts and command arguments are left

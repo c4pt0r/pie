@@ -57,6 +57,10 @@ struct Cli {
     /// Model id within the provider's catalog.
     #[arg(long)]
     model: Option<String>,
+    /// Override the selected model's base URL for this run. Useful for local OpenAI-compatible
+    /// servers such as DS4.
+    #[arg(long = "base-url", value_name = "URL")]
+    base_url: Option<String>,
     /// Thinking level (off | minimal | low | medium | high | xhigh).
     #[arg(
         long,
@@ -208,8 +212,17 @@ async fn delete_session_cmd(repo: &JsonlSessionRepo, id: &str) -> Result<()> {
 }
 
 async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo) -> Result<()> {
-    let local_models = local_models::load_all(&cwd).await?;
-    let model = model::auto_detect_model(cli.provider.as_deref(), cli.model.as_deref())?;
+    let cli_base_url = cli.base_url.clone();
+    validate_base_url_override(&cli)?;
+    let local_models = local_models::load_all(&cwd, cli_base_url.as_deref()).await?;
+    let mut model = model::auto_detect_model(cli.provider.as_deref(), cli.model.as_deref())?;
+    if let Some(base_url) = cli_base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+    {
+        model.base_url = base_url.to_string();
+    }
     let thinking = parse_thinking(&cli.thinking)?;
 
     // Resolve / create the session. `--continue` is just `--resume` without an id.
@@ -632,6 +645,29 @@ fn parse_thinking(s: &str) -> Result<ThinkingLevel> {
     s.parse().map_err(anyhow::Error::msg)
 }
 
+fn validate_base_url_override(cli: &Cli) -> Result<()> {
+    let Some(_base_url) = cli
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+    else {
+        return Ok(());
+    };
+    if cli
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .is_none()
+    {
+        anyhow::bail!(
+            "--base-url requires an explicit --provider so credentials cannot be auto-detected for the wrong endpoint"
+        );
+    }
+    Ok(())
+}
+
 fn compose_system_prompt(cwd: &std::path::Path, memory: &str, tool_names: &[String]) -> String {
     let mut s = String::new();
     s.push_str(&render_base_prompt(tool_names));
@@ -795,5 +831,37 @@ mod tests {
     fn auth_wrapper_fails_closed_without_provider_scoped_key() {
         let opts = apply_auth_to_simple_options(&model("ds4"), None, |_| None);
         assert_eq!(opts.base.api_key, None);
+    }
+
+    #[test]
+    fn base_url_override_requires_explicit_provider() {
+        let mut cli = Cli {
+            provider: None,
+            model: Some("deepseek-v4-flash".into()),
+            base_url: Some("http://user:secret-token@127.0.0.1:8000/v1?token=secret".into()),
+            thinking: "off".into(),
+            resume: false,
+            continue_: false,
+            resume_id: None,
+            list_sessions: false,
+            list_all_sessions: false,
+            delete_session: None,
+            image: Vec::new(),
+            builtin_skill: Vec::new(),
+            trigger_poll_secs: None,
+        };
+        let err = validate_base_url_override(&cli).unwrap_err().to_string();
+        assert!(
+            err.contains("--base-url requires an explicit --provider"),
+            "{err}"
+        );
+        assert!(!err.contains("secret-token"), "{err}");
+        assert!(!err.contains("127.0.0.1"), "{err}");
+        assert!(!err.contains("token=secret"), "{err}");
+        assert!(!err.contains("OPENAI_API_KEY"), "{err}");
+        assert!(!err.contains("DS4_API_KEY"), "{err}");
+
+        cli.provider = Some("ds4".into());
+        validate_base_url_override(&cli).unwrap();
     }
 }

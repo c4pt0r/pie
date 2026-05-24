@@ -30,7 +30,7 @@ pub fn auto_detect_model(
         if let Some(m) = get_model(&provider, id) {
             return Ok(m);
         }
-        bail!("{}", explicit_model_not_found_message(p, id));
+        bail!("{}", explicit_model_not_found_message(p, id, true));
     }
     // Detect by env, with the auth.json store as fallback (issue #13).
     let store = crate::auth::AuthStore::load().unwrap_or_default();
@@ -51,6 +51,12 @@ pub fn auto_detect_model(
         if let Some(any) = first_model_for_provider(provider) {
             return Ok(any);
         }
+        if *provider == "ds4" {
+            bail!(
+                "{}",
+                explicit_model_not_found_message(provider, model_id, true)
+            );
+        }
     }
     bail!(
         "no API key found. Set one of: {} env vars, or run `/login <provider> <key>` from inside pie.",
@@ -62,7 +68,7 @@ pub fn auto_detect_model(
     );
 }
 
-fn explicit_model_not_found_message(provider: &str, id: &str) -> String {
+fn explicit_model_not_found_message(provider: &str, id: &str, show_local_hint: bool) -> String {
     let mut by_provider = std::collections::BTreeMap::<String, Vec<String>>::new();
     for model in pie_ai::list_models() {
         by_provider
@@ -76,9 +82,14 @@ fn explicit_model_not_found_message(provider: &str, id: &str) -> String {
             .map(|(provider, models)| format!("{provider}({})", models.len()))
             .collect::<Vec<_>>()
             .join(", ");
+        let hint = if show_local_hint && provider == "ds4" {
+            " For local DS4, pass --base-url http://127.0.0.1:8000/v1, set DS4_BASE_URL, or add ds4 to ~/.pie/models.json."
+        } else {
+            ""
+        };
         return format!(
             "model provider not found in catalog: provider={provider}. Known providers: {providers}"
-        );
+        ) + hint;
     };
     models.sort();
     let candidates = models

@@ -6,7 +6,9 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use pie_ai::Model;
+use pie_ai::{
+    Api, InputModality, Model, ModelCost, ModelThinkingLevel, Provider, ThinkingLevelMap,
+};
 use serde::Deserialize;
 
 #[derive(Debug, Clone)]
@@ -20,16 +22,25 @@ struct ModelsFile {
     models: Vec<Model>,
 }
 
-pub async fn load_all(cwd: &Path) -> Result<LoadedLocalModels> {
+pub async fn load_all(cwd: &Path, cli_base_url: Option<&str>) -> Result<LoadedLocalModels> {
     let paths = [
         crate::config::base_dir().join("models.json"),
         cwd.join(".pie").join("models.json"),
     ];
-    load_all_from_paths(&paths)
+    load_all_from_paths_with_base_url(&paths, cli_base_url)
 }
 
-pub fn load_all_from_paths(paths: &[PathBuf]) -> Result<LoadedLocalModels> {
+#[cfg(test)]
+fn load_all_from_paths(paths: &[PathBuf]) -> Result<LoadedLocalModels> {
+    load_all_from_paths_with_base_url(paths, None)
+}
+
+pub fn load_all_from_paths_with_base_url(
+    paths: &[PathBuf],
+    cli_base_url: Option<&str>,
+) -> Result<LoadedLocalModels> {
     let mut models = Vec::<Model>::new();
+    register_builtin_local_defaults(cli_base_url);
     for path in paths {
         if !path.exists() {
             continue;
@@ -50,6 +61,69 @@ pub fn load_all_from_paths(paths: &[PathBuf]) -> Result<LoadedLocalModels> {
         pie_ai::register_custom_model(model.clone());
     }
     Ok(LoadedLocalModels { models })
+}
+
+fn register_builtin_local_defaults(cli_base_url: Option<&str>) {
+    // DS4 is a local OpenAI-compatible server, so its base URL is user/environment specific.
+    // Register the conventional provider/model only when the URL is explicit; user/project
+    // `models.json` entries with the same provider/id are loaded afterwards and override it.
+    if let Some(base_url) = ds4_base_url(cli_base_url) {
+        pie_ai::register_custom_model(ds4_model(base_url));
+    }
+}
+
+fn ds4_base_url(cli_base_url: Option<&str>) -> Option<String> {
+    cli_base_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(ds4_base_url_from_env)
+}
+
+fn ds4_base_url_from_env() -> Option<String> {
+    ["DS4_BASE_URL", "DS4_URL"].into_iter().find_map(|key| {
+        std::env::var(key)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn ds4_model(base_url: String) -> Model {
+    let thinking_level_map = [
+        (ModelThinkingLevel::Off, None),
+        (ModelThinkingLevel::Minimal, Some("low".into())),
+        (ModelThinkingLevel::Low, Some("low".into())),
+        (ModelThinkingLevel::Medium, Some("medium".into())),
+        (ModelThinkingLevel::High, Some("high".into())),
+        (ModelThinkingLevel::Xhigh, Some("xhigh".into())),
+    ]
+    .into_iter()
+    .collect::<ThinkingLevelMap>();
+    Model {
+        id: "deepseek-v4-flash".into(),
+        name: "DeepSeek V4 Flash (local DS4)".into(),
+        api: Api::from("openai-responses"),
+        provider: Provider::from("ds4"),
+        base_url,
+        reasoning: true,
+        thinking_level_map: Some(thinking_level_map),
+        input: vec![InputModality::Text],
+        cost: ModelCost::default(),
+        context_window: 100_000,
+        max_tokens: 384_000,
+        headers: None,
+        compat: Some(serde_json::json!({
+            "supportsStore": false,
+            "supportsDeveloperRole": false,
+            "supportsReasoningEffort": true,
+            "supportsUsageInStreaming": true,
+            "maxTokensField": "max_tokens",
+            "supportsStrictMode": false,
+            "thinkingFormat": "deepseek",
+            "requiresReasoningContentOnAssistantMessages": true
+        })),
+    }
 }
 
 fn load_file(path: &Path) -> Result<ModelsFile> {
@@ -107,6 +181,10 @@ mod tests {
         }
     }
 
+    fn unregister_ds4_default() {
+        pie_ai::unregister_custom_model(&pie_ai::Provider::from("ds4"), "deepseek-v4-flash");
+    }
+
     fn model_json(provider: &str, id: &str, api: &str, base_url: &str) -> String {
         format!(
             r#"{{
@@ -144,6 +222,79 @@ mod tests {
   ]
 }}"#
         )
+    }
+
+    #[tokio::test]
+    async fn registers_ds4_model_from_explicit_env_url_and_allows_user_override() {
+        let _lock = env_lock().lock().await;
+        let _base_url = EnvGuard::set("DS4_BASE_URL", "http://127.0.0.1:8000/v1");
+        let _legacy_url = EnvGuard::remove("DS4_URL");
+        unregister_ds4_default();
+        load_all_from_paths(&[]).unwrap();
+
+        let model = pie_ai::get_model(&pie_ai::Provider::from("ds4"), "deepseek-v4-flash")
+            .expect("ds4 default model registered");
+        assert_eq!(model.api.0, "openai-responses");
+        assert_eq!(model.base_url, "http://127.0.0.1:8000/v1");
+        assert_eq!(model.max_tokens, 384_000);
+
+        let resolved =
+            crate::model::auto_detect_model(Some("ds4"), Some("deepseek-v4-flash")).unwrap();
+        assert_eq!(resolved.provider, pie_ai::Provider::from("ds4"));
+        assert_eq!(resolved.id, "deepseek-v4-flash");
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("models.json");
+        std::fs::write(
+            &path,
+            model_json(
+                "ds4",
+                "deepseek-v4-flash",
+                "openai-responses",
+                "http://127.0.0.1:7777/v1",
+            ),
+        )
+        .unwrap();
+
+        load_all_from_paths(&[path]).unwrap();
+
+        let model = pie_ai::get_model(&pie_ai::Provider::from("ds4"), "deepseek-v4-flash")
+            .expect("ds4 model registered");
+        assert_eq!(model.base_url, "http://127.0.0.1:7777/v1");
+
+        unregister_ds4_default();
+    }
+
+    #[tokio::test]
+    async fn ds4_url_env_alias_registers_model() {
+        let _lock = env_lock().lock().await;
+        let _base_url = EnvGuard::remove("DS4_BASE_URL");
+        let _legacy_url = EnvGuard::set("DS4_URL", "http://127.0.0.1:8123/v1");
+        unregister_ds4_default();
+
+        load_all_from_paths(&[]).unwrap();
+
+        let model = pie_ai::get_model(&pie_ai::Provider::from("ds4"), "deepseek-v4-flash")
+            .expect("ds4 model registered");
+        assert_eq!(model.base_url, "http://127.0.0.1:8123/v1");
+
+        unregister_ds4_default();
+    }
+
+    #[tokio::test]
+    async fn cli_base_url_registers_ds4_model_and_overrides_env_url() {
+        let _lock = env_lock().lock().await;
+        let _base_url = EnvGuard::set("DS4_BASE_URL", "http://127.0.0.1:8000/v1");
+        let _legacy_url = EnvGuard::remove("DS4_URL");
+        unregister_ds4_default();
+
+        load_all_from_paths_with_base_url(&[], Some("http://127.0.0.1:9999/v1")).unwrap();
+
+        let model = pie_ai::get_model(&pie_ai::Provider::from("ds4"), "deepseek-v4-flash")
+            .expect("ds4 model registered");
+        assert_eq!(model.base_url, "http://127.0.0.1:9999/v1");
+
+        unregister_ds4_default();
     }
 
     #[test]
@@ -343,6 +494,11 @@ data: {"type":"response.completed","response":{"id":"resp_test","status":"comple
         let _lock = env_lock().lock().await;
         let _openai = EnvGuard::set("OPENAI_API_KEY", "real-openai-should-not-leak");
         let _ds4 = EnvGuard::set("DS4_API_KEY", "dsv4-local");
+        let _base_url = EnvGuard::remove("DS4_BASE_URL");
+        let _legacy_url = EnvGuard::remove("DS4_URL");
+        let _pie_dir = TempDir::new().unwrap();
+        let _pie_dir_env = EnvGuard::set("PIE_DIR", &_pie_dir.path().to_string_lossy());
+        unregister_ds4_default();
 
         let body = r#"data: {"type":"response.created","response":{"id":"resp_test","model":"model","output":[]}}
 
@@ -355,7 +511,7 @@ data: {"type":"response.completed","response":{"id":"resp_test","status":"comple
 "#;
         let (base_url, request_rx) = serve_once_capture_request(body).await;
         let provider = "ds4";
-        let id = "deepseek-v4-flash";
+        let id = "deepseek-v4-flash-env-fixture";
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("models.json");
         std::fs::write(
@@ -388,10 +544,42 @@ data: {"type":"response.completed","response":{"id":"resp_test","status":"comple
     }
 
     #[tokio::test]
+    async fn ds4_env_without_url_reports_base_url_config() {
+        let _lock = env_lock().lock().await;
+        let _openai = EnvGuard::remove("OPENAI_API_KEY");
+        let _anthropic = EnvGuard::remove("ANTHROPIC_API_KEY");
+        let _ds4 = EnvGuard::set("DS4_API_KEY", "dsv4-local");
+        let _base_url = EnvGuard::remove("DS4_BASE_URL");
+        let _legacy_url = EnvGuard::remove("DS4_URL");
+        let _pie_dir = TempDir::new().unwrap();
+        let _pie_dir_env = EnvGuard::set("PIE_DIR", &_pie_dir.path().to_string_lossy());
+        unregister_ds4_default();
+
+        let err = crate::model::auto_detect_model(None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("provider=ds4"), "{err}");
+        assert!(err.contains("--base-url"), "{err}");
+        assert!(err.contains("DS4_BASE_URL"), "{err}");
+        assert!(err.contains("models.json"), "{err}");
+
+        let explicit_err = crate::model::auto_detect_model(Some("ds4"), Some("deepseek-v4-flash"))
+            .unwrap_err()
+            .to_string();
+        assert!(explicit_err.contains("provider=ds4"), "{explicit_err}");
+        assert!(explicit_err.contains("--base-url"), "{explicit_err}");
+        assert!(explicit_err.contains("DS4_BASE_URL"), "{explicit_err}");
+        assert!(explicit_err.contains("models.json"), "{explicit_err}");
+    }
+
+    #[tokio::test]
     async fn ds4_responses_model_fails_closed_without_ds4_env_even_when_openai_env_exists() {
         let _lock = env_lock().lock().await;
         let _openai = EnvGuard::set("OPENAI_API_KEY", "real-openai-should-not-leak");
         let _ds4 = EnvGuard::remove("DS4_API_KEY");
+        let _base_url = EnvGuard::remove("DS4_BASE_URL");
+        let _legacy_url = EnvGuard::remove("DS4_URL");
+        unregister_ds4_default();
 
         let provider = "ds4";
         let id = "deepseek-v4-flash-missing-key";
