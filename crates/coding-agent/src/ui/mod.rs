@@ -403,7 +403,11 @@ impl App {
             match result {
                 Ok(Some(message)) => self.system_line(message),
                 Ok(None) => {}
-                Err(e) => self.error_line(format!("{}{e}", turn.prefix)),
+                Err(e) => self.error_line(format!(
+                    "{}{}",
+                    turn.prefix,
+                    user_facing_run_error(&e.to_string())
+                )),
             }
         }
         turn.aborted = false;
@@ -1474,6 +1478,23 @@ fn human_bytes(bytes: usize) -> String {
     }
 }
 
+fn user_facing_run_error(error: &str) -> String {
+    let Some(rest) = error.strip_prefix("no API key for provider: ") else {
+        return error.to_string();
+    };
+    let provider = rest.split(';').next().unwrap_or(rest).trim();
+    if provider.is_empty() {
+        return error.to_string();
+    }
+    let vars = pie_ai::env_api_keys::env_var_names(provider);
+    let credential_hint = if vars.is_empty() {
+        "configure a provider-specific credential".to_string()
+    } else {
+        format!("set {}", vars.join(" or "))
+    };
+    format!("no API key for provider: {provider}; run /login {provider} or {credential_hint}")
+}
+
 fn new_textarea() -> TextArea<'static> {
     let mut textarea = TextArea::default();
     textarea.set_cursor_line_style(Style::default());
@@ -2039,6 +2060,17 @@ mod tests {
 
         assert!(app.validate_pending_image_support());
         assert!(feed_text(&app).is_empty());
+    }
+
+    #[test]
+    fn missing_api_key_error_uses_cli_recovery_action() {
+        let text = user_facing_run_error(
+            "no API key for provider: deepseek; set DEEPSEEK_API_KEY or pass options.api_key",
+        );
+
+        assert!(text.contains("/login deepseek"), "{text}");
+        assert!(text.contains("DEEPSEEK_API_KEY"), "{text}");
+        assert!(!text.contains("options.api_key"), "{text}");
     }
 
     #[test]
