@@ -1046,7 +1046,9 @@ impl App {
         let status_area = chunks[1];
         let input_area = chunks[2];
         let hint_area = chunks[3];
-        let (feed_area, trigger_area) = if content_area.width >= TRIGGER_PANEL_MIN_TOTAL_WIDTH {
+        let (feed_area, trigger_area) = if content_area.width >= TRIGGER_PANEL_MIN_TOTAL_WIDTH
+            && self.should_show_side_panel()
+        {
             let cols =
                 Layout::horizontal([Constraint::Min(40), Constraint::Length(TRIGGER_PANEL_WIDTH)])
                     .split(content_area);
@@ -1142,6 +1144,12 @@ impl App {
                 .title_style(Style::default().fg(Color::Magenta)),
         );
         frame.render_widget(panel, area);
+    }
+
+    fn should_show_side_panel(&self) -> bool {
+        !crate::triggers::global_registry().list().is_empty()
+            || self.panel_status.mcp_servers > 0
+            || self.panel_status.mcp_notification_hooks > 0
     }
 
     fn trigger_panel_lines(&self, width: usize, height: usize) -> Vec<Line<'static>> {
@@ -1745,6 +1753,38 @@ mod tests {
         assert!(
             text.contains("dedup"),
             "trigger-runtime feature label missing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn wide_layout_hides_empty_static_trigger_panel() {
+        let _guard = TRIGGER_REGISTRY_TEST_LOCK.lock().unwrap();
+        crate::triggers::global_registry().clear_for_tests();
+        let mut app = test_app();
+        app.panel_status = PanelStatus {
+            mcp_servers: 0,
+            mcp_tools: 0,
+            mcp_notification_hooks: 0,
+            hook_points: vec!["before_tool_call".into(), "after_tool_call".into()],
+            trigger_features: vec!["dedup".into(), "cycle suppress".into()],
+        };
+
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+
+        assert!(
+            !text.contains("Triggers"),
+            "empty static trigger panel should not consume width:\n{text}"
+        );
+        assert!(
+            !text.contains("before_tool_call"),
+            "static hook rows belong in /triggers status, not the default side panel:\n{text}"
+        );
+        assert!(
+            !text.contains("cycle suppress"),
+            "static trigger-runtime rows belong in /triggers status, not the default side panel:\n{text}"
         );
     }
 
