@@ -264,7 +264,7 @@ impl App {
         self.feed
             .push_plain(format!("tools:   {tools}"), Level::Output);
         self.feed.push_plain(
-            "Enter to send · Ctrl-C to abort/exit · /help for commands",
+            "Enter send · Ctrl-V paste text/images · Ctrl-C abort/exit · /help",
             Level::System,
         );
     }
@@ -1114,9 +1114,9 @@ impl App {
 
         // Hint line.
         let hint = if self.busy {
-            "Enter queue next · Alt+Enter newline · Ctrl-C abort current · empty Ctrl-U removes last queued · Wheel/PgUp scroll"
+            "Enter queue next · Ctrl-V paste · Alt+Enter newline · Ctrl-C abort current · empty Ctrl-U removes queued"
         } else {
-            "Enter send · Alt+Enter newline · ↑↓ history · Wheel/PgUp scroll · Shift/Option-drag select · Ctrl-C abort"
+            "Enter send · Ctrl-V paste · Alt+Enter newline · ↑↓ history · Wheel/PgUp scroll · Ctrl-C abort"
         };
         frame.render_widget(
             Paragraph::new(Line::styled(
@@ -1681,6 +1681,10 @@ mod tests {
         assert!(
             text.contains("│>  type a message, or /help"),
             "input should have a prompt and horizontal padding:\n{text}"
+        );
+        assert!(
+            text.contains("Ctrl-V paste"),
+            "idle hint should advertise paste support:\n{text}"
         );
     }
 

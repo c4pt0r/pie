@@ -56,6 +56,8 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
   model advertises image input support. Clipboard images are converted to the same
   `ImageContent` path as `--image`, shown only as bounded attachment metadata in the feed,
   and sent with the next prompt; text clipboard paste keeps the existing text path.
+- The TUI startup line and bottom hint now advertise Ctrl-V paste support so text/image
+  clipboard paste is discoverable without reading release notes.
 - **#4** Dangerous-bash detector wired through `before_tool_call`. 11-pattern corpus
   (`rm -rf /`, `sudo`, `curl|sh`, etc.) returns deny reason as the synthesized tool result.
 - **#5** `@file` mention injection. Files are read, capped at 64 KiB, prepended to the
