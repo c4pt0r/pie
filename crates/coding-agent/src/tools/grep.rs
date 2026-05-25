@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 const DEFAULT_MAX_MATCHES: usize = 200;
 const DEFAULT_MAX_FILES: usize = 5_000;
+const MAX_MATCH_LINE_CHARS: usize = 500;
 
 pub struct GrepTool;
 
@@ -102,10 +103,13 @@ impl AgentTool for GrepTool {
                 };
                 for (lineno, line) in body.lines().enumerate() {
                     if re_clone.is_match(line) {
+                        let (text, line_was_truncated) =
+                            preview_match_line(line, re_clone.find(line));
                         out.push(MatchOut {
                             path: p.display().to_string(),
                             lineno: lineno + 1,
-                            text: line.to_string(),
+                            text,
+                            line_was_truncated,
                         });
                         if out.len() >= max_matches {
                             return Ok(out);
@@ -119,16 +123,26 @@ impl AgentTool for GrepTool {
         .map_err(|e| AgentToolError::from(format!("spawn_blocking: {e}")))?;
         let matches = result.map_err(AgentToolError::from)?;
 
+        let truncated_lines = matches.iter().filter(|m| m.line_was_truncated).count();
         let mut text = format!("grep: {} hits\n", matches.len());
         for m in matches.iter().take(max_matches) {
             text.push_str(&format!("{}:{}: {}\n", m.path, m.lineno, m.text));
+        }
+        if truncated_lines > 0 {
+            text.push_str(&format!(
+                "[{truncated_lines} long matching line(s) truncated to {MAX_MATCH_LINE_CHARS} chars]\n"
+            ));
         }
         if matches.len() >= max_matches {
             text.push_str(&format!("[truncated at {max_matches} matches]\n"));
         }
         Ok(AgentToolResult {
             content: vec![UserContentBlock::text(text)],
-            details: json!({ "matches": matches.len() }),
+            details: json!({
+                "matches": matches.len(),
+                "truncated_lines": truncated_lines,
+                "max_match_line_chars": MAX_MATCH_LINE_CHARS,
+            }),
             terminate: None,
         })
     }
@@ -138,6 +152,45 @@ struct MatchOut {
     path: String,
     lineno: usize,
     text: String,
+    line_was_truncated: bool,
+}
+
+fn preview_match_line(line: &str, match_range: Option<regex::Match<'_>>) -> (String, bool) {
+    if line.chars().count() <= MAX_MATCH_LINE_CHARS {
+        return (line.to_string(), false);
+    }
+
+    let Some(match_range) = match_range else {
+        let preview: String = line.chars().take(MAX_MATCH_LINE_CHARS).collect();
+        return (format!("{preview}...[line truncated]"), true);
+    };
+
+    let match_start = line[..match_range.start()].chars().count();
+    let match_len = line[match_range.start()..match_range.end()]
+        .chars()
+        .count()
+        .max(1);
+    let visible_match_len = match_len.min(MAX_MATCH_LINE_CHARS);
+    let context_budget = MAX_MATCH_LINE_CHARS.saturating_sub(visible_match_len);
+    let before_budget = context_budget / 2;
+    let after_budget = context_budget - before_budget;
+    let start_char = match_start.saturating_sub(before_budget);
+    let end_char = match_start + visible_match_len + after_budget;
+    let total_chars = line.chars().count();
+
+    let mut preview = String::new();
+    if start_char > 0 {
+        preview.push_str("[line truncated]...");
+    }
+    preview.extend(
+        line.chars()
+            .skip(start_char)
+            .take(end_char.saturating_sub(start_char).min(total_chars)),
+    );
+    if end_char < total_chars {
+        preview.push_str("...[line truncated]");
+    }
+    (preview, true)
 }
 
 use once_cell::sync::Lazy;
@@ -187,5 +240,58 @@ mod tests {
         };
         assert!(text.contains("hello world"));
         assert!(text.contains("another hello"));
+    }
+
+    #[tokio::test]
+    async fn truncates_very_long_matching_lines() {
+        let dir = tempdir().unwrap();
+        let long_line = format!("needle {}", "x".repeat(MAX_MATCH_LINE_CHARS + 100));
+        std::fs::write(dir.path().join("a.txt"), long_line).unwrap();
+
+        let tool = GrepTool;
+        let r = tool
+            .execute(
+                "g",
+                json!({ "pattern": "needle", "path": dir.path().to_str().unwrap() }),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        let text = match &r.content[0] {
+            pie_ai::UserContentBlock::Text(t) => t.text.clone(),
+            _ => panic!("expected text"),
+        };
+        assert!(text.contains("...[line truncated]"));
+        assert!(text.contains("1 long matching line(s) truncated"));
+        assert_eq!(r.details["truncated_lines"], 1);
+        assert_eq!(r.details["max_match_line_chars"], MAX_MATCH_LINE_CHARS);
+        assert!(!text.contains(&"x".repeat(MAX_MATCH_LINE_CHARS + 100)));
+    }
+
+    #[tokio::test]
+    async fn long_line_preview_keeps_late_match_visible() {
+        let dir = tempdir().unwrap();
+        let long_line = format!("{} NEEDLE {}", "prefix".repeat(120), "suffix".repeat(120));
+        std::fs::write(dir.path().join("a.txt"), long_line).unwrap();
+
+        let tool = GrepTool;
+        let r = tool
+            .execute(
+                "g",
+                json!({ "pattern": "NEEDLE", "path": dir.path().to_str().unwrap() }),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        let text = match &r.content[0] {
+            pie_ai::UserContentBlock::Text(t) => t.text.clone(),
+            _ => panic!("expected text"),
+        };
+        assert!(text.contains("NEEDLE"));
+        assert!(text.contains("[line truncated]..."));
+        assert!(text.contains("...[line truncated]"));
+        assert_eq!(r.details["truncated_lines"], 1);
     }
 }

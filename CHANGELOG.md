@@ -339,6 +339,10 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
   oversized TUI previews. The default path limit is 200 instead of 1000, truncated results
   include a clear recovery hint, and structured details now report the limit and whether it
   was reached. Agents can still request a larger explicit `limit` when needed.
+- `grep` tool results now cap each matching line preview at 500 UTF-8 characters and mark
+  truncated lines explicitly. This keeps generated/minified one-line files from dominating
+  the model context or TUI feed while preserving the file path, line number, and match
+  location.
 - `/model` now accepts the natural `provider/model-id` form as an alias for
   `provider:model-id` and, after selecting a model, immediately checks whether that exact
   provider has an env or auth-store credential. Missing credentials now produce a
