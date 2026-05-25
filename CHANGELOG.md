@@ -335,6 +335,10 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
 
 ### Fixed
 
+- `find` tool results are now bounded more tightly by default to reduce token waste and
+  oversized TUI previews. The default path limit is 200 instead of 1000, truncated results
+  include a clear recovery hint, and structured details now report the limit and whether it
+  was reached. Agents can still request a larger explicit `limit` when needed.
 - `/model` now accepts the natural `provider/model-id` form as an alias for
   `provider:model-id` and, after selecting a model, immediately checks whether that exact
   provider has an env or auth-store credential. Missing credentials now produce a
