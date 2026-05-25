@@ -15,6 +15,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::base_dir;
 
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn auth_path() -> PathBuf {
     base_dir().join("auth.json")
 }
@@ -143,10 +146,7 @@ impl AuthStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
     use tempfile::TempDir;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct EnvGuard {
         key: &'static str,

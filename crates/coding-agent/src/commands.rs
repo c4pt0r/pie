@@ -1832,9 +1832,6 @@ pub async fn dispatch(input: &str, registry: &Registry, ctx: &CommandCtx<'_>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct EnvGuard {
         key: &'static str,
@@ -1924,7 +1921,7 @@ mod tests {
 
     #[test]
     fn model_credential_hint_uses_only_selected_provider_credentials() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::auth::ENV_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let _pie_dir = EnvGuard::set("PIE_DIR", temp.path());
         let _deepseek = EnvGuard::remove("DEEPSEEK_API_KEY");
@@ -1939,7 +1936,7 @@ mod tests {
 
     #[test]
     fn model_credential_hint_accepts_env_or_auth_store_for_selected_provider() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::auth::ENV_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let _pie_dir = EnvGuard::set("PIE_DIR", temp.path());
         let _deepseek = EnvGuard::set("DEEPSEEK_API_KEY", "sk-deepseek-present");
