@@ -520,6 +520,21 @@ impl App {
         if trimmed.is_empty() && !has_pending_images {
             return Ok(());
         }
+        if trimmed.starts_with('/') {
+            self.clear_input();
+            self.history_idx = None;
+            self.last_ctrlc = None;
+            self.history.append(&trimmed);
+            self.follow = true;
+            self.feed.push_user(&trimmed);
+            self.dispatch_slash(&trimmed, terminal, turn).await;
+            return Ok(());
+        }
+
+        if !self.validate_pending_image_support() {
+            return Ok(());
+        }
+
         self.clear_input();
         self.history_idx = None;
         self.last_ctrlc = None;
@@ -527,12 +542,6 @@ impl App {
             self.history.append(&trimmed);
         }
         self.follow = true;
-
-        if trimmed.starts_with('/') {
-            self.feed.push_user(&trimmed);
-            self.dispatch_slash(&trimmed, terminal, turn).await;
-            return Ok(());
-        }
 
         let expanded = if trimmed.is_empty() {
             String::new()
@@ -639,6 +648,17 @@ impl App {
             .as_ref()
             .map(|model| model.input.contains(&InputModality::Image))
             .unwrap_or(false)
+    }
+
+    fn validate_pending_image_support(&mut self) -> bool {
+        let count = self.pending_images.len() + self.pending_pasted_images.len();
+        if count == 0 || self.current_model_accepts_images() {
+            return true;
+        }
+        self.error_line(format!(
+            "current model does not support image input; switch to a vision-capable model before sending {count} image attachment(s)"
+        ));
+        false
     }
 
     fn queue_user_prompt(&mut self, display: String, prompt: String, images: Vec<ImageContent>) {
@@ -1945,6 +1965,36 @@ mod tests {
             text.contains("current model does not support image input"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn pending_path_image_requires_vision_model_without_dropping_attachment() {
+        let mut app = test_app();
+        app.pending_images
+            .push(std::path::PathBuf::from("/tmp/screenshot.png"));
+
+        assert!(!app.validate_pending_image_support());
+
+        assert_eq!(app.pending_images.len(), 1);
+        let text = feed_text(&app);
+        assert!(
+            text.contains("current model does not support image input"),
+            "{text}"
+        );
+        assert!(
+            text.contains("1 image attachment"),
+            "error should mention pending attachment count: {text}"
+        );
+    }
+
+    #[test]
+    fn pending_path_image_allowed_for_vision_model() {
+        let mut app = test_app_with_model(faux_vision_model());
+        app.pending_images
+            .push(std::path::PathBuf::from("/tmp/screenshot.png"));
+
+        assert!(app.validate_pending_image_support());
+        assert!(feed_text(&app).is_empty());
     }
 
     #[test]
