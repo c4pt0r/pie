@@ -66,6 +66,16 @@ impl SkillsState {
             });
         }
     }
+
+    /// Drop the `{source, name}` override, if present. Returns true if an entry was removed.
+    /// Used when a skill is removed entirely (`RemoveSkill`) so a later reinstall of the same
+    /// name doesn't inherit a stale disabled state.
+    pub fn remove(&mut self, name: &str, source: SkillSource) -> bool {
+        let before = self.overrides.len();
+        self.overrides
+            .retain(|e| !(e.name == name && e.source == source));
+        self.overrides.len() != before
+    }
 }
 
 /// Absolute path to the overlay file under `base_dir` (`~/.pie/`).
@@ -132,6 +142,22 @@ pub async fn set_and_save(
     state.set(name, source, enabled);
     save(base_dir, &state).await?;
     Ok(state)
+}
+
+/// Convenience: load → remove the `{source, name}` override → save. Used by `RemoveSkill` so
+/// removing a skill also forgets any disabled state for it. A no-op (no entry) still rewrites
+/// the file harmlessly; callers that want to skip the write on no-op can check
+/// [`SkillsState::remove`] directly.
+pub async fn remove_and_save(
+    base_dir: &Path,
+    name: &str,
+    source: SkillSource,
+) -> std::io::Result<()> {
+    let mut state = load(base_dir).await;
+    if state.remove(name, source) {
+        save(base_dir, &state).await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -212,6 +238,32 @@ mod tests {
         state.set("foo", SkillSource::User, true);
         assert_eq!(state.overrides.len(), 1, "same {{source,name}} upserts");
         assert!(state.overrides[0].enabled);
+    }
+
+    #[test]
+    fn remove_drops_matching_entry_and_is_source_aware() {
+        let mut state = SkillsState::default();
+        state.set("foo", SkillSource::User, false);
+        state.set("foo", SkillSource::Project, false);
+        // Removing the user entry leaves the project entry intact.
+        assert!(state.remove("foo", SkillSource::User));
+        assert!(state.lookup("foo", SkillSource::User).is_none());
+        assert!(state.lookup("foo", SkillSource::Project).is_some());
+        // Removing a non-existent entry is a no-op returning false.
+        assert!(!state.remove("foo", SkillSource::User));
+    }
+
+    #[tokio::test]
+    async fn remove_and_save_clears_entry_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        set_and_save(dir.path(), "foo", SkillSource::User, false)
+            .await
+            .unwrap();
+        remove_and_save(dir.path(), "foo", SkillSource::User)
+            .await
+            .unwrap();
+        let reloaded = load(dir.path()).await;
+        assert!(reloaded.lookup("foo", SkillSource::User).is_none());
     }
 
     #[tokio::test]

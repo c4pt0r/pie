@@ -287,6 +287,9 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
     // `~/.pie/skills-state.json` overlay; shares the same harness cell so it can reload the
     // catalog after writing.
     tools.push(tools::set_skill_state_tool(skill_harness_cell.clone()));
+    // RemoveSkill tool (task #23, S-A2b). Deletes a user-installed skill dir + clears its
+    // overlay entry + reloads; builtin/project skills are refused (disable instead).
+    tools.push(tools::remove_skill_tool(skill_harness_cell.clone()));
     tools.push(tools::new_trigger_tool());
     tools.push(tools::list_triggers_tool());
     tools.push(tools::remove_trigger_tool());

@@ -12,6 +12,7 @@ pub mod ls;
 pub mod mcp_adapter;
 pub mod memory;
 pub mod read;
+pub mod remove_skill;
 pub mod set_skill_state;
 pub mod skill;
 pub mod task;
@@ -96,6 +97,13 @@ pub fn install_skill_tool(harness_cell: skill::SkillHarnessCell) -> Arc<dyn Agen
 /// `reload_skills_from_disk`. See `set_skill_state::SetSkillStateTool` for the overlay model.
 pub fn set_skill_state_tool(harness_cell: skill::SkillHarnessCell) -> Arc<dyn AgentTool> {
     Arc::new(set_skill_state::SetSkillStateTool::new(harness_cell))
+}
+
+/// Build the `RemoveSkill` tool (delete a user-installed skill). Same harness-cell wiring;
+/// deletes `~/.pie/skills/<name>/`, clears the overlay entry, and hot-reloads. Builtin/project
+/// skills are refused (disable instead). See `remove_skill::RemoveSkillTool`.
+pub fn remove_skill_tool(harness_cell: skill::SkillHarnessCell) -> Arc<dyn AgentTool> {
+    Arc::new(remove_skill::RemoveSkillTool::new(harness_cell))
 }
 
 /// Build the dynamic trigger creation tool. This is model-facing counterpart to the
