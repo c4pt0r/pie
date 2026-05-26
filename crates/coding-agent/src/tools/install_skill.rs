@@ -221,14 +221,7 @@ impl AgentTool for InstallSkillTool {
             Source::Path { .. } => "path",
             Source::Content { .. } => "content",
         };
-        let source_redacted = match &input.source {
-            // URL / path are themselves opaque references, safe to record.
-            Source::Url { url } => json!(url),
-            Source::Path { path } => json!(path),
-            // Inline content body is never echoed into the audit; we just record that the
-            // source was inline so resume can distinguish from URL/path origin.
-            Source::Content { .. } => json!(null),
-        };
+        let source_redacted = audit_source_reference(&input.source);
         let audit_payload = json!({
             "status": "installed",
             "name": parsed.name,
@@ -312,6 +305,32 @@ enum Source {
     Content {
         content: String,
     },
+}
+
+fn audit_source_reference(source: &Source) -> Value {
+    match source {
+        Source::Url { url } => audit_url_reference(url),
+        Source::Path { path } => json!(path),
+        // Inline content body is never echoed into the audit; we just record that the
+        // source was inline so resume can distinguish from URL/path origin.
+        Source::Content { .. } => json!(null),
+    }
+}
+
+fn audit_url_reference(url: &str) -> Value {
+    match reqwest::Url::parse(url) {
+        Ok(parsed) => {
+            let mut hasher = Sha256::new();
+            hasher.update(parsed.path().as_bytes());
+            json!({
+                "scheme": parsed.scheme(),
+                "host": parsed.host_str().unwrap_or(""),
+                "path_hash": format!("{:x}", hasher.finalize()),
+                "redacted": true,
+            })
+        }
+        Err(_) => json!({ "redacted": true }),
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────────────────
@@ -1094,6 +1113,30 @@ mod tests {
             !serialized.contains("delta body"),
             "audit must not contain skill body, got: {serialized}"
         );
+    }
+
+    #[test]
+    fn url_audit_reference_redacts_secret_bearing_parts() {
+        let reference = audit_url_reference(
+            "https://user:pass@example.com/token-path/skill.md?api_key=SECRET#frag",
+        );
+        let serialized = serde_json::to_string(&reference).unwrap();
+
+        assert_eq!(reference["scheme"], "https");
+        assert_eq!(reference["host"], "example.com");
+        assert_eq!(reference["redacted"], true);
+        assert!(
+            reference["path_hash"]
+                .as_str()
+                .is_some_and(|s| s.len() == 64),
+            "path hash should be a SHA256 hex digest: {reference}"
+        );
+        for forbidden in ["user", "pass", "token-path", "api_key", "SECRET", "frag"] {
+            assert!(
+                !serialized.contains(forbidden),
+                "url audit reference leaked {forbidden}: {serialized}"
+            );
+        }
     }
 
     /// Atomic write guarantee: a successful write leaves no `.tmp` sibling in the parent dir.
