@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use pie_agent_core::{
-    AgentHarness, AgentHarnessOptions, AgentTool, MemorySessionStorage, Session, SessionStorage,
-    SessionTreeEntry, Skill, SkillSource, ThinkingLevel,
+    AgentHarness, AgentHarnessOptions, AgentTool, LoadSkillsOutput, MemorySessionStorage,
+    ReloadSkillsFn, Session, SessionStorage, SessionTreeEntry, Skill, SkillSource, ThinkingLevel,
 };
 use pie_ai::{
     AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream, AssistantRole,
@@ -44,6 +44,9 @@ mod history;
 #[allow(dead_code)]
 #[path = "../src/session/mod.rs"]
 mod session;
+#[allow(dead_code)]
+#[path = "../src/skills_state.rs"]
+mod skills_state;
 #[allow(dead_code)]
 #[path = "../src/triggers/mod.rs"]
 mod triggers;
@@ -152,6 +155,58 @@ fn skill(name: &str, content: &str, disabled: bool) -> Skill {
         content: content.into(),
         disable_model_invocation: disabled,
         source: SkillSource::User,
+    }
+}
+
+fn harness_with_reloadable_skills(base_dir: &Path, seed: Vec<Skill>) -> Arc<AgentHarness> {
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage as Arc<dyn SessionStorage>);
+    let source = Arc::new(Mutex::new(seed.clone()));
+    let base = base_dir.to_path_buf();
+    let loader_source = source.clone();
+    let loader: ReloadSkillsFn = Arc::new(move || {
+        let source = loader_source.clone();
+        let base = base.clone();
+        Box::pin(async move {
+            let mut skills = source.lock().unwrap().clone();
+            let state = skills_state::load(&base).await;
+            skills_state::apply(&state, &mut skills);
+            LoadSkillsOutput {
+                skills,
+                diagnostics: Vec::new(),
+            }
+        })
+    });
+    let mut opts = AgentHarnessOptions::new(faux_model(), session);
+    opts.skills = seed;
+    opts.reload_skills_fn = Some(loader);
+    Arc::new(AgentHarness::new(opts))
+}
+
+static COMMAND_OUTPUT_LOCK: Mutex<()> = Mutex::new(());
+
+struct OutputCapture {
+    lines: Arc<Mutex<Vec<String>>>,
+}
+
+impl OutputCapture {
+    fn install() -> Self {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let sink_lines = lines.clone();
+        commands::console::set_sink(Box::new(move |line| {
+            sink_lines.lock().unwrap().push(line);
+        }));
+        Self { lines }
+    }
+
+    fn text(&self) -> String {
+        self.lines.lock().unwrap().join("\n")
+    }
+}
+
+impl Drop for OutputCapture {
+    fn drop(&mut self) {
+        commands::console::clear_sink();
     }
 }
 
@@ -876,6 +931,180 @@ async fn dispatch_skill_refuses_disabled_skill() {
         }
         other => panic!("expected Error outcome, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn dispatch_skills_disable_persists_overlay_and_reloads() {
+    let _guard = PIE_DIR_ENV_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let _pie_dir = EnvGuard::set("PIE_DIR", temp.path());
+    let harness = harness_with_reloadable_skills(
+        temp.path(),
+        vec![skill("review-pr", "SECRET SKILL BODY", false)],
+    );
+
+    let registry = commands::Registry::with_builtins();
+    let cwd = std::env::current_dir().unwrap();
+    let ctx = commands::CommandCtx {
+        harness: &harness,
+        session_id: "test",
+        log_path: None,
+        tool_count: 0,
+        cwd: &cwd,
+    };
+
+    let outcome = commands::dispatch("/skills disable review-pr", &registry, &ctx).await;
+    assert!(matches!(outcome, commands::CommandOutcome::Handled));
+
+    let skills = harness.skills();
+    let skill = skills.iter().find(|s| s.name == "review-pr").unwrap();
+    assert!(
+        skill.disable_model_invocation,
+        "reload should apply overlay"
+    );
+
+    let state = skills_state::load(temp.path()).await;
+    assert_eq!(
+        state
+            .lookup("review-pr", SkillSource::User)
+            .map(|entry| entry.enabled),
+        Some(false)
+    );
+    let entries = harness.session().entries().await.unwrap();
+    let audit = entries.iter().any(|entry| {
+        matches!(
+            entry,
+            SessionTreeEntry::Custom { custom_type, data, .. }
+                if custom_type == "skill_control_plane"
+                    && data.as_ref().and_then(|d| d.get("actor")).and_then(|v| v.as_str()) == Some("slash")
+                    && data.as_ref().and_then(|d| d.get("after_enabled")).and_then(|v| v.as_bool()) == Some(false)
+        )
+    });
+    assert!(
+        audit,
+        "slash skill disable should write audit: {entries:#?}"
+    );
+}
+
+#[tokio::test]
+async fn dispatch_skills_enable_is_user_mediated_and_reuses_overlay() {
+    let _guard = PIE_DIR_ENV_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let _pie_dir = EnvGuard::set("PIE_DIR", temp.path());
+    let harness = harness_with_reloadable_skills(
+        temp.path(),
+        vec![skill("formatter", "SECRET SKILL BODY", true)],
+    );
+
+    let registry = commands::Registry::with_builtins();
+    let cwd = std::env::current_dir().unwrap();
+    let ctx = commands::CommandCtx {
+        harness: &harness,
+        session_id: "test",
+        log_path: None,
+        tool_count: 0,
+        cwd: &cwd,
+    };
+
+    let outcome = commands::dispatch("/skills enable formatter user", &registry, &ctx).await;
+    assert!(matches!(outcome, commands::CommandOutcome::Handled));
+
+    let skills = harness.skills();
+    let skill = skills.iter().find(|s| s.name == "formatter").unwrap();
+    assert!(
+        !skill.disable_model_invocation,
+        "user slash command may explicitly enable a frontmatter-disabled skill"
+    );
+
+    let state = skills_state::load(temp.path()).await;
+    assert_eq!(
+        state
+            .lookup("formatter", SkillSource::User)
+            .map(|entry| entry.enabled),
+        Some(true)
+    );
+    let entries = harness.session().entries().await.unwrap();
+    let audit = entries.iter().any(|entry| {
+        matches!(
+            entry,
+            SessionTreeEntry::Custom { custom_type, data, .. }
+                if custom_type == "skill_control_plane"
+                    && data.as_ref().and_then(|d| d.get("actor")).and_then(|v| v.as_str()) == Some("slash")
+                    && data.as_ref().and_then(|d| d.get("after_enabled")).and_then(|v| v.as_bool()) == Some(true)
+        )
+    });
+    assert!(audit, "slash skill enable should write audit: {entries:#?}");
+}
+
+#[tokio::test]
+async fn dispatch_skills_show_prints_metadata_without_body() {
+    let _output_guard = COMMAND_OUTPUT_LOCK.lock().unwrap();
+    let capture = OutputCapture::install();
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage as Arc<dyn SessionStorage>);
+    let mut opts = AgentHarnessOptions::new(faux_model(), session);
+    let mut s = skill("review-pr", "SECRET SKILL BODY", false);
+    s.source = SkillSource::Project;
+    opts.skills = vec![s];
+    let harness = Arc::new(AgentHarness::new(opts));
+
+    let registry = commands::Registry::with_builtins();
+    let cwd = std::env::current_dir().unwrap();
+    let ctx = commands::CommandCtx {
+        harness: &harness,
+        session_id: "test",
+        log_path: None,
+        tool_count: 0,
+        cwd: &cwd,
+    };
+
+    let outcome = commands::dispatch("/skills show review-pr project", &registry, &ctx).await;
+    assert!(matches!(outcome, commands::CommandOutcome::Handled));
+    let text = capture.text();
+    assert!(text.contains("Skill: review-pr (project)"), "{text}");
+    assert!(text.contains("Status: enabled"), "{text}");
+    assert!(text.contains("Path:"), "{text}");
+    assert!(
+        text.contains("Body: not shown"),
+        "show should explain body omission:\n{text}"
+    );
+    assert!(
+        !text.contains("SECRET SKILL BODY"),
+        "show must not print SKILL.md body:\n{text}"
+    );
+}
+
+#[tokio::test]
+async fn dispatch_skills_reload_uses_harness_reload_and_prints_summary() {
+    let _output_guard = COMMAND_OUTPUT_LOCK.lock().unwrap();
+    let capture = OutputCapture::install();
+    let temp = tempfile::tempdir().unwrap();
+    let harness = harness_with_reloadable_skills(
+        temp.path(),
+        vec![skill("one", "body", false), skill("two", "body", false)],
+    );
+    // Make the live catalog stale so the assertion proves `/skills reload` called the harness
+    // reload closure rather than just recounting the current catalog.
+    harness.replace_skills(Vec::new());
+
+    let registry = commands::Registry::with_builtins();
+    let cwd = std::env::current_dir().unwrap();
+    let ctx = commands::CommandCtx {
+        harness: &harness,
+        session_id: "test",
+        log_path: None,
+        tool_count: 0,
+        cwd: &cwd,
+    };
+
+    let outcome = commands::dispatch("/skills reload", &registry, &ctx).await;
+    assert!(matches!(outcome, commands::CommandOutcome::Handled));
+    assert_eq!(harness.skills().len(), 2, "reload should refresh catalog");
+    let text = capture.text();
+    assert!(
+        text.contains("reloaded skills: 2 loaded, 0 diagnostics"),
+        "{text}"
+    );
 }
 
 #[tokio::test]

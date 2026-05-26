@@ -60,7 +60,7 @@ use crate::readline::SlashCompleter;
 use crate::{images, mentions};
 use feed::{Feed, Level};
 use kernel::{QueuedTurn, ReplKernel, TurnState, poll_turn};
-use pie_agent_core::{AgentHarness, AgentMessage, AgentRunError};
+use pie_agent_core::{AgentHarness, AgentMessage, AgentRunError, SkillSource};
 use pie_ai::{ContentBlock, ImageContent, Message, UserContent, UserContentBlock};
 
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -1077,7 +1077,8 @@ impl App {
     }
 
     fn should_show_side_panel(&self) -> bool {
-        !crate::triggers::global_registry().list().is_empty()
+        !self.kernel.harness().skills().is_empty()
+            || !crate::triggers::global_registry().list().is_empty()
             || self.panel_status.mcp_servers > 0
             || self.panel_status.mcp_notification_hooks > 0
     }
@@ -1087,6 +1088,40 @@ impl App {
         let rules = crate::triggers::global_registry().list();
 
         let mut lines = Vec::new();
+        let skills = self.kernel.harness().skills();
+        lines.push(panel_line("Skills".to_string(), Color::Cyan, width));
+        if skills.is_empty() {
+            lines.push(panel_line("none".to_string(), Color::DarkGray, width));
+        } else {
+            let disabled = skills
+                .iter()
+                .filter(|skill| skill.disable_model_invocation)
+                .count();
+            let enabled = skills.len().saturating_sub(disabled);
+            lines.push(panel_line(
+                format!("enabled {enabled} · disabled {disabled}"),
+                if disabled == 0 {
+                    Color::Green
+                } else {
+                    Color::Yellow
+                },
+                width,
+            ));
+            let source_count =
+                |source| skills.iter().filter(|skill| skill.source == source).count();
+            lines.push(panel_line(
+                format!(
+                    "builtin {} · user {} · project {}",
+                    source_count(SkillSource::Builtin),
+                    source_count(SkillSource::User),
+                    source_count(SkillSource::Project)
+                ),
+                Color::DarkGray,
+                width,
+            ));
+        }
+
+        lines.push(Line::raw(""));
         lines.push(panel_line("Triggers".to_string(), Color::Cyan, width));
         if rules.is_empty() {
             lines.push(panel_line("none".to_string(), Color::DarkGray, width));
@@ -1127,7 +1162,8 @@ impl App {
 
         let hook_rows = self.panel_status.hook_points.len().max(1);
         let feature_rows = self.panel_status.trigger_features.len().max(1);
-        // 2 section gaps + 2 section titles + 2 mcp body rows + hook rows + feature rows + 1 runtime gap/title
+        // Skills + Triggers are variable above. Reserve enough rows for the lower static status
+        // sections so MCP/Hooks/Runtime don't get clipped in ordinary tall terminals.
         let status_rows = 2 + 2 + 2 + hook_rows + 2 + feature_rows;
         while lines.len() + status_rows < height {
             lines.push(Line::raw(""));
@@ -1537,6 +1573,21 @@ mod tests {
         })
     }
 
+    fn ui_skill(
+        name: &str,
+        source: pie_agent_core::SkillSource,
+        disabled: bool,
+    ) -> pie_agent_core::Skill {
+        pie_agent_core::Skill {
+            name: name.into(),
+            description: format!("description for {name}"),
+            file_path: format!("/tmp/{name}/SKILL.md"),
+            content: "SECRET SKILL BODY".into(),
+            disable_model_invocation: disabled,
+            source,
+        }
+    }
+
     fn one_pixel_clipboard_image() -> crate::clipboard_image::ClipboardImage {
         crate::clipboard_image::encode_rgba_clipboard_image(1, 1, vec![255, 0, 0, 255]).unwrap()
     }
@@ -1734,6 +1785,42 @@ mod tests {
         assert!(
             !text.contains("cycle suppress"),
             "static trigger-runtime rows belong in /triggers status, not the default side panel:\n{text}"
+        );
+    }
+
+    #[test]
+    fn wide_layout_renders_compact_skills_panel_summary() {
+        let _guard = TRIGGER_REGISTRY_TEST_LOCK.lock().unwrap();
+        crate::triggers::global_registry().clear_for_tests();
+        let mut app = test_app();
+        app.kernel.harness().replace_skills(vec![
+            ui_skill(
+                "builtin-review",
+                pie_agent_core::SkillSource::Builtin,
+                false,
+            ),
+            ui_skill("user-format", pie_agent_core::SkillSource::User, true),
+            ui_skill("project-plan", pie_agent_core::SkillSource::Project, false),
+        ]);
+
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+
+        assert!(text.contains("Automation"), "panel title missing:\n{text}");
+        assert!(text.contains("Skills"), "skills section missing:\n{text}");
+        assert!(
+            text.contains("enabled 2 · disabled 1"),
+            "skills enabled/disabled summary missing:\n{text}"
+        );
+        assert!(
+            text.contains("builtin 1 · user 1 · project 1"),
+            "skills source summary missing:\n{text}"
+        );
+        assert!(
+            !text.contains("SECRET SKILL BODY"),
+            "skills panel must not render skill body:\n{text}"
         );
     }
 

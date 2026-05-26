@@ -11,9 +11,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use pie_agent_core::{
     AgentHarness, HookState, NotificationHookStatus, NotificationStatusSnapshot,
-    RunningTriggerState, SessionTreeEntry, ThinkingLevel,
+    RunningTriggerState, SessionTreeEntry, Skill, SkillSource, ThinkingLevel,
 };
 use pie_ai::{Model, Provider, get_model, list_models};
+use serde_json::json;
 
 /// Sink for slash-command output. The full-screen TUI owns the only terminal writer, so
 /// commands must not `println!` straight to stdout — they route through here. The app installs
@@ -30,6 +31,13 @@ pub mod console {
     #[cfg_attr(test, allow(dead_code))]
     pub fn set_sink(sink: Sink) {
         *SINK.lock() = Some(sink);
+    }
+
+    /// Clear the active line sink. Used by tests to avoid leaking capture sinks across cases.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub fn clear_sink() {
+        *SINK.lock() = None;
     }
 
     /// Emit one line of command output through the active sink (or stdout when unset).
@@ -253,30 +261,214 @@ impl SlashCommand for SkillsCommand {
         "skills"
     }
     fn description(&self) -> &'static str {
-        "list loaded skills"
+        "list, inspect, reload, enable, or disable skills"
     }
-    async fn run(&self, _argv: &[String], ctx: &CommandCtx<'_>) -> CommandOutcome {
-        let skills = ctx.harness.skills();
-        if skills.is_empty() {
-            cprintln!(
-                "(no skills loaded — drop SKILL.md files under ~/.pie/skills/<name>/ or <cwd>/.pie/skills/<name>/)"
-            );
-        } else {
-            cprintln!("Loaded skills ({}):", skills.len());
-            for s in &skills {
-                let disabled = if s.disable_model_invocation {
-                    "  [disabled: disable_model_invocation=true]"
-                } else {
-                    ""
-                };
-                cprintln!("  - {}  ({}){}", s.name, s.source.label(), disabled);
-                if !s.description.is_empty() {
-                    cprintln!("      {}", s.description);
-                }
-                cprintln!("      path: {}", s.file_path);
+    fn usage(&self) -> &'static str {
+        "[show <name>|reload|enable <name> [source]|disable <name> [source]]"
+    }
+    async fn run(&self, argv: &[String], ctx: &CommandCtx<'_>) -> CommandOutcome {
+        match argv.first().map(String::as_str) {
+            None | Some("list" | "ls") => {
+                print_skills_list(&ctx.harness.skills());
+                CommandOutcome::Handled
             }
+            Some("show") => show_skill(&argv[1..], ctx),
+            Some("reload") => reload_skills(ctx).await,
+            Some("enable") => set_skill_enabled(&argv[1..], ctx, true).await,
+            Some("disable") => set_skill_enabled(&argv[1..], ctx, false).await,
+            Some(_) => CommandOutcome::Error(
+                "usage: /skills [show <name>|reload|enable <name> [source]|disable <name> [source]]"
+                    .into(),
+            ),
         }
-        CommandOutcome::Handled
+    }
+}
+
+fn print_skills_list(skills: &[Skill]) {
+    if skills.is_empty() {
+        cprintln!(
+            "(no skills loaded — drop SKILL.md files under ~/.pie/skills/<name>/ or <cwd>/.pie/skills/<name>/)"
+        );
+    } else {
+        cprintln!("Loaded skills ({}):", skills.len());
+        for s in skills {
+            let disabled = if s.disable_model_invocation {
+                "  [disabled: disable_model_invocation=true]"
+            } else {
+                ""
+            };
+            cprintln!("  - {}  ({}){}", s.name, s.source.label(), disabled);
+            if !s.description.is_empty() {
+                cprintln!("      {}", s.description);
+            }
+            cprintln!("      path: {}", s.file_path);
+        }
+    }
+}
+
+fn show_skill(argv: &[String], ctx: &CommandCtx<'_>) -> CommandOutcome {
+    let Some(name) = argv.first() else {
+        return CommandOutcome::Error("usage: /skills show <name> [source]".into());
+    };
+    let source = match optional_skill_source(argv.get(1)) {
+        Ok(source) => source,
+        Err(e) => return CommandOutcome::Error(e),
+    };
+    let skills = ctx.harness.skills();
+    let skill = match resolve_active_skill(&skills, name, source) {
+        Ok(skill) => skill,
+        Err(e) => return CommandOutcome::Error(e),
+    };
+    cprintln!("Skill: {} ({})", skill.name, skill.source.label());
+    cprintln!(
+        "Status: {}",
+        if skill.disable_model_invocation {
+            "disabled"
+        } else {
+            "enabled"
+        }
+    );
+    if !skill.description.is_empty() {
+        cprintln!("Description: {}", skill.description);
+    }
+    cprintln!("Path: {}", skill.file_path);
+    cprintln!("Body: not shown; use the file path if you need to inspect the full skill.");
+    CommandOutcome::Handled
+}
+
+async fn reload_skills(ctx: &CommandCtx<'_>) -> CommandOutcome {
+    match ctx.harness.reload_skills_from_disk().await {
+        Ok(out) => {
+            cprintln!(
+                "reloaded skills: {} loaded, {} diagnostics",
+                out.skills.len(),
+                out.diagnostics.len()
+            );
+            CommandOutcome::Handled
+        }
+        Err(e) => CommandOutcome::Error(format!("reload skills failed: {e}")),
+    }
+}
+
+async fn set_skill_enabled(argv: &[String], ctx: &CommandCtx<'_>, enabled: bool) -> CommandOutcome {
+    let Some(name) = argv.first() else {
+        let verb = if enabled { "enable" } else { "disable" };
+        return CommandOutcome::Error(format!("usage: /skills {verb} <name> [source]"));
+    };
+    let source = match optional_skill_source(argv.get(1)) {
+        Ok(source) => source,
+        Err(e) => return CommandOutcome::Error(e),
+    };
+    let skills = ctx.harness.skills();
+    let skill = match resolve_active_skill(&skills, name, source) {
+        Ok(skill) => skill,
+        Err(e) => return CommandOutcome::Error(e),
+    };
+    let source = skill.source;
+    let name = skill.name.clone();
+    let was_enabled = !skill.disable_model_invocation;
+
+    if was_enabled == enabled {
+        cprintln!(
+            "skill already {}: {} ({})",
+            if enabled { "enabled" } else { "disabled" },
+            name,
+            source.label()
+        );
+        return CommandOutcome::Handled;
+    }
+
+    if let Err(e) =
+        crate::skills_state::set_and_save(&crate::config::base_dir(), &name, source, enabled).await
+    {
+        return CommandOutcome::Error(format!("persist skill state failed: {e}"));
+    }
+    match ctx.harness.reload_skills_from_disk().await {
+        Ok(out) => {
+            write_skill_state_audit(ctx, &name, source, was_enabled, enabled).await;
+            let diagnostics = if out.diagnostics.is_empty() {
+                String::new()
+            } else {
+                format!(" ({} diagnostics)", out.diagnostics.len())
+            };
+            cprintln!(
+                "{} skill: {} ({}){}",
+                if enabled { "enabled" } else { "disabled" },
+                name,
+                source.label(),
+                diagnostics
+            );
+            CommandOutcome::Handled
+        }
+        Err(e) => CommandOutcome::Error(format!("reload after skill state change failed: {e}")),
+    }
+}
+
+async fn write_skill_state_audit(
+    ctx: &CommandCtx<'_>,
+    name: &str,
+    source: SkillSource,
+    before_enabled: bool,
+    after_enabled: bool,
+) {
+    let audit = json!({
+        "op": "set_state",
+        "actor": "slash",
+        "name": name,
+        "source": source.label(),
+        "before_enabled": before_enabled,
+        "after_enabled": after_enabled,
+    });
+    if let Err(e) = ctx
+        .harness
+        .session()
+        .append_custom("skill_control_plane", Some(audit))
+        .await
+    {
+        tracing::warn!(
+            skill = %name,
+            error = %e,
+            "skill_control_plane audit write failed; slash state change itself succeeded"
+        );
+    }
+}
+
+fn optional_skill_source(raw: Option<&String>) -> Result<Option<SkillSource>, String> {
+    raw.map(|s| parse_skill_source(s).map(Some))
+        .unwrap_or(Ok(None))
+}
+
+fn parse_skill_source(raw: &str) -> Result<SkillSource, String> {
+    match raw {
+        "builtin" => Ok(SkillSource::Builtin),
+        "user" => Ok(SkillSource::User),
+        "project" => Ok(SkillSource::Project),
+        _ => Err("invalid skill source; expected one of: builtin, user, project".into()),
+    }
+}
+
+fn resolve_active_skill<'a>(
+    skills: &'a [Skill],
+    name: &str,
+    source: Option<SkillSource>,
+) -> Result<&'a Skill, String> {
+    let matches = skills
+        .iter()
+        .filter(|skill| skill.name == name && source.map(|s| skill.source == s).unwrap_or(true))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [skill] => Ok(*skill),
+        [] => {
+            let source_hint = source
+                .map(|source| format!(" {} ", source.label()))
+                .unwrap_or_else(|| " ".into());
+            Err(format!(
+                "no active{source_hint}skill named '{name}'. Run /skills to list loaded skills."
+            ))
+        }
+        _ => Err(format!(
+            "multiple active skills named '{name}'; pass source: builtin, user, or project"
+        )),
     }
 }
 
@@ -2159,5 +2351,12 @@ mod tests {
         assert_eq!(SkillSource::Builtin.label(), "builtin");
         assert_eq!(SkillSource::User.label(), "user");
         assert_eq!(SkillSource::Project.label(), "project");
+    }
+
+    #[test]
+    fn skill_source_parse_error_is_fixed_and_bounded() {
+        let err = parse_skill_source("user-secret-token").unwrap_err();
+        assert!(err.contains("expected one of"), "{err}");
+        assert!(!err.contains("user-secret-token"), "{err}");
     }
 }
