@@ -264,9 +264,12 @@ fn parse_source(s: &str) -> Result<SkillSource, AgentToolError> {
         "builtin" => Ok(SkillSource::Builtin),
         "user" => Ok(SkillSource::User),
         "project" => Ok(SkillSource::Project),
-        other => Err(AgentToolError::Message(format!(
-            "invalid source '{other}' (expected builtin|user|project)"
-        ))),
+        // Fixed wording — do not echo the raw arg back (defense-in-depth, Provider/Auth
+        // review on PR #108): the model already knows what it passed, and not reflecting
+        // arbitrary tool input keeps the redaction discipline uniform.
+        _ => Err(AgentToolError::from(
+            "invalid `source` (expected one of: builtin, user, project)",
+        )),
     }
 }
 
