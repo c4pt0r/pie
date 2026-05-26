@@ -11,7 +11,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use pie_agent_core::{
     AgentHarness, HookState, NotificationHookStatus, NotificationStatusSnapshot,
-    RunningTriggerState, SessionTreeEntry, Skill, ThinkingLevel,
+    RunningTriggerState, SessionTreeEntry, ThinkingLevel,
 };
 use pie_ai::{Model, Provider, get_model, list_models};
 
@@ -269,12 +269,7 @@ impl SlashCommand for SkillsCommand {
                 } else {
                     ""
                 };
-                cprintln!(
-                    "  - {}  ({}){}",
-                    s.name,
-                    skill_source_label(s, ctx.cwd),
-                    disabled
-                );
+                cprintln!("  - {}  ({}){}", s.name, s.source.label(), disabled);
                 if !s.description.is_empty() {
                     cprintln!("      {}", s.description);
                 }
@@ -335,25 +330,6 @@ impl SlashCommand for SkillCommand {
         }
         cprintln!("attached skill: {name} for next turn");
         CommandOutcome::AttachSkill { name: name.clone() }
-    }
-}
-
-fn skill_source_label(skill: &Skill, cwd: &std::path::Path) -> String {
-    // Built-in skills are bundled into the `pie` binary and surface a synthetic
-    // `<builtin>/<name>/SKILL.md` path. Detect that before falling through to the disk-path
-    // checks below.
-    if skill.file_path.starts_with("<builtin>/") {
-        return "builtin".into();
-    }
-    let path = std::path::Path::new(&skill.file_path);
-    if path.starts_with(cwd.join(".pie").join("skills")) {
-        "project".into()
-    } else if skill.file_path.contains("/.pie/skills/")
-        || skill.file_path.contains("/.pie/skills\\")
-    {
-        "user".into()
-    } else {
-        "source path".into()
     }
 }
 
@@ -1832,6 +1808,7 @@ pub async fn dispatch(input: &str, registry: &Registry, ctx: &CommandCtx<'_>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pie_agent_core::SkillSource;
 
     struct EnvGuard {
         key: &'static str,
@@ -2174,42 +2151,13 @@ mod tests {
         assert_eq!(attach_skill_prompt("plain", None), "plain");
     }
 
-    /// Helper: build a Skill record only filling the fields `skill_source_label` reads.
-    fn skill_with_path(name: &str, file_path: &str) -> Skill {
-        Skill {
-            name: name.into(),
-            description: String::new(),
-            file_path: file_path.into(),
-            content: String::new(),
-            disable_model_invocation: false,
-        }
-    }
-
     #[test]
-    fn skill_source_label_recognizes_builtin_synthetic_path() {
-        // Built-in skills (#32) carry a synthetic `<builtin>/<name>/SKILL.md` path. `/skills`
-        // must classify these as `builtin`, not fall through to the `source path` catch-all.
-        let s = skill_with_path(
-            "karpathy-guidelines",
-            "<builtin>/karpathy-guidelines/SKILL.md",
-        );
-        let cwd = std::path::PathBuf::from("/tmp/some-project");
-        assert_eq!(skill_source_label(&s, &cwd), "builtin");
-    }
-
-    #[test]
-    fn skill_source_label_distinguishes_builtin_from_project_and_user() {
-        // Round out the test by confirming the new builtin branch doesn't shadow the existing
-        // project / user paths. This locks `/skills` source classification across all three
-        // tiers in one place.
-        let cwd = std::path::PathBuf::from("/repo");
-        let project = skill_with_path("p", "/repo/.pie/skills/p/SKILL.md");
-        assert_eq!(skill_source_label(&project, &cwd), "project");
-        let user = skill_with_path("u", "/home/me/.pie/skills/u/SKILL.md");
-        assert_eq!(skill_source_label(&user, &cwd), "user");
-        let builtin = skill_with_path("b", "<builtin>/b/SKILL.md");
-        assert_eq!(skill_source_label(&builtin, &cwd), "builtin");
-        let unknown = skill_with_path("x", "/some/weird/place/x/SKILL.md");
-        assert_eq!(skill_source_label(&unknown, &cwd), "source path");
+    fn skill_source_label_maps_enum_variants() {
+        // `/skills` now renders the structured `Skill.source` field (set by the loader per
+        // discovery root) instead of inferring source from the file_path string. Lock the
+        // label mapping the listing depends on.
+        assert_eq!(SkillSource::Builtin.label(), "builtin");
+        assert_eq!(SkillSource::User.label(), "user");
+        assert_eq!(SkillSource::Project.label(), "project");
     }
 }

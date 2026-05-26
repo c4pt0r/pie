@@ -131,7 +131,7 @@ mod tests {
     use super::*;
     use once_cell::sync::OnceCell as SyncOnceCell;
     use pie_agent_core::{
-        AgentHarnessOptions, MemorySessionStorage, Session, SessionStorage, Skill,
+        AgentHarnessOptions, MemorySessionStorage, Session, SessionStorage, Skill, SkillSource,
     };
     use pie_ai::{Api, Model, ModelCost, Provider};
     use std::sync::Arc;
@@ -172,6 +172,7 @@ mod tests {
             file_path: format!("/tmp/skills/{name}/SKILL.md"),
             content: format!("# {name}\n\nBody of the {name} skill."),
             disable_model_invocation: disabled,
+            source: SkillSource::User,
         }
     }
 

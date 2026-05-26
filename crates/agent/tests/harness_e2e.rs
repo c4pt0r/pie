@@ -6,8 +6,8 @@ use std::sync::Arc;
 use pie_agent_core::{
     AgentHarness, AgentHarnessOptions, AgentMessage, CompactionSettings, HarnessEvent,
     HarnessListener, JsonlSessionRepo, MemorySessionStorage, Session, SessionError,
-    SessionErrorCode, SessionStorage, SessionTreeEntry, Skill, StreamFn, ThinkingLevel,
-    build_session_context,
+    SessionErrorCode, SessionStorage, SessionTreeEntry, Skill, SkillSource, StreamFn,
+    ThinkingLevel, build_session_context,
 };
 use pie_ai::{
     AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream, AssistantRole,
@@ -190,6 +190,7 @@ async fn skills_block_appears_in_system_prompt() {
         file_path: "/skills/my-skill/SKILL.md".into(),
         content: "the body".into(),
         disable_model_invocation: false,
+        source: SkillSource::User,
     };
     let mut opts = AgentHarnessOptions::new(faux_model(), session);
     opts.system_prompt = "Base.".into();
@@ -4197,6 +4198,7 @@ async fn reload_skills_from_disk_invokes_loader_and_replaces_catalog() {
         content: "original body".into(),
         description: "the skill we ship with".into(),
         disable_model_invocation: false,
+        source: SkillSource::User,
         file_path: "/tmp/original".into(),
     }];
 
@@ -4213,6 +4215,7 @@ async fn reload_skills_from_disk_invokes_loader_and_replaces_catalog() {
                         content: "after install".into(),
                         description: "newly installed".into(),
                         disable_model_invocation: false,
+                        source: SkillSource::User,
                         file_path: "/tmp/fresh-one".into(),
                     },
                     Skill {
@@ -4220,6 +4223,7 @@ async fn reload_skills_from_disk_invokes_loader_and_replaces_catalog() {
                         content: "second new".into(),
                         description: "also newly installed".into(),
                         disable_model_invocation: false,
+                        source: SkillSource::User,
                         file_path: "/tmp/fresh-two".into(),
                     },
                 ],
@@ -4279,6 +4283,7 @@ async fn reload_skills_from_disk_propagates_loader_diagnostics() {
                     content: "ok".into(),
                     description: "valid skill".into(),
                     disable_model_invocation: false,
+                    source: SkillSource::User,
                     file_path: "/tmp/good".into(),
                 }],
                 diagnostics: vec![SkillDiagnostic {
@@ -4344,6 +4349,7 @@ async fn reload_skills_from_disk_preserves_message_state_and_streaming_flag() {
                     content: "fresh".into(),
                     description: "post-reload".into(),
                     disable_model_invocation: false,
+                    source: SkillSource::User,
                     file_path: "/tmp/reloaded".into(),
                 }],
                 diagnostics: Vec::new(),

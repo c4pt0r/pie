@@ -81,6 +81,7 @@ pub use harness::{
         ExecOptions, ExecOutput, ExecResult, ExecutionEnv, ExecutionError, ExecutionErrorCode,
         FileError, FileErrorCode, FileInfo, FileKind, FsResult, PromptTemplate, SessionError,
         SessionErrorCode, Skill, SkillDiagnostic, SkillDiagnosticCode, SkillFrontmatter,
+        SkillSource,
     },
 };
 

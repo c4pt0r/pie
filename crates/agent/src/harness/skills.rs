@@ -302,6 +302,11 @@ impl<'a> Walker<'a> {
             file_path: file_path.to_string(),
             content: body,
             disable_model_invocation: frontmatter.disable_model_invocation,
+            // The walker doesn't know which discovery root (builtin/user/project) a dir maps
+            // to — it just walks the dirs it's handed. The embedder's loader (coding-agent
+            // `skills::load_all` + `builtin_skills`) sets the correct source per root after
+            // loading. Default keeps the runtime IO-free and source-agnostic.
+            source: SkillSource::default(),
         });
     }
 }
@@ -542,6 +547,7 @@ mod tests {
             file_path: "/abs/skills/my-skill/SKILL.md".into(),
             content: "hello".into(),
             disable_model_invocation: false,
+            source: SkillSource::User,
         };
         let out = format_skill_invocation(&skill, Some("EXTRA"));
         assert!(out.contains("<skill name=\"my-skill\""));

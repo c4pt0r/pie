@@ -11,7 +11,8 @@ use async_trait::async_trait;
 use pie_agent_core::{
     AgentHarness, AgentHarnessOptions, AgentTool, AgentToolError, AgentToolResult, AgentToolUpdate,
     CredentialScope, HarnessEvent, MemorySessionStorage, PayloadVisibility, ReplacementPolicy,
-    Session, SessionStorage, Skill, SourceKind, StreamFn, Trigger, TriggerAuthority, TriggerSource,
+    Session, SessionStorage, Skill, SkillSource, SourceKind, StreamFn, Trigger, TriggerAuthority,
+    TriggerSource,
 };
 use pie_ai::{
     AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream, AssistantRole,
@@ -696,6 +697,7 @@ async fn trigger_sub_agent_sees_parent_skill_catalog() {
         file_path: "/tmp/skills/alpha/SKILL.md".into(),
         content: "Alpha skill body.".into(),
         disable_model_invocation: false,
+        source: SkillSource::User,
     }];
     opts.tools = vec![Arc::new(RecordingBashTool::new(bash_calls.clone())) as Arc<dyn AgentTool>];
     opts.stream_fn = Some(recording_dynamic_trigger_stream(

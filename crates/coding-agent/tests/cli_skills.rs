@@ -22,7 +22,7 @@ use tempfile::TempDir;
 /// duplicated lets us test the loader without restructuring the crate; if the duplicate drifts,
 /// the test fails the next time we touch it.
 mod skills_mirror {
-    use pie_agent_core::{NativeEnv, Skill, SkillDiagnostic, load_skills};
+    use pie_agent_core::{NativeEnv, Skill, SkillDiagnostic, SkillSource, load_skills};
     use std::path::{Path, PathBuf};
     use tokio_util::sync::CancellationToken;
 
@@ -38,11 +38,14 @@ mod skills_mirror {
         let cancel = CancellationToken::new();
         let mut combined = Vec::<Skill>::new();
         let mut diagnostics = Vec::<SkillDiagnostic>::new();
-        for dir in [user, project] {
+        // Mirror the real `skills::load_all`: load user first, project second (project wins),
+        // and tag each skill with the source of the root it came from.
+        for (dir, source) in [(user, SkillSource::User), (project, SkillSource::Project)] {
             let s = dir.to_string_lossy().to_string();
             let out = load_skills(&env, &[s.as_str()], cancel.clone()).await;
             diagnostics.extend(out.diagnostics);
-            for skill in out.skills {
+            for mut skill in out.skills {
+                skill.source = source;
                 if let Some(i) = combined.iter().position(|s| s.name == skill.name) {
                     combined[i] = skill;
                 } else {
@@ -173,5 +176,68 @@ async fn missing_roots_load_cleanly() {
         loaded.diagnostics.is_empty(),
         "non-existent roots should produce no diagnostics: {:#?}",
         loaded.diagnostics
+    );
+}
+
+#[tokio::test]
+async fn loader_tags_skill_source_per_root() {
+    use pie_agent_core::SkillSource;
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+
+    // One skill in each root, distinct names so no shadowing.
+    write_skill(home.path(), "user-skill", "u", "USER");
+    write_skill(&cwd.path().join(".pie"), "project-skill", "p", "PROJECT");
+
+    let loaded = skills_mirror::load_all(cwd.path(), home.path()).await;
+
+    let user = loaded
+        .skills
+        .iter()
+        .find(|s| s.name == "user-skill")
+        .expect("user skill loaded");
+    let project = loaded
+        .skills
+        .iter()
+        .find(|s| s.name == "project-skill")
+        .expect("project skill loaded");
+
+    assert_eq!(
+        user.source,
+        SkillSource::User,
+        "skill from ~/.pie/skills must be tagged User"
+    );
+    assert_eq!(
+        project.source,
+        SkillSource::Project,
+        "skill from <cwd>/.pie/skills must be tagged Project"
+    );
+    // The display label the `/skills` listing renders comes straight off the field now.
+    assert_eq!(user.source.label(), "user");
+    assert_eq!(project.source.label(), "project");
+}
+
+#[tokio::test]
+async fn loader_tags_project_source_when_project_shadows_user() {
+    use pie_agent_core::SkillSource;
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+
+    // Same name in both roots — project wins, and the surviving entry must carry the
+    // Project source (not the User source it would have had if shadowing dropped the tag).
+    write_skill(home.path(), "shared", "user-version", "USER BODY");
+    write_skill(
+        &cwd.path().join(".pie"),
+        "shared",
+        "project-version",
+        "PROJECT BODY",
+    );
+
+    let loaded = skills_mirror::load_all(cwd.path(), home.path()).await;
+    let shared = loaded.skills.iter().find(|s| s.name == "shared").unwrap();
+    assert_eq!(
+        shared.source,
+        SkillSource::Project,
+        "project-shadowed skill must report Project source"
     );
 }

@@ -233,6 +233,35 @@ pub trait ExecutionEnv: Send + Sync {
 // Skill — the resource discovered by `skills.rs`
 // ──────────────────────────────────────────────────────────────────────────────────────────
 
+/// Where a loaded skill came from. The runtime walker doesn't distinguish discovery roots,
+/// so it leaves this at the default (`User`); the embedder's loader (e.g. the coding-agent
+/// CLI, which loads builtin / `~/.pie/skills` / `<cwd>/.pie/skills` separately) sets the
+/// correct value per skill. Used for source-aware management — e.g. "remove only
+/// user-installed skills", disambiguating a builtin shadowed by a same-name user skill —
+/// and for observability (showing the active source in `/skills`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillSource {
+    /// Bundled with the `pie` binary; lowest precedence.
+    Builtin,
+    /// `~/.pie/skills/` — user-global. Default for directly-constructed skills.
+    #[default]
+    User,
+    /// `<cwd>/.pie/skills/` — project-local; highest precedence.
+    Project,
+}
+
+impl SkillSource {
+    /// Stable lowercase label for display + audit (`builtin` / `user` / `project`).
+    pub fn label(self) -> &'static str {
+        match self {
+            SkillSource::Builtin => "builtin",
+            SkillSource::User => "user",
+            SkillSource::Project => "project",
+        }
+    }
+}
+
 /// Skill loaded from a `SKILL.md` file or provided by an application.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Skill {
@@ -248,6 +277,11 @@ pub struct Skill {
     /// surfaced through the skill catalog (descriptive use).
     #[serde(default)]
     pub disable_model_invocation: bool,
+    /// Origin of this skill. Defaults to [`SkillSource::User`]; the embedder's loader sets
+    /// it per discovery root. Runtime-only consumers (and directly-constructed skills) see
+    /// the default.
+    #[serde(default)]
+    pub source: SkillSource,
 }
 
 /// Frontmatter shape parsed off the `SKILL.md` head.

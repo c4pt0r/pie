@@ -20,7 +20,7 @@
 //!
 //! See c4pt0r/pie#32 for the spec.
 
-use pie_agent_core::Skill;
+use pie_agent_core::{Skill, SkillSource};
 use std::collections::BTreeSet;
 
 /// Raw markdown of each built-in skill, vendored verbatim under
@@ -148,6 +148,7 @@ fn spec_to_skill(spec: &BuiltinSpec) -> Skill {
         file_path: format!("<builtin>/{}/SKILL.md", spec.name),
         content: strip_frontmatter(spec.raw_markdown).to_string(),
         disable_model_invocation: false,
+        source: SkillSource::Builtin,
     }
 }
 
@@ -389,6 +390,7 @@ mod tests {
             file_path: file_path.into(),
             content: format!("body of {name}"),
             disable_model_invocation: false,
+            source: SkillSource::User,
         }
     }
 

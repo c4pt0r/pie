@@ -273,6 +273,7 @@ async fn skill_tool_returns_wrapped_body_on_hit() {
     use once_cell::sync::OnceCell as SyncOnceCell;
     use pie_agent_core::{
         AgentHarness, AgentHarnessOptions, MemorySessionStorage, Session, SessionStorage, Skill,
+        SkillSource,
     };
 
     let storage = Arc::new(MemorySessionStorage::new()) as Arc<dyn SessionStorage>;
@@ -284,6 +285,7 @@ async fn skill_tool_returns_wrapped_body_on_hit() {
         file_path: "/tmp/skills/test-skill/SKILL.md".into(),
         content: "# test-skill\n\nDo the test thing.".into(),
         disable_model_invocation: false,
+        source: SkillSource::User,
     }];
     let harness: Arc<AgentHarness> = Arc::new(AgentHarness::new(opts));
 

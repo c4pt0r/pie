@@ -38,6 +38,7 @@ pub fn format_skills_for_system_prompt(skills: &[Skill]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::types::SkillSource;
     use super::*;
 
     fn mk(name: &str, desc: &str) -> Skill {
@@ -47,6 +48,7 @@ mod tests {
             file_path: format!("/skills/{name}/SKILL.md"),
             content: "body".into(),
             disable_model_invocation: false,
+            source: SkillSource::User,
         }
     }
 

@@ -9,7 +9,7 @@ use std::sync::Mutex;
 
 use pie_agent_core::{
     AgentHarness, AgentHarnessOptions, AgentTool, MemorySessionStorage, Session, SessionStorage,
-    SessionTreeEntry, Skill, ThinkingLevel,
+    SessionTreeEntry, Skill, SkillSource, ThinkingLevel,
 };
 use pie_ai::{
     AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream, AssistantRole,
@@ -151,6 +151,7 @@ fn skill(name: &str, content: &str, disabled: bool) -> Skill {
         file_path: format!("/tmp/project/.pie/skills/{name}/SKILL.md"),
         content: content.into(),
         disable_model_invocation: disabled,
+        source: SkillSource::User,
     }
 }
 

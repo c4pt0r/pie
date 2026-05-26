@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use pie_agent_core::{NativeEnv, Skill, SkillDiagnostic, load_skills};
+use pie_agent_core::{NativeEnv, Skill, SkillDiagnostic, SkillSource, load_skills};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::base_dir;
@@ -38,12 +38,15 @@ pub async fn load_all(cwd: &Path) -> LoadedSkills {
     let mut combined = Vec::<Skill>::new();
     let mut diagnostics = Vec::<SkillDiagnostic>::new();
 
-    // Load user first so project entries (loaded second) can shadow.
-    for dir in [user, project] {
+    // Load user first so project entries (loaded second) can shadow. The runtime walker
+    // leaves `source` at its default; we set the correct source per root here, where the
+    // project-vs-user distinction is actually known.
+    for (dir, source) in [(user, SkillSource::User), (project, SkillSource::Project)] {
         let s = dir.to_string_lossy().to_string();
         let out = load_skills(&env, &[s.as_str()], cancel.clone()).await;
         diagnostics.extend(out.diagnostics);
-        for skill in out.skills {
+        for mut skill in out.skills {
+            skill.source = source;
             dedupe_project_wins(&mut combined, skill);
         }
     }
