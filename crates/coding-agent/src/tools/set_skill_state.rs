@@ -1,10 +1,18 @@
-//! `SetSkillState` builtin tool (skill-lifecycle task #23, S-A2): enable or disable a loaded
-//! skill at runtime without editing its `SKILL.md`.
+//! `SetSkillState` builtin tool (skill-lifecycle task #23, S-A2): **disable** a loaded skill
+//! at runtime without editing its `SKILL.md`.
 //!
 //! Persistence is the `~/.pie/skills-state.json` overlay (see [`crate::skills_state`]) keyed
 //! by `{source, name}` — the user's SKILL.md stays pristine and the choice survives restarts
 //! and reloads. Works for ANY source: a builtin or project skill that can't be deleted can
 //! still be disabled. (Removal of user-installed skills is the separate `RemoveSkill` tool.)
+//!
+//! **Disable-only (Provider/Auth gate, PR #108)**: the model-facing tool rejects
+//! `enabled: true`. Re-enabling is a persistent privilege escalation (re-opening a skill an
+//! author or user disabled) and, until `ControlPlaneWrite` has a real user-Prompt gate, the
+//! two-phase confirm is model-self-confirmed rather than user-mediated. Enabling is therefore
+//! a user action via the `/skills enable <name>` slash command (S-B), which calls the same
+//! `skills_state::set_and_save(.., enabled=true)` under a real keystroke. The overlay itself
+//! supports both states; only the tool surface is restricted.
 //!
 //! Safety:
 //! - Two-phase: the first call (without `confirm: true`) previews the change (current vs
@@ -96,6 +104,25 @@ impl AgentTool for SetSkillStateTool {
     ) -> Result<AgentToolResult, AgentToolError> {
         let input: Input = serde_json::from_value(params)
             .map_err(|e| AgentToolError::Message(format!("invalid arguments: {e}")))?;
+
+        // Security gate (Provider/Auth review on PR #108): the model-facing tool may only
+        // DISABLE a skill. Re-enabling is a persistent privilege escalation — a skill the
+        // author shipped with `disable_model_invocation=true`, or one a user explicitly
+        // disabled, would be re-opened by the model itself. Because `ControlPlaneWrite` has
+        // no real user-Prompt gate yet (the two-phase confirm is model-self-confirmed, not
+        // user-mediated), enabling must come from an explicit user action — the
+        // `/skills enable <name>` slash command (S-B), which calls
+        // `skills_state::set_and_save(.., enabled=true)` under a real user keystroke. Lift
+        // this restriction once the runtime Prompt path for ControlPlaneWrite lands.
+        if input.enabled {
+            return Err(AgentToolError::Message(format!(
+                "the SetSkillState tool can only disable a skill, not enable one. Re-enabling \
+                 '{}' is a user action — run `/skills enable {}` in the terminal. (Enabling \
+                 via the tool will be allowed once control-plane writes require user \
+                 confirmation.)",
+                input.name, input.name
+            )));
+        }
 
         let harness = self
             .harness
@@ -249,14 +276,15 @@ fn enabled_word(enabled: bool) -> &'static str {
 
 static DEFINITION: Lazy<Tool> = Lazy::new(|| Tool {
     name: "SetSkillState".into(),
-    description:
-        "Enable or disable a loaded skill at runtime without editing its SKILL.md. The choice \
-         is recorded in a local overlay (~/.pie/skills-state.json) keyed by source+name and \
+    description: "Disable a loaded skill at runtime without editing its SKILL.md. The choice is \
+         recorded in a local overlay (~/.pie/skills-state.json) keyed by source+name and \
          survives restarts. Works for any source — a builtin or project skill that can't be \
          removed can still be disabled. Two-phase: first call previews (current vs target \
          state); call again with `confirm: true` to apply. Disabling prevents the model from \
-         auto-invoking the skill via the Skill tool; the skill still appears in the catalog."
-            .into(),
+         auto-invoking the skill via the Skill tool; the skill still appears in the catalog. \
+         Note: this tool can only DISABLE (set `enabled: false`). Re-enabling a skill is a \
+         user action — the user runs `/skills enable <name>` in the terminal."
+        .into(),
     parameters: json!({
         "type": "object",
         "properties": {
@@ -271,7 +299,7 @@ static DEFINITION: Lazy<Tool> = Lazy::new(|| Tool {
             },
             "enabled": {
                 "type": "boolean",
-                "description": "Target state: true to enable, false to disable."
+                "description": "Target state. This tool only supports `false` (disable); `true` (re-enable) is rejected and must be done by the user via `/skills enable <name>`."
             },
             "confirm": {
                 "type": "boolean",
@@ -414,29 +442,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enable_overrides_frontmatter_disable() {
+    async fn tool_rejects_enable_directing_to_slash_command() {
+        // Security gate (Provider/Auth, PR #108): the model-facing tool may only disable.
+        // `enabled: true` is rejected — even in preview — with a hint to the user-driven
+        // `/skills enable` command. No overlay is written and the skill stays disabled.
         let dir = tempfile::tempdir().unwrap();
-        // Skill ships disabled via frontmatter; user enables it at runtime.
         let (harness, cell) = build(
             vec![skill("foo", SkillSource::User, true)],
             dir.path().into(),
         );
         let tool = SetSkillStateTool::with_base_dir(cell, dir.path().into());
 
-        exec(
-            &tool,
+        for params in [
+            json!({"name": "foo", "enabled": true}),
             json!({"name": "foo", "enabled": true, "confirm": true}),
-        )
-        .await
-        .expect("apply ok");
+        ] {
+            let err = exec(&tool, params)
+                .await
+                .expect_err("enable must be rejected");
+            let AgentToolError::Message(m) = err else {
+                panic!("typed error")
+            };
+            assert!(
+                m.contains("/skills enable foo"),
+                "error should direct to the user command, got: {m}"
+            );
+        }
+
+        // Frontmatter-disabled skill stays disabled; no overlay written.
         let foo = harness
             .skills()
             .into_iter()
             .find(|s| s.name == "foo")
             .unwrap();
+        assert!(foo.disable_model_invocation, "skill remains disabled");
         assert!(
-            !foo.disable_model_invocation,
-            "runtime enable overrides frontmatter"
+            !skills_state::state_path(dir.path()).exists(),
+            "rejected enable must not write the overlay"
+        );
+        // No audit entry either — the gate returns before any session write (QA gate:
+        // rejected enable must not write overlay, reload, or audit).
+        let audited = harness
+            .session()
+            .entries()
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, pie_agent_core::SessionTreeEntry::Custom { custom_type, .. } if custom_type == "skill_control_plane"));
+        assert!(
+            !audited,
+            "rejected enable must not write a skill_control_plane audit entry"
         );
     }
 
