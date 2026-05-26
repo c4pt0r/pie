@@ -31,6 +31,7 @@ mod otlp;
 mod readline;
 mod session;
 mod skills;
+mod skills_state;
 mod templates;
 mod tools;
 mod triggers;
@@ -282,6 +283,10 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
     // catalog. Two-phase preview→confirm safety inside the tool; see
     // `crates/coding-agent/src/tools/install_skill.rs` for the security model.
     tools.push(tools::install_skill_tool(skill_harness_cell.clone()));
+    // SetSkillState tool (task #23, S-A2). Enable/disable a loaded skill at runtime via the
+    // `~/.pie/skills-state.json` overlay; shares the same harness cell so it can reload the
+    // catalog after writing.
+    tools.push(tools::set_skill_state_tool(skill_harness_cell.clone()));
     tools.push(tools::new_trigger_tool());
     tools.push(tools::list_triggers_tool());
     tools.push(tools::remove_trigger_tool());
@@ -327,10 +332,17 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
                 std::process::exit(2);
             }
         };
-    let combined_skills = builtin_skills::merge_with_user_project(
+    let mut combined_skills = builtin_skills::merge_with_user_project(
         resolved_builtins.skills.clone(),
         &loaded_skills.skills,
     );
+    // Apply the runtime enable/disable overlay (`~/.pie/skills-state.json`). A user who ran
+    // `/skills disable <name>` (or the SetSkillState tool) sees that choice survive across
+    // restarts without their SKILL.md being edited. Keyed by {source, name}.
+    {
+        let state = skills_state::load(&config::base_dir()).await;
+        skills_state::apply(&state, &mut combined_skills);
+    }
 
     let mut opts = AgentHarnessOptions::new(model.clone(), session.clone());
     opts.system_prompt = system_prompt;
@@ -353,7 +365,12 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
             let builtins = builtins.clone();
             Box::pin(async move {
                 let loaded = skills::load_all(&cwd).await;
-                let merged = builtin_skills::merge_with_user_project(builtins, &loaded.skills);
+                let mut merged = builtin_skills::merge_with_user_project(builtins, &loaded.skills);
+                // Re-apply the enable/disable overlay on every reload so a disabled skill
+                // stays disabled after an install/remove/reload. Same source-of-truth as the
+                // startup path above.
+                let state = skills_state::load(&config::base_dir()).await;
+                skills_state::apply(&state, &mut merged);
                 pie_agent_core::LoadSkillsOutput {
                     skills: merged,
                     diagnostics: loaded.diagnostics,

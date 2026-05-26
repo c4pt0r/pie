@@ -12,6 +12,7 @@ pub mod ls;
 pub mod mcp_adapter;
 pub mod memory;
 pub mod read;
+pub mod set_skill_state;
 pub mod skill;
 pub mod task;
 pub mod truncate;
@@ -87,6 +88,14 @@ pub fn skill_tool(harness_cell: skill::SkillHarnessCell) -> Arc<dyn AgentTool> {
 /// `PermissionCategory::ControlPlaneWrite` plumbing.
 pub fn install_skill_tool(harness_cell: skill::SkillHarnessCell) -> Arc<dyn AgentTool> {
     Arc::new(install_skill::InstallSkillTool::new(harness_cell))
+}
+
+/// Build the `SetSkillState` tool (enable/disable a loaded skill at runtime). Same
+/// harness-cell wiring as `skill_tool` / `install_skill_tool` — it reads the live catalog,
+/// writes the `~/.pie/skills-state.json` overlay, and hot-reloads via
+/// `reload_skills_from_disk`. See `set_skill_state::SetSkillStateTool` for the overlay model.
+pub fn set_skill_state_tool(harness_cell: skill::SkillHarnessCell) -> Arc<dyn AgentTool> {
+    Arc::new(set_skill_state::SetSkillStateTool::new(harness_cell))
 }
 
 /// Build the dynamic trigger creation tool. This is model-facing counterpart to the
