@@ -10,11 +10,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use pie_agent_core::{
-    AgentHarness, HookState, NotificationHookStatus, NotificationStatusSnapshot,
+    AgentHarness, AgentTool, HookState, NotificationHookStatus, NotificationStatusSnapshot,
     RunningTriggerState, SessionTreeEntry, Skill, SkillSource, ThinkingLevel,
 };
-use pie_ai::{Model, Provider, get_model, list_models};
+use pie_ai::{Model, Provider, UserContentBlock, get_model, list_models};
 use serde_json::json;
+use tokio_util::sync::CancellationToken;
 
 /// Sink for slash-command output. The full-screen TUI owns the only terminal writer, so
 /// commands must not `println!` straight to stdout — they route through here. The app installs
@@ -261,10 +262,10 @@ impl SlashCommand for SkillsCommand {
         "skills"
     }
     fn description(&self) -> &'static str {
-        "list, inspect, reload, enable, or disable skills"
+        "list, install, inspect, reload, enable, disable, or remove skills"
     }
     fn usage(&self) -> &'static str {
-        "[show <name>|reload|enable <name> [source]|disable <name> [source]]"
+        "[install [--confirm] [--overwrite] <url|path>|show <name>|reload|enable <name> [source]|disable <name> [source]|remove [--confirm] <name> [source]]"
     }
     async fn run(&self, argv: &[String], ctx: &CommandCtx<'_>) -> CommandOutcome {
         match argv.first().map(String::as_str) {
@@ -272,12 +273,14 @@ impl SlashCommand for SkillsCommand {
                 print_skills_list(&ctx.harness.skills());
                 CommandOutcome::Handled
             }
+            Some("install") => install_skill(&argv[1..], ctx).await,
             Some("show") => show_skill(&argv[1..], ctx),
             Some("reload") => reload_skills(ctx).await,
             Some("enable") => set_skill_enabled(&argv[1..], ctx, true).await,
             Some("disable") => set_skill_enabled(&argv[1..], ctx, false).await,
+            Some("remove") => remove_skill(&argv[1..], ctx).await,
             Some(_) => CommandOutcome::Error(
-                "usage: /skills [show <name>|reload|enable <name> [source]|disable <name> [source]]"
+                "usage: /skills [install [--confirm] [--overwrite] <url|path>|show <name>|reload|enable <name> [source]|disable <name> [source]|remove [--confirm] <name> [source]]"
                     .into(),
             ),
         }
@@ -350,6 +353,124 @@ async fn reload_skills(ctx: &CommandCtx<'_>) -> CommandOutcome {
     }
 }
 
+async fn install_skill(argv: &[String], ctx: &CommandCtx<'_>) -> CommandOutcome {
+    let parsed = match parse_skill_install_args(argv) {
+        Ok(parsed) => parsed,
+        Err(e) => return CommandOutcome::Error(e),
+    };
+    let source = skill_install_source(parsed.target, ctx.cwd);
+    let params = json!({
+        "source": source,
+        "confirm": parsed.confirm,
+        "overwrite": parsed.overwrite,
+    });
+    let cell = skill_harness_cell(ctx);
+    let tool = crate::tools::install_skill::InstallSkillTool::new(cell);
+    match tool
+        .execute(
+            "slash-skills-install",
+            params,
+            CancellationToken::new(),
+            None,
+        )
+        .await
+    {
+        Ok(result) => {
+            print_install_skill_result(&result, &parsed);
+            CommandOutcome::Handled
+        }
+        Err(e) => CommandOutcome::Error(format!("install skill failed: {e}")),
+    }
+}
+
+struct InstallSkillArgs<'a> {
+    target: &'a str,
+    confirm: bool,
+    overwrite: bool,
+}
+
+fn parse_skill_install_args(argv: &[String]) -> Result<InstallSkillArgs<'_>, String> {
+    let mut confirm = false;
+    let mut overwrite = false;
+    let mut positional = Vec::new();
+    for arg in argv {
+        match arg.as_str() {
+            "--confirm" | "--yes" => confirm = true,
+            "--overwrite" => overwrite = true,
+            other if other.starts_with("--") => {
+                return Err(format!("unknown option for /skills install: {other}"));
+            }
+            _ => positional.push(arg.as_str()),
+        }
+    }
+    match positional.as_slice() {
+        [target] => Ok(InstallSkillArgs {
+            target,
+            confirm,
+            overwrite,
+        }),
+        _ => Err("usage: /skills install [--confirm] [--overwrite] <https-url|path>".into()),
+    }
+}
+
+fn skill_install_source(target: &str, cwd: &std::path::Path) -> serde_json::Value {
+    if target.starts_with("http://") || target.starts_with("https://") {
+        json!({ "type": "url", "url": target })
+    } else {
+        let path = std::path::PathBuf::from(target);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        };
+        json!({ "type": "path", "path": path.to_string_lossy().to_string() })
+    }
+}
+
+fn print_install_skill_result(result: &pie_agent_core::AgentToolResult, args: &InstallSkillArgs) {
+    let phase = result.details.get("phase").and_then(|v| v.as_str());
+    if phase == Some("preview") {
+        let name = result
+            .details
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unknown>");
+        let target = result
+            .details
+            .get("target_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unknown>");
+        let size = result
+            .details
+            .get("size")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let existing = result
+            .details
+            .get("existing")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let overwrite_required = result
+            .details
+            .get("overwrite_required")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        cprintln!(
+            "skill install preview: {name} -> {target} ({size}B, existing={existing}, overwrite_required={overwrite_required})"
+        );
+        let overwrite = if overwrite_required && !args.overwrite {
+            " --overwrite"
+        } else {
+            ""
+        };
+        cprintln!("run `/skills install --confirm{overwrite} <same-url-or-path>` to install");
+        return;
+    }
+    for line in tool_result_text(result).lines() {
+        cprintln!("{line}");
+    }
+}
+
 async fn set_skill_enabled(argv: &[String], ctx: &CommandCtx<'_>, enabled: bool) -> CommandOutcome {
     let Some(name) = argv.first() else {
         let verb = if enabled { "enable" } else { "disable" };
@@ -402,6 +523,112 @@ async fn set_skill_enabled(argv: &[String], ctx: &CommandCtx<'_>, enabled: bool)
         }
         Err(e) => CommandOutcome::Error(format!("reload after skill state change failed: {e}")),
     }
+}
+
+async fn remove_skill(argv: &[String], ctx: &CommandCtx<'_>) -> CommandOutcome {
+    let parsed = match parse_skill_remove_args(argv) {
+        Ok(parsed) => parsed,
+        Err(e) => return CommandOutcome::Error(e),
+    };
+    let mut params = json!({
+        "name": parsed.name,
+        "confirm": parsed.confirm,
+    });
+    if let Some(source) = parsed.source {
+        params["source"] = json!(source.label());
+    }
+    let cell = skill_harness_cell(ctx);
+    let tool = crate::tools::remove_skill::RemoveSkillTool::new(cell);
+    match tool
+        .execute(
+            "slash-skills-remove",
+            params,
+            CancellationToken::new(),
+            None,
+        )
+        .await
+    {
+        Ok(result) => {
+            print_remove_skill_result(&result);
+            CommandOutcome::Handled
+        }
+        Err(e) => CommandOutcome::Error(format!("remove skill failed: {e}")),
+    }
+}
+
+struct RemoveSkillArgs<'a> {
+    name: &'a str,
+    source: Option<SkillSource>,
+    confirm: bool,
+}
+
+fn parse_skill_remove_args(argv: &[String]) -> Result<RemoveSkillArgs<'_>, String> {
+    let mut confirm = false;
+    let mut positional = Vec::new();
+    for arg in argv {
+        match arg.as_str() {
+            "--confirm" | "--yes" => confirm = true,
+            other if other.starts_with("--") => {
+                return Err(format!("unknown option for /skills remove: {other}"));
+            }
+            _ => positional.push(arg.as_str()),
+        }
+    }
+    match positional.as_slice() {
+        [name] => Ok(RemoveSkillArgs {
+            name,
+            source: None,
+            confirm,
+        }),
+        [name, source] => Ok(RemoveSkillArgs {
+            name,
+            source: Some(parse_skill_source(source)?),
+            confirm,
+        }),
+        _ => Err("usage: /skills remove [--confirm] <name> [source]".into()),
+    }
+}
+
+fn print_remove_skill_result(result: &pie_agent_core::AgentToolResult) {
+    let phase = result.details.get("phase").and_then(|v| v.as_str());
+    if phase == Some("preview") {
+        let name = result
+            .details
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unknown>");
+        let target = result
+            .details
+            .get("target_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unknown>");
+        cprintln!("skill remove preview: {name} (user) -> {target}");
+        cprintln!("run `/skills remove --confirm {name}` to remove it");
+        return;
+    }
+    for line in tool_result_text(result).lines() {
+        cprintln!("{line}");
+    }
+}
+
+fn skill_harness_cell(ctx: &CommandCtx<'_>) -> crate::tools::skill::SkillHarnessCell {
+    let cell = std::sync::Arc::new(once_cell::sync::OnceCell::new());
+    // This is a fresh cell scoped to a single slash command invocation, so set() can only fail
+    // if this helper is called incorrectly inside the same invocation.
+    let _ = cell.set(ctx.harness.clone());
+    cell
+}
+
+fn tool_result_text(result: &pie_agent_core::AgentToolResult) -> String {
+    result
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            UserContentBlock::Text(text) => Some(text.text.as_str()),
+            UserContentBlock::Image(_) => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 async fn write_skill_state_audit(

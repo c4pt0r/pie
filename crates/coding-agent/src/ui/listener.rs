@@ -44,10 +44,10 @@ fn map_agent_event(event: &AgentEvent) -> Vec<FeedUpdate> {
         },
         AgentEvent::ToolExecutionStart {
             tool_name, args, ..
-        } => vec![FeedUpdate::ToolStart {
-            name: tool_name.clone(),
-            args: preview(args),
-        }],
+        } => {
+            let (name, args) = tool_start_display(tool_name, args);
+            vec![FeedUpdate::ToolStart { name, args }]
+        }
         AgentEvent::ToolExecutionUpdate {
             tool_call_id,
             partial_result,
@@ -73,6 +73,18 @@ fn map_agent_event(event: &AgentEvent) -> Vec<FeedUpdate> {
         }
         _ => Vec::new(),
     }
+}
+
+fn tool_start_display(tool_name: &str, args: &serde_json::Value) -> (String, String) {
+    if tool_name == "Skill" {
+        if let Some(name) = args.get("name").and_then(|v| v.as_str()) {
+            return (
+                format!("Skill({})", truncate_chars(name, 48)),
+                String::new(),
+            );
+        }
+    }
+    (tool_name.to_string(), preview(args))
 }
 
 /// Build the harness listener for trigger lifecycle lines. Keeps the same "stay quiet unless a
@@ -308,6 +320,28 @@ mod tests {
             panic!("expected one tool end update");
         };
         assert_eq!(lines, &vec!["short".to_string(), "output".to_string()]);
+    }
+
+    #[test]
+    fn skill_tool_start_uses_bounded_label_without_body() {
+        let event = AgentEvent::ToolExecutionStart {
+            tool_call_id: "call-skill".into(),
+            tool_name: "Skill".into(),
+            args: serde_json::json!({
+                "name": "review-pr",
+                "content": "SECRET SKILL BODY"
+            }),
+        };
+
+        let updates = map_agent_event(&event);
+        let [FeedUpdate::ToolStart { name, args }] = updates.as_slice() else {
+            panic!("expected one tool start update");
+        };
+        assert_eq!(name, "Skill(review-pr)");
+        assert!(
+            args.is_empty(),
+            "Skill tool args should not be rendered: {args}"
+        );
     }
 
     #[test]
