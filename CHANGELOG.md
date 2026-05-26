@@ -343,6 +343,9 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
   truncated lines explicitly. This keeps generated/minified one-line files from dominating
   the model context or TUI feed while preserving the file path, line number, and match
   location.
+- The TUI right-side automation panel now uses clearer section labels: the panel title is
+  `Automation`, the dynamic rule list remains `Triggers`, and runtime capabilities render
+  under `Runtime`, avoiding the previous repeated `trigger` / `Trigger` wording.
 - `/model` now accepts the natural `provider/model-id` form as an alias for
   `provider:model-id` and, after selecting a model, immediately checks whether that exact
   provider has an env or auth-store credential. Missing credentials now produce a

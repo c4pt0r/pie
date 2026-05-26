@@ -1163,7 +1163,7 @@ impl App {
             Block::default()
                 .borders(Borders::LEFT)
                 .padding(Padding::left(1))
-                .title(" triggers ")
+                .title(" Automation ")
                 .border_style(Style::default().fg(Color::DarkGray))
                 .title_style(Style::default().fg(Color::Magenta)),
         );
@@ -1221,7 +1221,7 @@ impl App {
 
         let hook_rows = self.panel_status.hook_points.len().max(1);
         let feature_rows = self.panel_status.trigger_features.len().max(1);
-        // 2 section gaps + 2 section titles + 2 mcp body rows + hook rows + feature rows + 1 trigger-runtime gap/title
+        // 2 section gaps + 2 section titles + 2 mcp body rows + hook rows + feature rows + 1 runtime gap/title
         let status_rows = 2 + 2 + 2 + hook_rows + 2 + feature_rows;
         while lines.len() + status_rows < height {
             lines.push(Line::raw(""));
@@ -1261,11 +1261,7 @@ impl App {
         }
 
         lines.push(Line::raw(""));
-        lines.push(panel_line(
-            "Trigger runtime".to_string(),
-            Color::Cyan,
-            width,
-        ));
+        lines.push(panel_line("Runtime".to_string(), Color::Cyan, width));
         if self.panel_status.trigger_features.is_empty() {
             lines.push(panel_line("none".to_string(), Color::DarkGray, width));
         } else {
@@ -1753,7 +1749,7 @@ mod tests {
             .add_rule("a build finishes", "summarize the result")
             .unwrap();
 
-        // Tall enough that all three sections (MCP / Hooks / Trigger runtime) clear the
+        // Tall enough that all three sections (MCP / Hooks / Runtime) clear the
         // right-rail clip — see `trigger_panel_lines`'s `status_rows` budget. The Trigger
         // runtime bullets render at the bottom of the panel; a 20-row buffer cuts them off.
         let backend = TestBackend::new(120, 30);
@@ -1761,7 +1757,7 @@ mod tests {
         terminal.draw(|f| app.render(f)).unwrap();
         let text = buffer_text(terminal.backend().buffer());
 
-        assert!(text.contains("triggers"), "panel title missing:\n{text}");
+        assert!(text.contains("Automation"), "panel title missing:\n{text}");
         assert!(text.contains("Triggers"), "trigger list missing:\n{text}");
         assert!(
             text.contains("[enabled, once]"),
@@ -1789,11 +1785,11 @@ mod tests {
             !text.contains("✓ before_tool_call"),
             "hook point rows should not use success checkmarks:\n{text}"
         );
-        // Trigger runtime features render as their own section, separate from `Hooks`, so users
+        // Runtime features render as their own section, separate from `Hooks`, so users
         // can't mistake `dedup` / `cycle suppress` etc. for pluggable callbacks.
         assert!(
-            text.contains("Trigger runtime"),
-            "trigger-runtime feature section title missing:\n{text}"
+            text.contains("Runtime"),
+            "runtime feature section title missing:\n{text}"
         );
         assert!(
             text.contains("dedup"),
