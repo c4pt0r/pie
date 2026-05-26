@@ -24,11 +24,11 @@
 //! (`commands::console`). The ratatui terminal is the single writer.
 
 pub mod feed;
+pub(crate) mod kernel;
 pub mod listener;
 
 pub use feed::FeedUpdate;
 
-use std::collections::VecDeque;
 use std::io::{IsTerminal, Write as _};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -53,72 +53,21 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Padding, Paragraph
 use tokio::sync::mpsc::UnboundedReceiver;
 use tui_textarea::TextArea;
 
-use crate::agent_session::{AgentSession, RetrySettings};
+use crate::agent_session::RetrySettings;
 use crate::commands::{self, CommandCtx, CommandOutcome, Registry};
 use crate::history::HistoryStore;
 use crate::readline::SlashCompleter;
 use crate::{images, mentions};
 use feed::{Feed, Level};
+use kernel::{QueuedTurn, ReplKernel, TurnState, poll_turn};
 use pie_agent_core::{AgentHarness, AgentMessage, AgentRunError};
-use pie_ai::{ContentBlock, ImageContent, InputModality, Message, UserContent, UserContentBlock};
-
-/// In-flight model turn, polled in the event loop's `select!`. Running it as a local future
-/// (not `tokio::spawn`) sidesteps the `Send` bound — `AgentSession::prompt` briefly holds a
-/// `parking_lot` guard across an `.await`, so its future is `!Send`.
-type TurnFut =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<String>, AgentRunError>>>>;
-
-#[derive(Default)]
-struct TurnState {
-    fut: Option<TurnFut>,
-    aborted: bool,
-    /// Prefix for the error line if the turn fails (e.g. `triggered turn: `).
-    prefix: &'static str,
-}
-
-async fn poll_turn(fut: &mut Option<TurnFut>) -> Result<Option<String>, AgentRunError> {
-    // Only created by `select!` when `fut.is_some()`, so the unwrap is sound.
-    fut.as_mut().expect("turn future present").await
-}
+use pie_ai::{ContentBlock, ImageContent, Message, UserContent, UserContentBlock};
 
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const MAX_INPUT_ROWS: usize = 6;
 const SCROLL_STEP: usize = 3;
 const COMPLETION_POPUP_MAX: usize = 8;
 const QUEUED_PREVIEW_CHARS: usize = 80;
-
-enum QueuedTurn {
-    UserPrompt {
-        display: String,
-        prompt: String,
-        images: Vec<ImageContent>,
-    },
-    AgentPrompt {
-        display: String,
-        prompt: String,
-        error_context: &'static str,
-    },
-    PromptTemplate {
-        display: String,
-        name: String,
-        vars: serde_json::Map<String, serde_json::Value>,
-    },
-    Compaction {
-        display: String,
-        custom: Option<String>,
-    },
-}
-
-impl QueuedTurn {
-    fn display(&self) -> &str {
-        match self {
-            Self::UserPrompt { display, .. }
-            | Self::AgentPrompt { display, .. }
-            | Self::PromptTemplate { display, .. }
-            | Self::Compaction { display, .. } => display,
-        }
-    }
-}
 const TRIGGER_PANEL_MIN_TOTAL_WIDTH: u16 = 100;
 const TRIGGER_PANEL_WIDTH: u16 = 36;
 const TRIGGER_PANEL_RULE_LIMIT: usize = 5;
@@ -157,8 +106,7 @@ pub struct AppConfig {
 }
 
 pub struct App {
-    harness: Arc<AgentHarness>,
-    retry: RetrySettings,
+    kernel: ReplKernel,
     registry: Registry,
     completer: SlashCompleter,
     cwd: PathBuf,
@@ -188,7 +136,7 @@ pub struct App {
     last_feed_area: Option<Rect>,
 
     busy: bool,
-    queued_turns: VecDeque<QueuedTurn>,
+    queued_turns: std::collections::VecDeque<QueuedTurn>,
     spinner_frame: usize,
     last_ctrlc: Option<Instant>,
     quit: bool,
@@ -198,8 +146,7 @@ impl App {
     pub fn new(config: AppConfig) -> Self {
         let completer = SlashCompleter::from_registry(&config.registry);
         Self {
-            harness: config.harness,
-            retry: config.retry,
+            kernel: ReplKernel::new(config.harness, config.retry),
             registry: config.registry,
             completer,
             cwd: config.cwd,
@@ -224,7 +171,7 @@ impl App {
             last_viewport_h: 1,
             last_feed_area: None,
             busy: false,
-            queued_turns: VecDeque::new(),
+            queued_turns: std::collections::VecDeque::new(),
             spinner_frame: 0,
             last_ctrlc: None,
             quit: false,
@@ -574,16 +521,13 @@ impl App {
     fn start_triggered_turn(&mut self, trace_id: String, turn: &mut TurnState) {
         // The kernel emits this only for an idle parent, but a user prompt may have started in
         // the gap; `continue_` would return AlreadyStreaming. Skip rather than error.
-        if self.harness.agent().is_streaming() {
+        if self.kernel.is_streaming() {
             return;
         }
         let short: String = trace_id.chars().take(8).collect();
         self.system_line(format!("running triggered turn (trace {short})"));
         self.follow = true;
-        let harness = self.harness.clone();
-        turn.fut = Some(Box::pin(
-            async move { harness.continue_().await.map(|_| None) },
-        ));
+        turn.fut = Some(self.kernel.continue_turn());
         turn.aborted = false;
         turn.prefix = "triggered turn: ";
         self.busy = true;
@@ -633,12 +577,7 @@ impl App {
     }
 
     fn current_model_accepts_images(&self) -> bool {
-        let state = self.harness.agent().state();
-        state
-            .model
-            .as_ref()
-            .map(|model| model.input.contains(&InputModality::Image))
-            .unwrap_or(false)
+        self.kernel.current_model_accepts_images()
     }
 
     fn queue_user_prompt(&mut self, display: String, prompt: String, images: Vec<ImageContent>) {
@@ -720,7 +659,7 @@ impl App {
     ) {
         let outcome = {
             let ctx = CommandCtx {
-                harness: &self.harness,
+                harness: self.kernel.harness(),
                 session_id: &self.session_id,
                 log_path: self.log_path.as_ref(),
                 tool_count: self.tool_count,
@@ -786,10 +725,7 @@ impl App {
         error_context: &'static str,
         turn: &mut TurnState,
     ) {
-        let harness = self.harness.clone();
-        turn.fut = Some(Box::pin(async move {
-            harness.prompt(prompt).await.map(|_| None)
-        }));
+        turn.fut = Some(self.kernel.prompt_turn(prompt));
         turn.aborted = false;
         turn.prefix = error_context;
         self.busy = true;
@@ -801,22 +737,7 @@ impl App {
         loaded_images: Vec<ImageContent>,
         turn: &mut TurnState,
     ) {
-        let harness = self.harness.clone();
-        let retry = self.retry.clone();
-        let has_images = !loaded_images.is_empty();
-        turn.fut = Some(Box::pin(async move {
-            if has_images {
-                harness
-                    .prompt_with_images(prompt_text, loaded_images)
-                    .await
-                    .map(|_| None)
-            } else {
-                AgentSession::new(harness, retry)
-                    .prompt(prompt_text)
-                    .await
-                    .map(|_| None)
-            }
-        }));
+        turn.fut = Some(self.kernel.user_prompt_turn(prompt_text, loaded_images));
         turn.aborted = false;
         turn.prefix = "";
         self.busy = true;
@@ -828,29 +749,14 @@ impl App {
         vars: serde_json::Map<String, serde_json::Value>,
         turn: &mut TurnState,
     ) {
-        let harness = self.harness.clone();
-        turn.fut = Some(Box::pin(async move {
-            harness
-                .prompt_from_template(&name, vars)
-                .await
-                .map(|_| None)
-        }));
+        turn.fut = Some(self.kernel.template_turn(name, vars));
         turn.aborted = false;
         turn.prefix = "template run failed: ";
         self.busy = true;
     }
 
     fn start_compaction_turn(&mut self, custom: Option<String>, turn: &mut TurnState) {
-        let harness = self.harness.clone();
-        turn.fut = Some(Box::pin(async move {
-            harness.force_compact(custom).await.map(|ran| {
-                Some(if ran {
-                    "compaction ran".to_string()
-                } else {
-                    "nothing to compact".to_string()
-                })
-            })
-        }));
+        turn.fut = Some(self.kernel.compaction_turn(custom));
         turn.aborted = false;
         turn.prefix = "compaction failed: ";
         self.busy = true;
@@ -885,7 +791,7 @@ impl App {
     fn request_abort(&mut self, turn: &mut TurnState) {
         if turn.fut.is_some() {
             turn.aborted = true;
-            self.harness.abort();
+            self.kernel.abort();
             self.system_line("aborting current turn…");
         }
     }
@@ -1246,7 +1152,7 @@ impl App {
 
     fn status_line(&self, width: usize, max_scroll: usize) -> Paragraph<'static> {
         let model = {
-            let state = self.harness.agent().state();
+            let state = self.kernel.harness().agent().state();
             state
                 .model
                 .as_ref()
@@ -1349,7 +1255,7 @@ impl App {
             }
             if input.starts_with('/') {
                 let ctx = CommandCtx {
-                    harness: &self.harness,
+                    harness: self.kernel.harness(),
                     session_id: &self.session_id,
                     log_path: self.log_path.as_ref(),
                     tool_count: self.tool_count,
@@ -1365,17 +1271,22 @@ impl App {
                         prompt,
                         error_context,
                     } => {
-                        if let Err(e) = self.harness.prompt(prompt).await {
+                        if let Err(e) = self.kernel.harness().prompt(prompt).await {
                             eprintln!("error: {error_context}{e}");
                         }
                     }
                     CommandOutcome::RunPromptTemplate { name, vars } => {
-                        if let Err(e) = self.harness.prompt_from_template(&name, vars).await {
+                        if let Err(e) = self
+                            .kernel
+                            .harness()
+                            .prompt_from_template(&name, vars)
+                            .await
+                        {
                             eprintln!("error: template run failed: {e}");
                         }
                     }
                     CommandOutcome::RunCompaction { custom } => {
-                        match self.harness.force_compact(custom).await {
+                        match self.kernel.harness().force_compact(custom).await {
                             Ok(true) => println!("compaction ran"),
                             Ok(false) => println!("nothing to compact"),
                             Err(e) => eprintln!("error: compaction failed: {e}"),
@@ -1387,10 +1298,7 @@ impl App {
             }
             let (expanded, _) = mentions::expand(input, &self.cwd).await;
             let prompt = commands::attach_skill_prompt(expanded, None);
-            if let Err(e) = AgentSession::new(self.harness.clone(), self.retry.clone())
-                .prompt(prompt)
-                .await
-            {
+            if let Err(e) = self.kernel.user_prompt_turn(prompt, Vec::new()).await {
                 eprintln!("error: {e}");
             }
         }
@@ -1551,7 +1459,7 @@ mod tests {
 
     fn faux_vision_model() -> pie_ai::Model {
         let mut model = faux_model();
-        model.input = vec![InputModality::Text, InputModality::Image];
+        model.input = vec![pie_ai::InputModality::Text, pie_ai::InputModality::Image];
         model
     }
 
