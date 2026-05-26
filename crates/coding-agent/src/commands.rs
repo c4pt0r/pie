@@ -220,7 +220,7 @@ impl SlashCommand for HelpCommand {
         "show available commands and model catalog help"
     }
     fn usage(&self) -> &'static str {
-        "[models|model]"
+        "[models|<command>]"
     }
     async fn run(&self, _argv: &[String], _ctx: &CommandCtx<'_>) -> CommandOutcome {
         // The REPL's `print_help` walks the registry — see main.rs. This handler is a stub
@@ -522,17 +522,24 @@ impl SlashCommand for ThinkingCommand {
     }
 }
 
-// Re-export for `print_help` in main.rs.
 pub fn print_help(registry: &Registry, topic: Option<&str>) {
-    if matches!(topic, Some("model" | "models")) {
-        match model_catalog_text(None) {
-            Ok(text) => emit_multiline(&text),
-            Err(e) => cprintln!("{e}"),
-        }
-        return;
+    emit_multiline(&help_text(registry, topic));
+}
+
+fn help_text(registry: &Registry, topic: Option<&str>) -> String {
+    let Some(topic) = topic.map(str::trim).filter(|topic| !topic.is_empty()) else {
+        return general_help_text(registry);
+    };
+    let topic = topic.trim_start_matches('/');
+    if topic == "models" {
+        return model_catalog_text(None).unwrap_or_else(|e| e);
     }
-    cprintln!();
-    cprintln!("Commands:");
+
+    command_help_text(registry, topic)
+}
+
+fn general_help_text(registry: &Registry) -> String {
+    let mut lines = vec![String::new(), "Commands:".into()];
     for cmd in registry.commands() {
         let aliases = if cmd.aliases().is_empty() {
             String::new()
@@ -544,22 +551,63 @@ pub fn print_help(registry: &Registry, topic: Option<&str>) {
         } else {
             format!(" {}", cmd.usage())
         };
-        cprintln!(
+        lines.push(format!(
             "  /{}{}    {}{}",
             cmd.name(),
             usage,
             cmd.description(),
             aliases
-        );
+        ));
     }
-    cprintln!();
-    cprintln!("Models:");
+    lines.push(String::new());
+    lines.push("Models:".into());
     for line in model_help_summary_lines() {
-        cprintln!("{line}");
+        lines.push(line);
     }
-    cprintln!();
-    cprintln!("Anything else is sent as a prompt to the agent.");
-    cprintln!();
+    lines.push(String::new());
+    lines.push("Anything else is sent as a prompt to the agent.".into());
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+fn command_help_text(registry: &Registry, topic: &str) -> String {
+    let Some(cmd) = registry.find(topic) else {
+        let suggestions = registry
+            .commands()
+            .iter()
+            .filter(|cmd| cmd.name().starts_with(topic) || cmd.aliases().contains(&topic))
+            .map(|cmd| format!("/{}", cmd.name()))
+            .take(5)
+            .collect::<Vec<_>>();
+        let suggestion = if suggestions.is_empty() {
+            "Run /help to list commands or /help models for the model catalog.".to_string()
+        } else {
+            format!("Did you mean {}?", suggestions.join(", "))
+        };
+        return format!("unknown help topic: {topic}\n{suggestion}");
+    };
+
+    let usage = if cmd.usage().is_empty() {
+        format!("/{}", cmd.name())
+    } else {
+        format!("/{} {}", cmd.name(), cmd.usage())
+    };
+    let mut lines = vec![usage, format!("  {}", cmd.description())];
+    if !cmd.aliases().is_empty() {
+        let aliases = cmd
+            .aliases()
+            .iter()
+            .map(|alias| format!("/{alias}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(format!("  aliases: {aliases}"));
+    }
+    if cmd.name() == "help" {
+        lines.push("  examples: /help model, /help /quit, /help models".into());
+    } else {
+        lines.push(format!("  more: /help {}", cmd.name()));
+    }
+    lines.join("\n")
 }
 
 pub fn cli_model_help_text() -> String {
@@ -1974,6 +2022,30 @@ mod tests {
         assert!(text.contains("<cwd>/.pie/models.json"), "{text}");
         assert!(!text.contains("API_KEY"), "{text}");
         assert!(!text.contains("auth.json"), "{text}");
+    }
+
+    #[test]
+    fn help_topic_renders_command_usage_and_aliases() {
+        let registry = Registry::with_builtins();
+        let model = help_text(&registry, Some("model"));
+        assert!(
+            model.contains("/model [provider:model-id|list [provider]]"),
+            "{model}"
+        );
+        assert!(model.contains("show or switch the active model"), "{model}");
+        assert!(model.contains("more: /help model"), "{model}");
+
+        let quit = help_text(&registry, Some("/quit"));
+        assert!(quit.contains("/quit"), "{quit}");
+        assert!(quit.contains("aliases: /exit, /q"), "{quit}");
+    }
+
+    #[test]
+    fn help_unknown_topic_gives_recovery_hint() {
+        let registry = Registry::with_builtins();
+        let text = help_text(&registry, Some("mod"));
+        assert!(text.contains("unknown help topic: mod"), "{text}");
+        assert!(text.contains("Did you mean /model?"), "{text}");
     }
 
     #[test]
