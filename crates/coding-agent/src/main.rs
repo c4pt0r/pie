@@ -113,6 +113,19 @@ struct Cli {
     /// Show LLM call debug logs in the conversation feed, including trigger/sub-agent calls.
     #[arg(long)]
     debug: bool,
+
+    /// Run the local browser UI instead of the terminal UI. Defaults to loopback-only.
+    #[arg(long)]
+    web: bool,
+    /// Host for `--web`. Non-loopback hosts require `--web-allow-remote`.
+    #[arg(long = "web-host", default_value = "127.0.0.1", value_name = "HOST")]
+    web_host: String,
+    /// Port for `--web`; use 0 to bind a random free port.
+    #[arg(long = "web-port", default_value_t = 0, value_name = "PORT")]
+    web_port: u16,
+    /// Allow `--web-host` to bind non-loopback interfaces. Intended only for trusted networks.
+    #[arg(long = "web-allow-remote")]
+    web_allow_remote: bool,
 }
 
 #[tokio::main]
@@ -625,7 +638,16 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
 
     // Hand off to the full-screen UI. It owns the terminal, the input box, the scrolling feed,
     // and the serialized run slot (user prompts + inject-and-run triggered turns) until quit.
-    app.run().await
+    if cli.web {
+        app.run_web(ui::web::WebOptions {
+            host: cli.web_host.clone(),
+            port: cli.web_port,
+            allow_remote: cli.web_allow_remote,
+        })
+        .await
+    } else {
+        app.run().await
+    }
 }
 
 /// Real `*Hook` trait registrations active in this binary. Only names that map to an actual
@@ -886,6 +908,10 @@ mod tests {
             builtin_skill: Vec::new(),
             trigger_poll_secs: None,
             debug: false,
+            web: false,
+            web_host: "127.0.0.1".into(),
+            web_port: 0,
+            web_allow_remote: false,
         };
         let err = validate_base_url_override(&cli).unwrap_err().to_string();
         assert!(

@@ -26,6 +26,7 @@
 pub mod feed;
 pub(crate) mod kernel;
 pub mod listener;
+pub(crate) mod web;
 
 pub use feed::FeedUpdate;
 

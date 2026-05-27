@@ -16,7 +16,8 @@ use ratatui::text::Line;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Visual class for a plain status/output line. Maps to a concrete [`Style`] at render time.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Level {
     /// Slash-command stdout and other neutral output.
     Output,
@@ -32,7 +33,8 @@ pub enum Level {
 
 /// A message sent from the agent/harness listeners (or the console sink) into the UI loop,
 /// where it is applied to the [`Feed`]. Crosses thread boundaries, so every field is owned.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FeedUpdate {
     TurnStart,
     TurnEnd,
