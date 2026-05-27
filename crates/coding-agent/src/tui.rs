@@ -272,7 +272,7 @@ impl Tui {
                     .lock()
                     .quiet_dynamic_trigger_traces
                     .remove(trace_id)
-                    && summary.trim() == "no dynamic trigger rule matched"
+                    && is_no_match_dynamic_summary(summary)
                 {
                     return;
                 }
@@ -370,6 +370,19 @@ fn trigger_state_label(state: pie_agent_core::TriggerState) -> &'static str {
         pie_agent_core::TriggerState::Failed => "failed",
         pie_agent_core::TriggerState::Completed => "completed",
     }
+}
+
+fn is_no_match_dynamic_summary(summary: &str) -> bool {
+    let normalized = summary.trim().to_ascii_lowercase();
+    normalized == "no dynamic trigger rule matched"
+        || normalized.contains("no dynamic trigger rule matched")
+        || normalized.contains("no trigger rule matched")
+        || normalized.contains("no dynamic rule matched")
+        || normalized.contains("no matching trigger")
+        || normalized.contains("no matching rule")
+        || normalized.contains("no match found")
+        || normalized.contains("nothing matched")
+        || normalized.contains("not matched")
 }
 
 fn trigger_state_color(state: pie_agent_core::TriggerState) -> &'static str {

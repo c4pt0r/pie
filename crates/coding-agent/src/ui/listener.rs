@@ -152,7 +152,7 @@ fn map_harness_event(
         } => {
             let summary = summary.as_deref().unwrap_or("completed");
             let was_quiet = quiet.lock().remove(trace_id);
-            if !debug && was_quiet && summary.trim() == "no dynamic trigger rule matched" {
+            if !debug && was_quiet && is_no_match_dynamic_summary(summary) {
                 return None;
             }
             Some(FeedUpdate::Plain {
@@ -205,6 +205,19 @@ fn debug_text(debug: bool, s: &str, max_chars: usize) -> String {
     } else {
         truncate_chars(s, max_chars)
     }
+}
+
+fn is_no_match_dynamic_summary(summary: &str) -> bool {
+    let normalized = summary.trim().to_ascii_lowercase();
+    normalized == "no dynamic trigger rule matched"
+        || normalized.contains("no dynamic trigger rule matched")
+        || normalized.contains("no trigger rule matched")
+        || normalized.contains("no dynamic rule matched")
+        || normalized.contains("no matching trigger")
+        || normalized.contains("no matching rule")
+        || normalized.contains("no match found")
+        || normalized.contains("nothing matched")
+        || normalized.contains("not matched")
 }
 
 #[cfg(test)]
@@ -411,6 +424,74 @@ mod tests {
         assert!(text.contains("trigger result line 29"));
         assert!(text.ends_with(&summary));
         assert!(!text.contains("truncated"));
+    }
+
+    #[test]
+    fn dynamic_periodic_no_match_variants_stay_quiet() {
+        let quiet = Mutex::new(HashSet::new());
+        assert!(
+            map_harness_event(
+                &HarnessEvent::TriggerExecutionStarted {
+                    trace_id: "trace-chrome-check".into(),
+                    source_label: "local:dynamic".into(),
+                    event_label: "dynamic periodic check".into(),
+                    prompt_preview: "Check Chrome Tab Job".into(),
+                },
+                &quiet,
+                false,
+            )
+            .is_none()
+        );
+
+        let update = map_harness_event(
+            &HarnessEvent::TriggerCompleted {
+                trace_id: "trace-chrome-check".into(),
+                summary: Some("Checked Chrome tabs; no matching rule found.".into()),
+                cost_usd: None,
+                details: serde_json::Value::Null,
+            },
+            &quiet,
+            false,
+        );
+        assert!(
+            update.is_none(),
+            "dynamic no-match poll completion should stay out of the main feed"
+        );
+    }
+
+    #[test]
+    fn dynamic_periodic_matched_completion_renders_result() {
+        let quiet = Mutex::new(HashSet::new());
+        assert!(
+            map_harness_event(
+                &HarnessEvent::TriggerExecutionStarted {
+                    trace_id: "trace-chrome-match".into(),
+                    source_label: "local:dynamic".into(),
+                    event_label: "dynamic periodic check".into(),
+                    prompt_preview: "Check Chrome Tab Job".into(),
+                },
+                &quiet,
+                false,
+            )
+            .is_none()
+        );
+
+        let update = map_harness_event(
+            &HarnessEvent::TriggerCompleted {
+                trace_id: "trace-chrome-match".into(),
+                summary: Some("matched dyn-123 and archived the Chrome tab".into()),
+                cost_usd: None,
+                details: serde_json::Value::Null,
+            },
+            &quiet,
+            false,
+        )
+        .expect("matched trigger result should render");
+        let FeedUpdate::Plain { text, level } = update else {
+            panic!("expected plain update");
+        };
+        assert_eq!(level, Level::Note);
+        assert!(text.contains("archived the Chrome tab"));
     }
 
     #[test]

@@ -798,3 +798,63 @@ fn dynamic_poll_no_match_stays_quiet() {
     let plain = strip_ansi(&String::from_utf8(buf).unwrap());
     assert_eq!(plain, "");
 }
+
+#[test]
+fn dynamic_poll_no_match_variant_stays_quiet() {
+    let tui = tui::Tui::new();
+    let mut buf: Vec<u8> = Vec::new();
+
+    tui.render_harness_event(
+        &HarnessEvent::TriggerExecutionStarted {
+            trace_id: "trace-chrome-check".into(),
+            source_label: "local:dynamic".into(),
+            event_label: "dynamic periodic check".into(),
+            prompt_preview: "Check Chrome Tab Job".into(),
+        },
+        &mut buf,
+    );
+    tui.render_harness_event(
+        &HarnessEvent::TriggerCompleted {
+            trace_id: "trace-chrome-check".into(),
+            summary: Some("Checked Chrome tabs; no matching rule found.".into()),
+            cost_usd: None,
+            details: serde_json::Value::Null,
+        },
+        &mut buf,
+    );
+
+    let plain = strip_ansi(&String::from_utf8(buf).unwrap());
+    assert_eq!(plain, "");
+}
+
+#[test]
+fn dynamic_poll_matched_result_still_renders() {
+    let tui = tui::Tui::new();
+    let mut buf: Vec<u8> = Vec::new();
+
+    tui.render_harness_event(
+        &HarnessEvent::TriggerExecutionStarted {
+            trace_id: "trace-chrome-match".into(),
+            source_label: "local:dynamic".into(),
+            event_label: "dynamic periodic check".into(),
+            prompt_preview: "Check Chrome Tab Job".into(),
+        },
+        &mut buf,
+    );
+    tui.render_harness_event(
+        &HarnessEvent::TriggerCompleted {
+            trace_id: "trace-chrome-match".into(),
+            summary: Some("matched dyn-123 and archived the Chrome tab".into()),
+            cost_usd: None,
+            details: serde_json::Value::Null,
+        },
+        &mut buf,
+    );
+
+    let plain = strip_ansi(&String::from_utf8(buf).unwrap());
+    assert!(
+        plain.contains("[trigger completed] trace=trace-chrome-match matched dyn-123"),
+        "{plain}"
+    );
+    assert!(plain.contains("archived the Chrome tab"), "{plain}");
+}
