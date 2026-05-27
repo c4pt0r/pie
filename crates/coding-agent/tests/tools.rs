@@ -9,6 +9,15 @@ use tokio_util::sync::CancellationToken;
 // Pull tool types out of the binary crate by including the source. Test-only.
 // `skills_state` is a top-level module that `tools::set_skill_state` references via
 // `crate::skills_state`, so it must be in this test binary's module tree too.
+#[path = "../src/bug_report.rs"]
+#[allow(dead_code)]
+mod bug_report;
+#[path = "../src/config.rs"]
+#[allow(dead_code)]
+mod config;
+#[path = "../src/export.rs"]
+#[allow(dead_code)]
+mod export;
 #[path = "../src/skills_state.rs"]
 #[allow(dead_code)]
 mod skills_state;

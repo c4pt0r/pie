@@ -10,9 +10,14 @@
 //! so they can be unit-tested against a synthetic `TriggerSink` (a
 //! `mpsc::unbounded_channel` receiver).
 
+pub mod cron;
 pub mod dynamic;
 pub mod mcp_notification_hook;
 
+#[allow(unused_imports)]
+pub use cron::{
+    CronJob, CronNotificationHook, cron_action_hook, cron_harness_listener, global_cron_registry,
+};
 #[allow(unused_imports)]
 pub use dynamic::{
     DynamicTriggerCheckHook, ListTriggersTool, NewTriggerTool, RemoveTriggerTool,

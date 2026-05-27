@@ -143,6 +143,10 @@ Inside `pie`, slash commands control the session:
 | `/triggers rules` | List dynamic trigger ids and state |
 | `/triggers enable <id>` / `/triggers disable <id>` | Resume or pause a trigger |
 | `/triggers remove <id>` | Delete a trigger |
+| `/cron` | List local scheduled jobs |
+| `/cron add "<minute hour dom month dow>" <prompt>` | Run a prompt on a local schedule |
+| `/cron enable <id>` / `/cron disable <id>` | Resume or pause a scheduled job |
+| `/cron remove <id>` | Delete a scheduled job |
 | `/quit` | Exit |
 
 CLI helpers:
@@ -168,6 +172,7 @@ The agent has tools for common coding workflows:
 - attach images to the first prompt with `--image`
 - create session-scoped natural-language triggers that run actions when local checks or MCP
   push events match
+- create user-scoped cron jobs that run prompts on a local schedule
 - run local command hooks or HTTP webhooks on agent lifecycle events; see [docs/hooks.md](docs/hooks.md)
 
 ## Triggers
@@ -208,6 +213,23 @@ MCP notifications are treated as trigger sources too: a configured MCP server ca
 event into the same trigger runtime, where the same rules, audit, deduping, and output
 behavior apply.
 
+## Cron jobs
+
+Cron jobs are time-based automations, separate from dynamic triggers. They are stored in
+`~/.pie/cron.toml`, use local time, and support standard 5-field cron expressions:
+
+```text
+/cron add "*/30 * * * *" summarize the repo state
+/cron list
+/cron disable cron-...
+```
+
+When a cron job is due, it enters the same serialized agent turn queue used by prompts and
+trigger inject-and-run actions. `pie` does not backfill missed ticks after downtime. If a
+job is still running when its next tick arrives, that tick is skipped and recorded in the
+job status. Cron config stores only the schedule and action text; control-plane audit and
+UI output use bounded, redacted previews.
+
 ## Files and storage
 
 By default, `pie` stores local state under `~/.pie`:
@@ -220,6 +242,7 @@ By default, `pie` stores local state under `~/.pie`:
 | `~/.pie/models.json` | User-global local/custom model definitions |
 | `~/.pie/history` | Prompt history |
 | `~/.pie/hooks.toml` | Optional command/webhook hooks |
+| `~/.pie/cron.toml` | User-global local cron jobs |
 | `~/.pie/config.toml` | Optional user config, including trigger poll interval |
 
 Set `PIE_DIR` to use a different base directory.

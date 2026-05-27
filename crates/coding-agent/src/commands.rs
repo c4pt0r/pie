@@ -158,6 +158,7 @@ impl Registry {
         r.register(Arc::new(HistoryCommand));
         r.register(Arc::new(TriggersCommand));
         r.register(Arc::new(NewTriggerCommand));
+        r.register(Arc::new(CronCommand));
         r
     }
 
@@ -1860,6 +1861,196 @@ impl SlashCommand for NewTriggerCommand {
             error_context: "create trigger: ",
         }
     }
+}
+
+struct CronCommand;
+
+#[async_trait]
+impl SlashCommand for CronCommand {
+    fn name(&self) -> &'static str {
+        "cron"
+    }
+
+    fn aliases(&self) -> &'static [&'static str] {
+        &["crontab"]
+    }
+
+    fn description(&self) -> &'static str {
+        "manage local scheduled agent jobs"
+    }
+
+    fn usage(&self) -> &'static str {
+        "[list|add \"<5-field-cron>\" <prompt>|enable <id>|disable <id>|remove <id>]"
+    }
+
+    async fn run(&self, argv: &[String], ctx: &CommandCtx<'_>) -> CommandOutcome {
+        let subcommand = argv.first().map(String::as_str).unwrap_or("list");
+        match subcommand {
+            "list" | "ls" | "status" => {
+                for line in render_cron_jobs(&crate::triggers::global_cron_registry().list()) {
+                    cprintln!("{line}");
+                }
+                CommandOutcome::Handled
+            }
+            "add" => {
+                if argv.len() < 3 {
+                    return CommandOutcome::Error(
+                        "usage: /cron add \"<minute hour dom month dow>\" <prompt>".into(),
+                    );
+                }
+                let schedule = &argv[1];
+                let action = argv[2..].join(" ");
+                match crate::triggers::global_cron_registry().add_job(schedule, &action) {
+                    Ok(job) => {
+                        write_cron_control_plane_audit(ctx, "add", None, Some(&job)).await;
+                        cprintln!("added cron job {}", job.id);
+                        cprintln!("  schedule: {}", job.schedule);
+                        cprintln!("  action: {}", preview_cron_action(&job.action));
+                        CommandOutcome::Handled
+                    }
+                    Err(e) => CommandOutcome::Error(e.to_string()),
+                }
+            }
+            "enable" | "resume" => set_cron_enabled(ctx, argv.get(1), true).await,
+            "disable" | "pause" => set_cron_enabled(ctx, argv.get(1), false).await,
+            "remove" | "rm" | "delete" => {
+                let Some(id) = argv.get(1) else {
+                    return CommandOutcome::Error("usage: /cron remove <id>".into());
+                };
+                match crate::triggers::global_cron_registry().remove_job(id) {
+                    Ok(Some(job)) => {
+                        write_cron_control_plane_audit(ctx, "remove", Some(&job), None).await;
+                        cprintln!("removed cron job {}", job.id);
+                        CommandOutcome::Handled
+                    }
+                    Ok(None) => CommandOutcome::Error(format!("no cron job with id '{id}'")),
+                    Err(e) => CommandOutcome::Error(e.to_string()),
+                }
+            }
+            other => CommandOutcome::Error(format!(
+                "unknown /cron command: {other}. usage: /cron {}",
+                self.usage()
+            )),
+        }
+    }
+}
+
+async fn set_cron_enabled(
+    ctx: &CommandCtx<'_>,
+    id: Option<&String>,
+    enabled: bool,
+) -> CommandOutcome {
+    let Some(id) = id else {
+        return CommandOutcome::Error(format!(
+            "usage: /cron {} <id>",
+            if enabled { "enable" } else { "disable" }
+        ));
+    };
+    let before = crate::triggers::global_cron_registry()
+        .list()
+        .into_iter()
+        .find(|job| job.id == *id);
+    match crate::triggers::global_cron_registry().set_job_enabled(id, enabled) {
+        Ok(Some(job)) => {
+            write_cron_control_plane_audit(
+                ctx,
+                if enabled { "enable" } else { "disable" },
+                before.as_ref(),
+                Some(&job),
+            )
+            .await;
+            cprintln!(
+                "{} cron job {}",
+                if enabled { "enabled" } else { "disabled" },
+                job.id
+            );
+            CommandOutcome::Handled
+        }
+        Ok(None) => CommandOutcome::Error(format!("no cron job with id '{id}'")),
+        Err(e) => CommandOutcome::Error(e.to_string()),
+    }
+}
+
+async fn write_cron_control_plane_audit(
+    ctx: &CommandCtx<'_>,
+    op: &str,
+    before: Option<&crate::triggers::cron::CronJob>,
+    after: Option<&crate::triggers::cron::CronJob>,
+) {
+    let job = after.or(before);
+    let now = chrono::Utc::now();
+    let audit = json!({
+        "op": op,
+        "actor": "slash",
+        "job_id": job.map(|job| job.id.as_str()),
+        "schedule": job.map(|job| job.schedule.as_str()),
+        "action_preview": job.map(|job| preview_cron_action(&job.action)),
+        "before_enabled": before.map(|job| job.enabled),
+        "after_enabled": after.map(|job| job.enabled),
+        "next_run": after
+            .filter(|job| job.enabled)
+            .and_then(|job| job.next_run_after(now))
+            .map(|dt| dt.to_rfc3339()),
+        "removed": before.is_some() && after.is_none(),
+    });
+    if let Err(e) = ctx
+        .harness
+        .session()
+        .append_custom("cron_control_plane", Some(audit))
+        .await
+    {
+        tracing::warn!(
+            op = %op,
+            job_id = job.map(|job| job.id.as_str()).unwrap_or("<unknown>"),
+            error = %e,
+            "cron_control_plane audit write failed; slash cron change itself succeeded"
+        );
+    }
+}
+
+pub(crate) fn render_cron_jobs(jobs: &[crate::triggers::cron::CronJob]) -> Vec<String> {
+    if jobs.is_empty() {
+        return vec!["Cron jobs: none".into()];
+    }
+    let mut lines = vec![format!("Cron jobs ({}):", jobs.len())];
+    for job in jobs {
+        let state = if job.enabled { "enabled" } else { "disabled" };
+        let running = job
+            .running_trace_id
+            .as_ref()
+            .map(|trace| format!(", running {trace}"))
+            .unwrap_or_default();
+        lines.push(format!(
+            "  {}  {}  {}{}",
+            job.id, state, job.schedule, running
+        ));
+        lines.push(format!("    action: {}", preview_cron_action(&job.action)));
+        if job.skipped_overlap_count > 0 {
+            lines.push(format!("    overlap skips: {}", job.skipped_overlap_count));
+        }
+        if let Some(err) = &job.last_error {
+            lines.push(format!("    last: {err}"));
+        } else if let Some(last) = job.last_fired_at {
+            lines.push(format!("    last fired: {}", last.to_rfc3339()));
+        }
+    }
+    lines
+}
+
+fn preview_cron_action(action: &str) -> String {
+    preview_cron_text(&crate::bug_report::redact(action), 120)
+}
+
+fn preview_cron_text(input: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (idx, ch) in input.chars().enumerate() {
+        if idx == max_chars {
+            out.push('…');
+            return out;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 pub(crate) fn render_triggers_status(snapshot: &NotificationStatusSnapshot) -> Vec<String> {

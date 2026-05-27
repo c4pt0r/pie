@@ -276,6 +276,9 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
     let dynamic_trigger_load_error = dynamic_trigger_registry
         .load_from_path(dynamic_trigger_path)
         .err();
+    let cron_registry = triggers::global_cron_registry().clone();
+    let cron_path = config::base_dir().join("cron.toml");
+    let cron_load_error = cron_registry.load_from_path(cron_path).err();
     let memory_dir = config::memory_dir();
     let mut tools = tools::default_tools(memory_dir.clone());
     // Task delegation tool (issue #11). Shares the parent's model + stream backend so its
@@ -397,10 +400,13 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
     // the sub-agent and inject their pushed summary into chat (the latter also runs one
     // model turn in the parent context); everything else falls through to the dynamic-rule
     // hook. The match is structural (server name), no model.
-    opts.before_trigger_action = Some(triggers::direct_inject_action_hook(
-        mcp_inject_summary_servers,
-        mcp_inject_and_run_servers,
-        triggers::before_trigger_action_hook(dynamic_trigger_registry.clone()),
+    opts.before_trigger_action = Some(triggers::cron_action_hook(
+        cron_registry.clone(),
+        triggers::direct_inject_action_hook(
+            mcp_inject_summary_servers,
+            mcp_inject_and_run_servers,
+            triggers::before_trigger_action_hook(dynamic_trigger_registry.clone()),
+        ),
     ));
     // LSP feedback loop (issue #12): attach diagnostics to write/edit tool results when
     // ~/.pie/lsp.toml or <cwd>/.pie/lsp.toml is configured.
@@ -437,6 +443,9 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
     for hook in mcp_notification_hooks {
         harness.register_notification_hook(hook);
     }
+    harness.register_notification_hook(std::sync::Arc::new(triggers::CronNotificationHook::new(
+        cron_registry.clone(),
+    )));
     harness.register_notification_hook(std::sync::Arc::new(
         triggers::DynamicTriggerCheckHook::new(dynamic_trigger_registry.clone()),
     ));
@@ -541,6 +550,19 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
             location
         ));
     }
+    if let Some(err) = &cron_load_error {
+        app.error_line(format!("cron: {err}"));
+    } else if !cron_registry.list().is_empty() {
+        let location = cron_registry
+            .storage_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "memory".into());
+        app.system_line(format!(
+            "loaded {} cron job(s) from {}",
+            cron_registry.list().len(),
+            location
+        ));
+    }
     if !loaded_templates.templates.is_empty() {
         app.system_line(format!(
             "loaded {} template(s): {}",
@@ -613,6 +635,8 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
     let _unsub_dynamic_fire_once = harness.subscribe_harness(triggers::fire_once_harness_listener(
         dynamic_trigger_registry.clone(),
     ));
+    let _unsub_cron =
+        harness.subscribe_harness(triggers::cron_harness_listener(cron_registry.clone()));
     let _unsub_hooks = harness.agent().subscribe(hooks.runner.listener());
     let _unsub_harness_hooks = harness.subscribe_harness(hooks.runner.harness_listener());
 

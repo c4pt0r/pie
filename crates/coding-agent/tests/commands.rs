@@ -19,6 +19,7 @@ use pie_ai::{
 static PATH_ENV_LOCK: Mutex<()> = Mutex::new(());
 static PIE_DIR_ENV_LOCK: Mutex<()> = Mutex::new(());
 static DYNAMIC_TRIGGER_LOCK: Mutex<()> = Mutex::new(());
+static CRON_LOCK: Mutex<()> = Mutex::new(());
 
 // The binary crate doesn't expose `commands` — pull it in via path-include so this test
 // exercises the actual code path without restructuring the crate as a [lib]. `commands.rs`
@@ -548,6 +549,169 @@ async fn dispatch_triggers_disable_and_enable_updates_rule_state() {
         session.entries().await.unwrap().is_empty(),
         "/triggers enable/disable only mutates the dynamic rule registry"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dispatch_cron_add_lists_toggles_and_removes_job() {
+    let _guard = CRON_LOCK.lock().unwrap();
+    triggers::global_cron_registry().clear_for_tests();
+
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage as Arc<dyn SessionStorage>);
+    let opts = AgentHarnessOptions::new(faux_model(), session.clone());
+    let harness = Arc::new(AgentHarness::new(opts));
+
+    let registry = commands::Registry::with_builtins();
+    let cwd = std::env::current_dir().unwrap();
+    let ctx = commands::CommandCtx {
+        harness: &harness,
+        session_id: "test",
+        log_path: None,
+        tool_count: 0,
+        cwd: &cwd,
+    };
+
+    let outcome = commands::dispatch(
+        "/cron add \"*/10 * * * *\" summarize the repo state",
+        &registry,
+        &ctx,
+    )
+    .await;
+    assert!(matches!(outcome, commands::CommandOutcome::Handled));
+    let jobs = triggers::global_cron_registry().list();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].schedule, "*/10 * * * *");
+    assert_eq!(jobs[0].action, "summarize the repo state");
+    assert!(jobs[0].enabled);
+
+    let list = commands::dispatch("/cron list", &registry, &ctx).await;
+    assert!(matches!(list, commands::CommandOutcome::Handled));
+    let rendered =
+        commands::render_cron_jobs(&[triggers::global_cron_registry().list()[0].clone()])
+            .join("\n");
+    assert!(rendered.contains("summarize the repo state"));
+
+    let disable =
+        commands::dispatch(&format!("/cron disable {}", jobs[0].id), &registry, &ctx).await;
+    assert!(matches!(disable, commands::CommandOutcome::Handled));
+    assert!(!triggers::global_cron_registry().list()[0].enabled);
+
+    let enable = commands::dispatch(&format!("/cron enable {}", jobs[0].id), &registry, &ctx).await;
+    assert!(matches!(enable, commands::CommandOutcome::Handled));
+    assert!(triggers::global_cron_registry().list()[0].enabled);
+
+    let remove = commands::dispatch(&format!("/cron remove {}", jobs[0].id), &registry, &ctx).await;
+    assert!(matches!(remove, commands::CommandOutcome::Handled));
+    assert!(triggers::global_cron_registry().list().is_empty());
+    let entries = session.entries().await.unwrap();
+    let audits = entries
+        .iter()
+        .filter_map(|entry| match entry {
+            SessionTreeEntry::Custom {
+                custom_type, data, ..
+            } if custom_type == "cron_control_plane" => data.as_ref(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        audits.len(),
+        4,
+        "cron writes should be audited: {entries:#?}"
+    );
+    assert_eq!(audits[0].get("op").and_then(|v| v.as_str()), Some("add"));
+    assert_eq!(
+        audits[0].get("actor").and_then(|v| v.as_str()),
+        Some("slash")
+    );
+    assert_eq!(
+        audits[0].get("after_enabled").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert!(
+        audits[0].get("next_run").and_then(|v| v.as_str()).is_some(),
+        "enabled cron audit should include next_run: {:#?}",
+        audits[0]
+    );
+    assert_eq!(
+        audits[1].get("op").and_then(|v| v.as_str()),
+        Some("disable")
+    );
+    assert_eq!(
+        audits[1].get("before_enabled").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        audits[1].get("after_enabled").and_then(|v| v.as_bool()),
+        Some(false)
+    );
+    assert_eq!(audits[2].get("op").and_then(|v| v.as_str()), Some("enable"));
+    assert_eq!(audits[3].get("op").and_then(|v| v.as_str()), Some("remove"));
+    assert_eq!(
+        audits[3].get("removed").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dispatch_cron_list_redacts_secret_like_action_preview() {
+    let _guard = CRON_LOCK.lock().unwrap();
+    triggers::global_cron_registry().clear_for_tests();
+    let secret = "sk-abcdefghijklmnopqrstuvwxyz123456";
+    triggers::global_cron_registry()
+        .add_job("* * * * *", &format!("use {secret}"))
+        .unwrap();
+
+    let rendered = commands::render_cron_jobs(&triggers::global_cron_registry().list()).join("\n");
+    assert!(!rendered.contains(secret), "{rendered}");
+    assert!(rendered.contains("[REDACTED:"), "{rendered}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dispatch_cron_add_audit_redacts_secret_like_action_preview() {
+    let _guard = CRON_LOCK.lock().unwrap();
+    triggers::global_cron_registry().clear_for_tests();
+
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage as Arc<dyn SessionStorage>);
+    let opts = AgentHarnessOptions::new(faux_model(), session.clone());
+    let harness = Arc::new(AgentHarness::new(opts));
+
+    let registry = commands::Registry::with_builtins();
+    let cwd = std::env::current_dir().unwrap();
+    let ctx = commands::CommandCtx {
+        harness: &harness,
+        session_id: "test",
+        log_path: None,
+        tool_count: 0,
+        cwd: &cwd,
+    };
+
+    let secret = "sk-abcdefghijklmnopqrstuvwxyz123456";
+    let outcome = commands::dispatch(
+        &format!("/cron add \"0 * * * *\" call API with Bearer abcdefghijklmnop and {secret}"),
+        &registry,
+        &ctx,
+    )
+    .await;
+    assert!(matches!(outcome, commands::CommandOutcome::Handled));
+
+    let entries = session.entries().await.unwrap();
+    let audit = entries
+        .iter()
+        .find_map(|entry| match entry {
+            SessionTreeEntry::Custom {
+                custom_type, data, ..
+            } if custom_type == "cron_control_plane" => data.as_ref(),
+            _ => None,
+        })
+        .expect("cron add should write audit");
+    let serialized = serde_json::to_string(audit).unwrap();
+    assert!(!serialized.contains(secret), "{serialized}");
+    assert!(
+        !serialized.contains("Bearer abcdefghijklmnop"),
+        "{serialized}"
+    );
+    assert!(serialized.contains("[REDACTED:"), "{serialized}");
 }
 
 #[tokio::test]

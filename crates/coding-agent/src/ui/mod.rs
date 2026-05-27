@@ -1080,6 +1080,7 @@ impl App {
     fn should_show_side_panel(&self) -> bool {
         !self.kernel.harness().skills().is_empty()
             || !crate::triggers::global_registry().list().is_empty()
+            || !crate::triggers::global_cron_registry().list().is_empty()
             || self.panel_status.mcp_servers > 0
             || self.panel_status.mcp_notification_hooks > 0
     }
@@ -1087,6 +1088,7 @@ impl App {
     fn trigger_panel_lines(&self, width: usize, height: usize) -> Vec<Line<'static>> {
         let width = width.max(1);
         let rules = crate::triggers::global_registry().list();
+        let cron_jobs = crate::triggers::global_cron_registry().list();
 
         let mut lines = Vec::new();
         let skills = self.kernel.harness().skills();
@@ -1155,6 +1157,57 @@ impl App {
             if rules.len() > TRIGGER_PANEL_RULE_LIMIT {
                 lines.push(panel_line(
                     format!("… {} more", rules.len() - TRIGGER_PANEL_RULE_LIMIT),
+                    Color::DarkGray,
+                    width,
+                ));
+            }
+        }
+
+        lines.push(Line::raw(""));
+        lines.push(panel_line("Cron".to_string(), Color::Cyan, width));
+        if cron_jobs.is_empty() {
+            lines.push(panel_line("none".to_string(), Color::DarkGray, width));
+        } else {
+            let enabled = cron_jobs.iter().filter(|job| job.enabled).count();
+            let disabled = cron_jobs.len().saturating_sub(enabled);
+            lines.push(panel_line(
+                format!("enabled {enabled} · disabled {disabled}"),
+                if disabled == 0 {
+                    Color::Green
+                } else {
+                    Color::Yellow
+                },
+                width,
+            ));
+            for job in cron_jobs.iter().take(TRIGGER_PANEL_RULE_LIMIT) {
+                let state_flag = if job.enabled { "enabled" } else { "disabled" };
+                let id = feed::truncate_chars(&job.id, 12);
+                let color = if job.enabled {
+                    Color::Green
+                } else {
+                    Color::DarkGray
+                };
+                lines.push(panel_line(
+                    format!("{id} [{state_flag}] {}", job.schedule),
+                    color,
+                    width,
+                ));
+                lines.push(panel_line(
+                    format!("  do {}", panel_rule_preview(&job.action, width)),
+                    Color::DarkGray,
+                    width,
+                ));
+                if job.skipped_overlap_count > 0 {
+                    lines.push(panel_line(
+                        format!("  skipped overlaps {}", job.skipped_overlap_count),
+                        Color::Yellow,
+                        width,
+                    ));
+                }
+            }
+            if cron_jobs.len() > TRIGGER_PANEL_RULE_LIMIT {
+                lines.push(panel_line(
+                    format!("… {} more", cron_jobs.len() - TRIGGER_PANEL_RULE_LIMIT),
                     Color::DarkGray,
                     width,
                 ));
@@ -1697,6 +1750,7 @@ mod tests {
     fn wide_layout_renders_trigger_panel() {
         let _guard = TRIGGER_REGISTRY_TEST_LOCK.lock().unwrap();
         crate::triggers::global_registry().clear_for_tests();
+        crate::triggers::global_cron_registry().clear_for_tests();
         let mut app = test_app();
         app.panel_status = PanelStatus {
             mcp_servers: 1,
@@ -1761,6 +1815,7 @@ mod tests {
     fn wide_layout_hides_empty_static_trigger_panel() {
         let _guard = TRIGGER_REGISTRY_TEST_LOCK.lock().unwrap();
         crate::triggers::global_registry().clear_for_tests();
+        crate::triggers::global_cron_registry().clear_for_tests();
         let mut app = test_app();
         app.panel_status = PanelStatus {
             mcp_servers: 0,
@@ -1793,6 +1848,7 @@ mod tests {
     fn wide_layout_renders_compact_skills_panel_summary() {
         let _guard = TRIGGER_REGISTRY_TEST_LOCK.lock().unwrap();
         crate::triggers::global_registry().clear_for_tests();
+        crate::triggers::global_cron_registry().clear_for_tests();
         let mut app = test_app();
         app.kernel.harness().replace_skills(vec![
             ui_skill(
@@ -1829,6 +1885,7 @@ mod tests {
     fn trigger_panel_redacts_rule_preview_secrets() {
         let _guard = TRIGGER_REGISTRY_TEST_LOCK.lock().unwrap();
         crate::triggers::global_registry().clear_for_tests();
+        crate::triggers::global_cron_registry().clear_for_tests();
         let mut app = test_app();
         let secret = "sk-panel-secret-should-not-render-1234567890";
         crate::triggers::global_registry()
@@ -1857,6 +1914,7 @@ mod tests {
     fn narrow_layout_hides_trigger_panel() {
         let _guard = TRIGGER_REGISTRY_TEST_LOCK.lock().unwrap();
         crate::triggers::global_registry().clear_for_tests();
+        crate::triggers::global_cron_registry().clear_for_tests();
         let mut app = test_app();
         crate::triggers::global_registry()
             .add_rule("a build finishes", "summarize the result")
@@ -1870,6 +1928,39 @@ mod tests {
         assert!(
             !text.contains("Triggers"),
             "trigger panel should be hidden on narrow terminals:\n{text}"
+        );
+    }
+
+    #[test]
+    fn wide_layout_renders_cron_jobs_in_automation_panel() {
+        let _guard = TRIGGER_REGISTRY_TEST_LOCK.lock().unwrap();
+        crate::triggers::global_registry().clear_for_tests();
+        crate::triggers::global_cron_registry().clear_for_tests();
+        let mut app = test_app();
+        let secret = "sk-cron-panel-secret-12345678901234567890";
+        crate::triggers::global_cron_registry()
+            .add_job("*/10 * * * *", &format!("call API with {secret}"))
+            .unwrap();
+
+        let backend = TestBackend::new(120, 26);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+
+        assert!(text.contains("Automation"), "panel title missing:\n{text}");
+        assert!(text.contains("Cron"), "cron section missing:\n{text}");
+        assert!(
+            text.contains("enabled 1 · disabled 0"),
+            "cron count summary missing:\n{text}"
+        );
+        assert!(
+            text.contains("*/10 * * *"),
+            "cron schedule missing:\n{text}"
+        );
+        assert!(!text.contains(secret), "cron panel leaked secret:\n{text}");
+        assert!(
+            text.contains("[REDACTED:"),
+            "cron panel should show redaction marker:\n{text}"
         );
     }
 

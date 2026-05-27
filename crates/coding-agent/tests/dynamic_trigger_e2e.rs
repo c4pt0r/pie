@@ -22,6 +22,15 @@ use pie_ai::{
 use tokio_util::sync::CancellationToken;
 
 #[allow(dead_code)]
+#[path = "../src/bug_report.rs"]
+mod bug_report;
+#[allow(dead_code)]
+#[path = "../src/config.rs"]
+mod config;
+#[allow(dead_code)]
+#[path = "../src/export.rs"]
+mod export;
+#[allow(dead_code)]
 #[path = "../src/triggers/mod.rs"]
 mod triggers;
 
