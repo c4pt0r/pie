@@ -58,6 +58,18 @@ pub enum FeedUpdate {
         text: String,
         level: Level,
     },
+    TriggerPollStatus(TriggerPollStatus),
+}
+
+/// Bounded, display-only status for periodic trigger checks that should stay visible in the
+/// main UI without appending a line to the conversation feed.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct TriggerPollStatus {
+    pub checked_at: String,
+    pub trace_id: String,
+    pub source_label: String,
+    pub event_label: String,
+    pub summary: String,
 }
 
 /// One renderable unit in the feed.
@@ -202,6 +214,7 @@ impl Feed {
                 is_error,
             } => self.upsert_tool_result(tool_call_id, lines, is_error),
             FeedUpdate::Plain { text, level } => self.push_plain(text, level),
+            FeedUpdate::TriggerPollStatus(_) => {}
         }
     }
 

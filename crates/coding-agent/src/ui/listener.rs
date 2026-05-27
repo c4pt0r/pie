@@ -6,12 +6,15 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use chrono::Local;
 use parking_lot::Mutex;
 use pie_agent_core::{AgentEvent, AgentListener, HarnessEvent, HarnessListener, TriggerState};
 use pie_ai::AssistantMessageEvent;
 use tokio::sync::mpsc::UnboundedSender;
 
-use super::feed::{FeedUpdate, Level, compact_tool_content_blocks, preview, truncate_chars};
+use super::feed::{
+    FeedUpdate, Level, TriggerPollStatus, compact_tool_content_blocks, preview, truncate_chars,
+};
 
 /// Build the per-turn agent listener. Maps streaming deltas, tool calls, and turn boundaries
 /// into feed updates.
@@ -153,7 +156,12 @@ fn map_harness_event(
             let summary = summary.as_deref().unwrap_or("completed");
             let was_quiet = quiet.lock().remove(trace_id);
             if !debug && was_quiet && is_no_match_dynamic_summary(summary) {
-                return None;
+                return Some(dynamic_poll_status_update(
+                    trace_id,
+                    "local:dynamic",
+                    "dynamic periodic check",
+                    summary,
+                ));
             }
             Some(FeedUpdate::Plain {
                 text: format!(
@@ -205,6 +213,21 @@ fn debug_text(debug: bool, s: &str, max_chars: usize) -> String {
     } else {
         truncate_chars(s, max_chars)
     }
+}
+
+fn dynamic_poll_status_update(
+    trace_id: &str,
+    source_label: &str,
+    event_label: &str,
+    summary: &str,
+) -> FeedUpdate {
+    FeedUpdate::TriggerPollStatus(TriggerPollStatus {
+        checked_at: Local::now().format("%H:%M:%S").to_string(),
+        trace_id: truncate_chars(trace_id, 24),
+        source_label: truncate_chars(source_label, 48),
+        event_label: truncate_chars(event_label, 64),
+        summary: truncate_chars(&crate::bug_report::redact(summary).replace('\n', " "), 120),
+    })
 }
 
 fn is_no_match_dynamic_summary(summary: &str) -> bool {
@@ -453,10 +476,30 @@ mod tests {
             &quiet,
             false,
         );
-        assert!(
-            update.is_none(),
-            "dynamic no-match poll completion should stay out of the main feed"
+        let Some(FeedUpdate::TriggerPollStatus(status)) = update else {
+            panic!("dynamic no-match poll completion should update poll status");
+        };
+        assert_eq!(status.trace_id, "trace-chrome-check");
+        assert_eq!(status.source_label, "local:dynamic");
+        assert_eq!(status.event_label, "dynamic periodic check");
+        assert!(status.summary.contains("no matching rule found"));
+    }
+
+    #[test]
+    fn dynamic_periodic_poll_status_redacts_and_bounds_summary() {
+        let marker = "sk-test-secret-1234567890";
+        let update = dynamic_poll_status_update(
+            "trace-secret",
+            "local:dynamic",
+            "dynamic periodic check",
+            &format!("Checked Chrome tabs with token {marker}; no matching rule found."),
         );
+        let FeedUpdate::TriggerPollStatus(status) = update else {
+            panic!("expected poll status");
+        };
+        assert!(!status.summary.contains(marker));
+        assert!(status.summary.contains("[REDACTED:"));
+        assert!(status.summary.chars().count() <= 120);
     }
 
     #[test]

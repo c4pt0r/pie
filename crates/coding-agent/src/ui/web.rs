@@ -47,6 +47,7 @@ struct WebSnapshot {
     model: String,
     busy: bool,
     queued_count: usize,
+    latest_trigger_poll: Option<super::feed::TriggerPollStatus>,
     feed_lines: Vec<String>,
 }
 
@@ -98,9 +99,9 @@ impl App {
                     self.publish_snapshot(&latest, &snapshot_tx).await;
                 }
                 Some(update) = feed_rx.recv() => {
-                    self.feed.apply(update);
+                    self.apply_feed_update(update);
                     while let Ok(update) = feed_rx.try_recv() {
-                        self.feed.apply(update);
+                        self.apply_feed_update(update);
                     }
                     self.publish_snapshot(&latest, &snapshot_tx).await;
                 }
@@ -242,6 +243,7 @@ impl App {
             model,
             busy: self.busy,
             queued_count: self.queued_turns.len(),
+            latest_trigger_poll: self.latest_trigger_poll.clone(),
             feed_lines: bounded_feed_lines(&self.feed, SNAPSHOT_LINE_LIMIT),
         }
     }
@@ -359,6 +361,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .line { min-height: 1.45em; }
     .muted { color: var(--muted); }
     .busy { color: var(--accent); }
+    #poll { color: var(--muted); font-size: 13px; margin-bottom: 8px; min-height: 18px; }
     form { display: grid; grid-template-columns: 1fr auto auto; gap: 8px; align-items: end; }
     textarea { width: 100%; min-height: 48px; max-height: 180px; resize: vertical; padding: 10px; font: inherit; }
     button { padding: 9px 12px; font: inherit; }
@@ -371,6 +374,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     <span id="model" class="muted"></span>
     <span id="status" class="muted"></span>
   </header>
+  <div id="poll"></div>
   <section id="feed" aria-live="polite"></section>
   <footer>
     <form id="form">
@@ -384,6 +388,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
 const feed = document.getElementById('feed');
 const model = document.getElementById('model');
 const status = document.getElementById('status');
+const poll = document.getElementById('poll');
 const input = document.getElementById('input');
 const form = document.getElementById('form');
 const abortButton = document.getElementById('abort');
@@ -394,6 +399,12 @@ function render(snapshot) {
     ? ('working' + (snapshot.queued_count ? ' · ' + snapshot.queued_count + ' queued' : ''))
     : ('ready' + (snapshot.queued_count ? ' · ' + snapshot.queued_count + ' queued' : ''));
   status.className = snapshot.busy ? 'busy' : 'muted';
+  poll.textContent = snapshot.latest_trigger_poll
+    ? ('Polling · ' + snapshot.latest_trigger_poll.checked_at + ' · '
+      + snapshot.latest_trigger_poll.source_label + ' / '
+      + snapshot.latest_trigger_poll.event_label + ' · '
+      + snapshot.latest_trigger_poll.summary)
+    : '';
   feed.replaceChildren(...snapshot.feed_lines.map((line) => {
     const div = document.createElement('div');
     div.className = 'line';
@@ -493,6 +504,7 @@ mod tests {
             model: "provider:model".into(),
             busy: false,
             queued_count: 0,
+            latest_trigger_poll: None,
             feed_lines: vec!["ready".into()],
         }));
         let router = web_router(HttpState {
@@ -559,6 +571,7 @@ mod tests {
                 model: "provider:model".into(),
                 busy: true,
                 queued_count: 1,
+                latest_trigger_poll: None,
                 feed_lines: vec!["streamed".into()],
             })
             .unwrap();

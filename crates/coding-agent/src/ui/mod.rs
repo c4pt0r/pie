@@ -59,7 +59,7 @@ use crate::commands::{self, CommandCtx, CommandOutcome, Registry};
 use crate::history::HistoryStore;
 use crate::readline::SlashCompleter;
 use crate::{images, mentions};
-use feed::{Feed, Level};
+use feed::{Feed, Level, TriggerPollStatus};
 use kernel::{QueuedTurn, ReplKernel, TurnState, poll_turn};
 use pie_agent_core::{AgentHarness, AgentMessage, AgentRunError, SkillSource};
 use pie_ai::{ContentBlock, ImageContent, Message, UserContent, UserContentBlock};
@@ -123,6 +123,7 @@ pub struct App {
     pending_pasted_images: Vec<ImageContent>,
 
     feed: Feed,
+    latest_trigger_poll: Option<TriggerPollStatus>,
     feed_rx: Option<UnboundedReceiver<FeedUpdate>>,
     main_run_rx: Option<UnboundedReceiver<String>>,
     panel_status: PanelStatus,
@@ -161,6 +162,7 @@ impl App {
             pending_images: config.pending_images,
             pending_pasted_images: Vec::new(),
             feed: Feed::new(),
+            latest_trigger_poll: None,
             feed_rx: Some(config.feed_rx),
             main_run_rx: Some(config.main_run_rx),
             panel_status: config.panel_status,
@@ -322,9 +324,9 @@ impl App {
                     }
                 }
                 Some(update) = feed_rx.recv() => {
-                    self.feed.apply(update);
+                    self.apply_feed_update(update);
                     while let Ok(update) = feed_rx.try_recv() {
-                        self.feed.apply(update);
+                        self.apply_feed_update(update);
                     }
                 }
                 Some(trace_id) = main_run_rx.recv(), if turn.fut.is_none() => {
@@ -361,6 +363,15 @@ impl App {
         turn.aborted = false;
         turn.prefix = "";
         self.start_next_queued_turn(turn);
+    }
+
+    fn apply_feed_update(&mut self, update: FeedUpdate) {
+        match update {
+            FeedUpdate::TriggerPollStatus(status) => {
+                self.latest_trigger_poll = Some(status);
+            }
+            other => self.feed.apply(other),
+        }
     }
 
     // ── event handling ──────────────────────────────────────────────────────────────────
@@ -1081,6 +1092,7 @@ impl App {
         !self.kernel.harness().skills().is_empty()
             || !crate::triggers::global_registry().list().is_empty()
             || !crate::triggers::global_cron_registry().list().is_empty()
+            || self.latest_trigger_poll.is_some()
             || self.panel_status.mcp_servers > 0
             || self.panel_status.mcp_notification_hooks > 0
     }
@@ -1161,6 +1173,35 @@ impl App {
                     width,
                 ));
             }
+        }
+
+        if let Some(status) = &self.latest_trigger_poll {
+            lines.push(Line::raw(""));
+            lines.push(panel_line("Polling".to_string(), Color::Cyan, width));
+            lines.push(panel_line(
+                format!("{} · no match", status.checked_at),
+                Color::Yellow,
+                width,
+            ));
+            lines.push(panel_line(
+                format!(
+                    "{} / {}",
+                    panel_rule_preview(&status.source_label, width),
+                    panel_rule_preview(&status.event_label, width)
+                ),
+                Color::DarkGray,
+                width,
+            ));
+            lines.push(panel_line(
+                format!("trace {}", panel_rule_preview(&status.trace_id, width)),
+                Color::DarkGray,
+                width,
+            ));
+            lines.push(panel_line(
+                format!("  {}", panel_rule_preview(&status.summary, width)),
+                Color::DarkGray,
+                width,
+            ));
         }
 
         lines.push(Line::raw(""));
@@ -1555,6 +1596,7 @@ fn print_headless_update(update: &FeedUpdate, at_line_start: &mut bool) {
             let _ = writeln!(out, "{text}");
             *at_line_start = true;
         }
+        FeedUpdate::TriggerPollStatus(_) => {}
         FeedUpdate::TurnStart => {}
         FeedUpdate::TurnEnd => {
             if !*at_line_start {
@@ -1841,6 +1883,49 @@ mod tests {
         assert!(
             !text.contains("cycle suppress"),
             "static trigger-runtime rows belong in /triggers status, not the default side panel:\n{text}"
+        );
+    }
+
+    #[test]
+    fn wide_layout_shows_latest_poll_status_without_feed_line() {
+        let _guard = TRIGGER_REGISTRY_TEST_LOCK.lock().unwrap();
+        crate::triggers::global_registry().clear_for_tests();
+        crate::triggers::global_cron_registry().clear_for_tests();
+        let mut app = test_app();
+        app.latest_trigger_poll = Some(TriggerPollStatus {
+            checked_at: "11:22:33".into(),
+            trace_id: "trace-chrome-check".into(),
+            source_label: "local:dynamic".into(),
+            event_label: "dynamic periodic check".into(),
+            summary: "Checked Chrome tabs; no matching rule found.".into(),
+        });
+
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+
+        assert!(text.contains("Automation"), "panel title missing:\n{text}");
+        assert!(text.contains("Polling"), "polling section missing:\n{text}");
+        assert!(
+            text.contains("11:22:33 · no match"),
+            "poll status missing:\n{text}"
+        );
+        assert!(
+            text.contains("local:dynamic / dynamic periodic c"),
+            "poll source missing:\n{text}"
+        );
+        assert!(
+            text.contains("trace trace-chrome-check"),
+            "poll trace missing:\n{text}"
+        );
+        assert!(
+            text.contains("no matching"),
+            "poll summary missing:\n{text}"
+        );
+        assert!(
+            !text.contains("[trigger completed]"),
+            "poll status should not be appended to the feed:\n{text}"
         );
     }
 
