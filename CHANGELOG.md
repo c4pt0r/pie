@@ -48,14 +48,16 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
   counters, hook health, running trigger actions, recent trigger audit rows, and supports
   aborting one or all in-flight trigger actions from the terminal while rendering only
   preview-safe fields.
-- Added user-global cron jobs as a time-based automation surface parallel to dynamic
-  triggers. `/cron add "<minute hour dom month dow>" <prompt>` stores jobs in
-  `~/.pie/cron.toml`, local-time scheduling emits normal trigger envelopes, execution uses
-  the same serialized inject-and-run turn slot as prompt and trigger work, overlapping ticks
-  are skipped and recorded, missed ticks are not backfilled after downtime, and
-  add/enable/disable/remove writes append-only `cron_control_plane` audit entries with
-  bounded redacted action previews. The default dynamic-trigger poll interval is now 10
-  minutes (`600s`) instead of 1 minute; `--trigger-poll-secs` and
+- Added session-scoped cron jobs as a time-based automation surface parallel to dynamic
+  triggers. `/cron add "<minute hour dom month dow>" <prompt>` stores jobs next to the
+  active session transcript, local-time scheduling emits normal trigger envelopes,
+  execution uses the same serialized inject-and-run turn slot as prompt and trigger work,
+  overlapping ticks are skipped and recorded, missed ticks are not backfilled after
+  downtime, and add/enable/disable/remove writes append-only `cron_control_plane` audit
+  entries with bounded redacted action previews. Natural-language scheduled jobs now use
+  the model-facing `NewCronJob` tool instead of dynamic `NewTrigger`; the default path
+  never writes a user-global cron file. The default dynamic-trigger poll interval is now
+  10 minutes (`600s`) instead of 1 minute; `--trigger-poll-secs` and
   `[triggers] poll_interval_secs` still override it.
 - Interactive TUI prompts can now be queued while a turn is already running. Enter during
   an active agent turn appends the next user prompt or agent-running slash command to a FIFO

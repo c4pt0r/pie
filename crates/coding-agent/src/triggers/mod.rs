@@ -16,7 +16,8 @@ pub mod mcp_notification_hook;
 
 #[allow(unused_imports)]
 pub use cron::{
-    CronJob, CronNotificationHook, cron_action_hook, cron_harness_listener, global_cron_registry,
+    CronJob, CronNotificationHook, NewCronJobTool, cron_action_hook, cron_harness_listener,
+    global_cron_registry,
 };
 #[allow(unused_imports)]
 pub use dynamic::{

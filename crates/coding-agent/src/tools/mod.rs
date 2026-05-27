@@ -106,6 +106,13 @@ pub fn remove_skill_tool(harness_cell: skill::SkillHarnessCell) -> Arc<dyn Agent
     Arc::new(remove_skill::RemoveSkillTool::new(harness_cell))
 }
 
+/// Build the session-scoped cron creation tool. This is the model-facing counterpart to
+/// `/cron add`: when the user asks in ordinary conversation for a scheduled / recurring
+/// job, the model can register it without falling back to a dynamic trigger.
+pub fn new_cron_job_tool(harness_cell: skill::SkillHarnessCell) -> Arc<dyn AgentTool> {
+    Arc::new(crate::triggers::NewCronJobTool::new(Some(harness_cell)))
+}
+
 /// Build the dynamic trigger creation tool. This is model-facing counterpart to the
 /// `/new-trigger` slash command: when the user asks in ordinary conversation to create an
 /// automation, the model can register the rule without requiring slash-command syntax.

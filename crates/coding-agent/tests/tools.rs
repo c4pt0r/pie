@@ -29,6 +29,7 @@ mod tools;
 mod triggers;
 
 static DYNAMIC_TRIGGER_LOCK: Mutex<()> = Mutex::new(());
+static CRON_LOCK: Mutex<()> = Mutex::new(());
 
 #[tokio::test]
 async fn read_writes_then_reads() {
@@ -141,6 +142,92 @@ async fn new_trigger_tool_registers_dynamic_rule() {
         _ => panic!("expected text"),
     };
     assert!(text.contains("created dynamic trigger"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn new_trigger_tool_rejects_fixed_schedule_jobs() {
+    let _guard = DYNAMIC_TRIGGER_LOCK.lock().unwrap();
+    triggers::global_registry().clear_for_tests();
+
+    let tool = tools::new_trigger_tool();
+    let err = tool
+        .execute(
+            "new-trigger-scheduled-1",
+            serde_json::json!({
+                "condition": "Every hour",
+                "action": "Check Hacker News"
+            }),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect_err("fixed schedules should be routed to cron");
+
+    assert!(
+        format!("{err}").contains("NewCronJob"),
+        "error should point model to cron tool: {err}"
+    );
+    assert!(triggers::global_registry().list().is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn new_trigger_tool_rejects_fixed_schedule_in_action_or_spec() {
+    let _guard = DYNAMIC_TRIGGER_LOCK.lock().unwrap();
+    triggers::global_registry().clear_for_tests();
+
+    let tool = tools::new_trigger_tool();
+    let err = tool
+        .execute(
+            "new-trigger-scheduled-bypass-1",
+            serde_json::json!({
+                "condition": "Hacker News should be checked",
+                "action": "Every hour, check Hacker News",
+                "spec": "Every hour, check Hacker News"
+            }),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect_err("fixed schedule in action/spec should be routed to cron");
+
+    assert!(
+        format!("{err}").contains("NewCronJob"),
+        "error should point model to cron tool: {err}"
+    );
+    assert!(triggers::global_registry().list().is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn new_cron_job_tool_registers_session_cron_job() {
+    let _guard = CRON_LOCK.lock().unwrap();
+    triggers::global_cron_registry().clear_for_tests();
+
+    let tool = triggers::NewCronJobTool::new(None);
+    let result = tool
+        .execute(
+            "new-cron-1",
+            serde_json::json!({
+                "schedule": "每小时",
+                "action": "Check the Hacker News front page"
+            }),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("tool should create cron job");
+
+    let jobs = triggers::global_cron_registry().list();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].schedule, "0 * * * *");
+    assert_eq!(jobs[0].action, "Check the Hacker News front page");
+    assert!(jobs[0].enabled);
+    assert_eq!(result.details["scope"], "session");
+
+    let text = match &result.content[0] {
+        pie_ai::UserContentBlock::Text(t) => t.text.clone(),
+        _ => panic!("expected text"),
+    };
+    assert!(text.contains("created cron job"));
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -172,7 +172,7 @@ The agent has tools for common coding workflows:
 - attach images to the first prompt with `--image`
 - create session-scoped natural-language triggers that run actions when local checks or MCP
   push events match
-- create user-scoped cron jobs that run prompts on a local schedule
+- create session-scoped cron jobs that run prompts on a local schedule
 - run local command hooks or HTTP webhooks on agent lifecycle events; see [docs/hooks.md](docs/hooks.md)
 
 ## Triggers
@@ -215,8 +215,10 @@ behavior apply.
 
 ## Cron jobs
 
-Cron jobs are time-based automations, separate from dynamic triggers. They are stored in
-`~/.pie/cron.toml`, use local time, and support standard 5-field cron expressions:
+Cron jobs are time-based automations, separate from dynamic triggers. By default they are
+stored next to the active session transcript, so a new session starts cleanly and `--resume`
+brings that session's scheduled jobs back. Cron jobs use local time and support standard
+5-field cron expressions:
 
 ```text
 /cron add "*/30 * * * *" summarize the repo state
@@ -230,6 +232,10 @@ job is still running when its next tick arrives, that tick is skipped and record
 job status. Cron config stores only the schedule and action text; control-plane audit and
 UI output use bounded, redacted previews.
 
+`/cron add` and natural-language scheduled jobs are session-scoped. They do not write a
+user-global `~/.pie/cron.toml`; a global cron install must be an explicit separate user
+action rather than the default behavior.
+
 ## Files and storage
 
 By default, `pie` stores local state under `~/.pie`:
@@ -242,7 +248,7 @@ By default, `pie` stores local state under `~/.pie`:
 | `~/.pie/models.json` | User-global local/custom model definitions |
 | `~/.pie/history` | Prompt history |
 | `~/.pie/hooks.toml` | Optional command/webhook hooks |
-| `~/.pie/cron.toml` | User-global local cron jobs |
+| `~/.pie/sessions/<cwd-hash>/<uuidv7>.cron.toml` | Session-scoped cron jobs |
 | `~/.pie/config.toml` | Optional user config, including trigger poll interval |
 
 Set `PIE_DIR` to use a different base directory.

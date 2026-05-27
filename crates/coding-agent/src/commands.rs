@@ -1978,21 +1978,7 @@ async fn write_cron_control_plane_audit(
     after: Option<&crate::triggers::cron::CronJob>,
 ) {
     let job = after.or(before);
-    let now = chrono::Utc::now();
-    let audit = json!({
-        "op": op,
-        "actor": "slash",
-        "job_id": job.map(|job| job.id.as_str()),
-        "schedule": job.map(|job| job.schedule.as_str()),
-        "action_preview": job.map(|job| preview_cron_action(&job.action)),
-        "before_enabled": before.map(|job| job.enabled),
-        "after_enabled": after.map(|job| job.enabled),
-        "next_run": after
-            .filter(|job| job.enabled)
-            .and_then(|job| job.next_run_after(now))
-            .map(|dt| dt.to_rfc3339()),
-        "removed": before.is_some() && after.is_none(),
-    });
+    let audit = crate::triggers::cron::cron_control_plane_audit(op, "slash", before, after);
     if let Err(e) = ctx
         .harness
         .session()
@@ -2010,9 +1996,9 @@ async fn write_cron_control_plane_audit(
 
 pub(crate) fn render_cron_jobs(jobs: &[crate::triggers::cron::CronJob]) -> Vec<String> {
     if jobs.is_empty() {
-        return vec!["Cron jobs: none".into()];
+        return vec!["Cron jobs (session): none".into()];
     }
-    let mut lines = vec![format!("Cron jobs ({}):", jobs.len())];
+    let mut lines = vec![format!("Cron jobs (session, {}):", jobs.len())];
     for job in jobs {
         let state = if job.enabled { "enabled" } else { "disabled" };
         let running = job

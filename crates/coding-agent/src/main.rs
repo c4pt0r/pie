@@ -277,7 +277,7 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
         .load_from_path(dynamic_trigger_path)
         .err();
     let cron_registry = triggers::global_cron_registry().clone();
-    let cron_path = config::base_dir().join("cron.toml");
+    let cron_path = session::cron_sidecar_path_for_session(&session, &repo).await?;
     let cron_load_error = cron_registry.load_from_path(cron_path).err();
     let memory_dir = config::memory_dir();
     let mut tools = tools::default_tools(memory_dir.clone());
@@ -303,6 +303,7 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
     // RemoveSkill tool (task #23, S-A2b). Deletes a user-installed skill dir + clears its
     // overlay entry + reloads; builtin/project skills are refused (disable instead).
     tools.push(tools::remove_skill_tool(skill_harness_cell.clone()));
+    tools.push(tools::new_cron_job_tool(skill_harness_cell.clone()));
     tools.push(tools::new_trigger_tool());
     tools.push(tools::list_triggers_tool());
     tools.push(tools::remove_trigger_tool());

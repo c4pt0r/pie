@@ -589,6 +589,10 @@ async fn dispatch_cron_add_lists_toggles_and_removes_job() {
     let rendered =
         commands::render_cron_jobs(&[triggers::global_cron_registry().list()[0].clone()])
             .join("\n");
+    assert!(
+        rendered.contains("Cron jobs (session, 1):"),
+        "cron list should label session scope: {rendered}"
+    );
     assert!(rendered.contains("summarize the repo state"));
 
     let disable =

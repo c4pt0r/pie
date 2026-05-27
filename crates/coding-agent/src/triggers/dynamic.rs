@@ -784,6 +784,19 @@ impl AgentTool for NewTriggerTool {
             .get("promote_to_chat")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let fixed_schedule_text = [
+            condition,
+            action,
+            params.get("spec").and_then(|v| v.as_str()),
+        ]
+        .into_iter()
+        .flatten()
+        .any(looks_like_fixed_schedule_request);
+        if fixed_schedule_text {
+            return Err(AgentToolError::Message(
+                "fixed scheduled jobs must use NewCronJob, not NewTrigger".into(),
+            ));
+        }
         let rule = match (condition, action) {
             (Some(condition), Some(action)) => {
                 global_registry().add_rule_with_flags(condition, action, fire_once, promote_to_chat)
@@ -1001,10 +1014,34 @@ fn render_trigger_rules_for_tool(rules: &[DynamicTriggerRule]) -> String {
     lines.join("\n")
 }
 
+fn looks_like_fixed_schedule_request(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let english = [
+        "every hour",
+        "hourly",
+        "every day",
+        "daily",
+        "every week",
+        "weekly",
+        "scheduled job",
+        "cron",
+        "crontab",
+    ];
+    english.iter().any(|needle| lower.contains(needle))
+        || text.contains("定时任务")
+        || text.contains("定時任務")
+        || text.contains("每小时")
+        || text.contains("每小時")
+        || text.contains("每天")
+        || text.contains("每日")
+        || text.contains("每周")
+        || text.contains("每週")
+}
+
 static NEW_TRIGGER_TOOL: once_cell::sync::Lazy<Tool> = once_cell::sync::Lazy::new(|| {
     Tool {
         name: "NewTrigger".into(),
-        description: "Create a dynamic trigger rule. Use this when the user asks pie to create an automation or trigger. Extract the natural-language condition and the action from the user's request instead of requiring a fixed phrase.".into(),
+        description: "Create an event/condition-based dynamic trigger rule. Use this for future events such as a browser tab, file, MCP notification, webhook, or other condition becoming true. Do not use this for fixed time, recurring, scheduled, hourly, daily, weekly, cron, crontab, 定时任务, 每小时, or similar time-based jobs; use NewCronJob instead.".into(),
         parameters: json!({
             "type": "object",
             "properties": {

@@ -249,6 +249,16 @@ fn dynamic_trigger_response(context: &Context) -> AssistantMessage {
                 "promote_to_chat": true
             }),
         )
+    } else if last_text.contains("每小时") || last_text.to_lowercase().contains("hourly scheduled")
+    {
+        assistant_tool_call(
+            "call-new-cron-job",
+            "NewCronJob",
+            serde_json::json!({
+                "schedule": "hourly",
+                "action": "Check the Hacker News front page for notable stories"
+            }),
+        )
     } else if last_text.contains("Create a trigger") {
         assistant_tool_call(
             "call-new-trigger",
@@ -477,6 +487,7 @@ fn any_trigger_result_summary(entries: &[pie_agent_core::SessionTreeEntry]) -> V
 async fn natural_language_prompt_creates_dynamic_trigger_and_runtime_event_executes_action() {
     let _guard = DYNAMIC_TRIGGER_LOCK.lock().unwrap();
     triggers::global_registry().clear_for_tests();
+    triggers::global_cron_registry().clear_for_tests();
 
     let bash_calls: Arc<parking_lot::Mutex<Vec<String>>> =
         Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -502,6 +513,10 @@ async fn natural_language_prompt_creates_dynamic_trigger_and_runtime_event_execu
     assert_eq!(rules.len(), 1);
     assert_eq!(rules[0].condition, "the event says build finished");
     assert_eq!(rules[0].action, "echo dynamic-fired");
+    assert!(
+        triggers::global_cron_registry().list().is_empty(),
+        "event/condition trigger request must not create a cron job"
+    );
 
     let events: Arc<parking_lot::Mutex<Vec<HarnessEvent>>> =
         Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -542,6 +557,67 @@ async fn natural_language_prompt_creates_dynamic_trigger_and_runtime_event_execu
             )
         }),
         "trigger_result audit should be written: {entries:#?}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn natural_language_scheduled_job_creates_cron_not_dynamic_trigger_chinese() {
+    let _guard = DYNAMIC_TRIGGER_LOCK.lock().unwrap();
+    triggers::global_registry().clear_for_tests();
+    triggers::global_cron_registry().clear_for_tests();
+
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage as Arc<dyn SessionStorage>);
+    let mut opts = AgentHarnessOptions::new(faux_model(), session);
+    opts.tools = vec![
+        Arc::new(triggers::NewCronJobTool::new(None)) as Arc<dyn AgentTool>,
+        Arc::new(triggers::NewTriggerTool) as Arc<dyn AgentTool>,
+    ];
+    opts.stream_fn = Some(dynamic_trigger_stream());
+    let harness = AgentHarness::new(opts);
+
+    harness
+        .prompt("创建一个每小时的定时任务，查看下 hackernews 首页新闻")
+        .await
+        .expect("prompt should create cron job");
+
+    let jobs = triggers::global_cron_registry().list();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].schedule, "0 * * * *");
+    assert!(jobs[0].action.contains("Hacker News"));
+    assert!(
+        triggers::global_registry().list().is_empty(),
+        "scheduled job must not create a dynamic trigger"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn natural_language_scheduled_job_creates_cron_not_dynamic_trigger_english() {
+    let _guard = DYNAMIC_TRIGGER_LOCK.lock().unwrap();
+    triggers::global_registry().clear_for_tests();
+    triggers::global_cron_registry().clear_for_tests();
+
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage as Arc<dyn SessionStorage>);
+    let mut opts = AgentHarnessOptions::new(faux_model(), session);
+    opts.tools = vec![
+        Arc::new(triggers::NewCronJobTool::new(None)) as Arc<dyn AgentTool>,
+        Arc::new(triggers::NewTriggerTool) as Arc<dyn AgentTool>,
+    ];
+    opts.stream_fn = Some(dynamic_trigger_stream());
+    let harness = AgentHarness::new(opts);
+
+    harness
+        .prompt("Create an hourly scheduled job to check Hacker News")
+        .await
+        .expect("prompt should create cron job");
+
+    let jobs = triggers::global_cron_registry().list();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].schedule, "0 * * * *");
+    assert!(
+        triggers::global_registry().list().is_empty(),
+        "scheduled job must not create a dynamic trigger"
     );
 }
 

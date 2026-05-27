@@ -25,6 +25,11 @@ pub fn trigger_sidecar_path(session_path: &std::path::Path) -> PathBuf {
     session_path.with_extension("triggers.json")
 }
 
+/// Cron jobs are session-scoped by default, parallel to dynamic trigger sidecars.
+pub fn cron_sidecar_path(session_path: &std::path::Path) -> PathBuf {
+    session_path.with_extension("cron.toml")
+}
+
 /// Return the dynamic-trigger sidecar for a live session.
 ///
 /// Jsonl sessions record their absolute transcript path in metadata. Older or synthetic
@@ -43,6 +48,23 @@ pub async fn trigger_sidecar_path_for_session(
         .and_then(|v| v.as_str())
         .unwrap_or("unknown-session");
     Ok(repo.root().join(format!("{session_id}.triggers.json")))
+}
+
+/// Return the cron sidecar for a live session.
+pub async fn cron_sidecar_path_for_session(
+    session: &Session,
+    repo: &JsonlSessionRepo,
+) -> Result<PathBuf> {
+    let metadata = session.storage().get_metadata_json().await?;
+    if let Some(path) = metadata.get("path").and_then(|v| v.as_str()) {
+        return Ok(cron_sidecar_path(std::path::Path::new(path)));
+    }
+
+    let session_id = metadata
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown-session");
+    Ok(repo.root().join(format!("{session_id}.cron.toml")))
 }
 
 /// Create a brand-new session under the current cwd's sessions dir.
@@ -142,6 +164,12 @@ pub async fn delete_by_id(repo: &JsonlSessionRepo, id: &str) -> Result<PathBuf> 
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e).with_context(|| format!("delete {}", trigger_sidecar.display())),
+    }
+    let cron_sidecar = cron_sidecar_path(&path);
+    match tokio::fs::remove_file(&cron_sidecar).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("delete {}", cron_sidecar.display())),
     }
     Ok(path)
 }
@@ -284,31 +312,62 @@ mod tests {
             trigger_sidecar_path(path),
             std::path::PathBuf::from("/tmp/session-id.triggers.json")
         );
+        assert_eq!(
+            cron_sidecar_path(path),
+            std::path::PathBuf::from("/tmp/session-id.cron.toml")
+        );
     }
 
     #[tokio::test]
-    async fn trigger_sidecar_path_survives_session_resume() {
+    async fn sidecar_paths_survive_session_resume() {
         let dir = tempdir().unwrap();
         let repo = JsonlSessionRepo::new(dir.path());
         let created = repo.create("/cwd").await.unwrap();
         let metadata = created.storage().get_metadata_json().await.unwrap();
         let session_id = metadata.get("id").and_then(|v| v.as_str()).unwrap();
         let session_path = metadata.get("path").and_then(|v| v.as_str()).unwrap();
-        let expected = trigger_sidecar_path(std::path::Path::new(session_path));
+        let expected_trigger = trigger_sidecar_path(std::path::Path::new(session_path));
+        let expected_cron = cron_sidecar_path(std::path::Path::new(session_path));
 
-        std::fs::write(&expected, "{\"version\":1,\"rules\":[]}").unwrap();
+        std::fs::write(&expected_trigger, "{\"version\":1,\"rules\":[]}").unwrap();
+        std::fs::write(&expected_cron, "[[jobs]]\n").unwrap();
         let resumed = resume(&repo, Some(session_id)).await.unwrap();
 
         assert_eq!(
             trigger_sidecar_path_for_session(&resumed, &repo)
                 .await
                 .unwrap(),
-            expected
+            expected_trigger
+        );
+        assert_eq!(
+            cron_sidecar_path_for_session(&resumed, &repo)
+                .await
+                .unwrap(),
+            expected_cron
         );
     }
 
     #[tokio::test]
-    async fn delete_removes_trigger_sidecar() {
+    async fn cron_sidecar_is_session_specific() {
+        let dir = tempdir().unwrap();
+        let repo = JsonlSessionRepo::new(dir.path());
+        let first = repo.create("/cwd").await.unwrap();
+        let second = repo.create("/cwd").await.unwrap();
+
+        let first_path = cron_sidecar_path_for_session(&first, &repo).await.unwrap();
+        let second_path = cron_sidecar_path_for_session(&second, &repo).await.unwrap();
+
+        assert_ne!(first_path, second_path);
+        std::fs::write(&first_path, "[[jobs]]\n").unwrap();
+        assert!(first_path.exists());
+        assert!(
+            !second_path.exists(),
+            "a new session must not inherit another session's cron sidecar"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_removes_session_sidecars() {
         let dir = tempdir().unwrap();
         let repo = JsonlSessionRepo::new(dir.path());
         let session = repo.create("/cwd").await.unwrap();
@@ -323,12 +382,15 @@ mod tests {
             .to_string();
         let session_path = repo.list().await.unwrap().pop().unwrap();
         let trigger_path = trigger_sidecar_path(&session_path);
+        let cron_path = cron_sidecar_path(&session_path);
         std::fs::write(&trigger_path, "{}").unwrap();
+        std::fs::write(&cron_path, "[[jobs]]\n").unwrap();
 
         let deleted = delete_by_id(&repo, &id).await.unwrap();
 
         assert_eq!(deleted, session_path);
         assert!(!deleted.exists());
         assert!(!trigger_path.exists());
+        assert!(!cron_path.exists());
     }
 }

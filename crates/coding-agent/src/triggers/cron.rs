@@ -12,15 +12,18 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Datelike, Local, Timelike, Utc};
+use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
 use pie_agent_core::{
+    AgentHarness, AgentTool, AgentToolError, AgentToolResult, AgentToolUpdate,
     BeforeTriggerActionContext, BeforeTriggerActionHook, CredentialScope, HarnessEvent,
     HarnessListener, HookError, HookState, NotificationHook, NotificationHookStatus,
-    PayloadVisibility, PromoteAction, ReplacementPolicy, SourceKind, Trigger, TriggerAction,
-    TriggerAuthority, TriggerDelivery, TriggerSink, TriggerSource,
+    PayloadVisibility, PromoteAction, ReplacementPolicy, SourceKind, ToolExecutionMode, Trigger,
+    TriggerAction, TriggerAuthority, TriggerDelivery, TriggerSink, TriggerSource,
 };
+use pie_ai::{Tool, UserContentBlock};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::time::{Duration, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -287,6 +290,93 @@ fn clear_stale_running_state(jobs: &mut [CronJob]) -> bool {
 pub fn global_cron_registry() -> &'static CronRegistry {
     static CELL: once_cell::sync::OnceCell<CronRegistry> = once_cell::sync::OnceCell::new();
     CELL.get_or_init(CronRegistry::new)
+}
+
+type HarnessCell = Arc<OnceCell<Arc<AgentHarness>>>;
+
+pub struct NewCronJobTool {
+    harness: Option<HarnessCell>,
+}
+
+impl NewCronJobTool {
+    pub fn new(harness: Option<HarnessCell>) -> Self {
+        Self { harness }
+    }
+}
+
+#[async_trait]
+impl AgentTool for NewCronJobTool {
+    fn definition(&self) -> &Tool {
+        &NEW_CRON_JOB_TOOL
+    }
+
+    fn label(&self) -> &str {
+        "NewCronJob"
+    }
+
+    fn execution_mode(&self) -> Option<ToolExecutionMode> {
+        Some(ToolExecutionMode::Sequential)
+    }
+
+    async fn execute(
+        &self,
+        _id: &str,
+        params: Value,
+        _cancel: CancellationToken,
+        _on_update: Option<AgentToolUpdate>,
+    ) -> Result<AgentToolResult, AgentToolError> {
+        let schedule = params
+            .get("schedule")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AgentToolError::from("missing required arg: schedule"))?;
+        let schedule = normalize_schedule(schedule)?;
+        let action = params
+            .get("action")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AgentToolError::from("missing required arg: action"))?;
+        let job = global_cron_registry()
+            .add_job(&schedule, action)
+            .map_err(|e| AgentToolError::Message(e.to_string()))?;
+
+        let mut audit_entry_id = None;
+        if let Some(harness) = self.harness.as_ref().and_then(|cell| cell.get()) {
+            let audit = cron_control_plane_audit("add", "tool", None, Some(&job));
+            match harness
+                .session()
+                .append_custom("cron_control_plane", Some(audit))
+                .await
+            {
+                Ok(id) => audit_entry_id = Some(id),
+                Err(e) => {
+                    tracing::warn!(
+                        op = "add",
+                        actor = "tool",
+                        job_id = %job.id,
+                        error = %e,
+                        "cron_control_plane audit write failed; tool cron change itself succeeded"
+                    );
+                }
+            }
+        }
+
+        Ok(AgentToolResult {
+            content: vec![UserContentBlock::text(format!(
+                "created cron job {}\nschedule: {}\naction: {}",
+                job.id,
+                job.schedule,
+                preview_redacted(&job.action, MAX_ACTION_PREVIEW_CHARS)
+            ))],
+            details: json!({
+                "id": job.id,
+                "schedule": job.schedule,
+                "action": job.action,
+                "enabled": job.enabled,
+                "scope": "session",
+                "audit_entry_id": audit_entry_id,
+            }),
+            terminate: None,
+        })
+    }
 }
 
 pub struct CronNotificationHook {
@@ -605,6 +695,61 @@ fn parse_number(field: &str, raw: &str, min: u32, max: u32) -> Result<u32, CronS
     Ok(value)
 }
 
+fn normalize_schedule(input: &str) -> Result<String, AgentToolError> {
+    let trimmed = input.trim();
+    if CronExpression::parse(trimmed).is_ok() {
+        return Ok(trimmed.to_string());
+    }
+
+    let normalized = trimmed.to_lowercase();
+    let alias = match normalized.as_str() {
+        "hourly" | "every hour" | "once an hour" => Some("0 * * * *"),
+        "daily" | "every day" | "once a day" => Some("0 9 * * *"),
+        "weekly" | "every week" | "once a week" => Some("0 9 * * 1"),
+        _ => {
+            if trimmed.contains("每小时") || trimmed.contains("每個小時") {
+                Some("0 * * * *")
+            } else if trimmed.contains("每天") || trimmed.contains("每日") {
+                Some("0 9 * * *")
+            } else if trimmed.contains("每周") || trimmed.contains("每週") {
+                Some("0 9 * * 1")
+            } else {
+                None
+            }
+        }
+    };
+    alias.map(str::to_string).ok_or_else(|| {
+        AgentToolError::Message(
+            "invalid schedule: provide a 5-field cron expression, or a supported alias such as hourly / every hour / 每小时"
+                .into(),
+        )
+    })
+}
+
+pub fn cron_control_plane_audit(
+    op: &str,
+    actor: &str,
+    before: Option<&CronJob>,
+    after: Option<&CronJob>,
+) -> Value {
+    let job = after.or(before);
+    let now = Utc::now();
+    json!({
+        "op": op,
+        "actor": actor,
+        "job_id": job.map(|job| job.id.as_str()),
+        "schedule": job.map(|job| job.schedule.as_str()),
+        "action_preview": job.map(|job| preview_redacted(&job.action, MAX_ACTION_PREVIEW_CHARS)),
+        "before_enabled": before.map(|job| job.enabled),
+        "after_enabled": after.map(|job| job.enabled),
+        "next_run": after
+            .filter(|job| job.enabled)
+            .and_then(|job| job.next_run_after(now))
+            .map(|dt| dt.to_rfc3339()),
+        "removed": before.is_some() && after.is_none(),
+    })
+}
+
 fn preview_redacted(input: &str, max_chars: usize) -> String {
     preview(&crate::bug_report::redact(input), max_chars)
 }
@@ -620,6 +765,30 @@ fn preview(input: &str, max_chars: usize) -> String {
     }
     out
 }
+
+static NEW_CRON_JOB_TOOL: once_cell::sync::Lazy<Tool> = once_cell::sync::Lazy::new(|| Tool {
+    name: "NewCronJob".into(),
+    description: "Create a session-scoped cron scheduled job. Use this when the user asks for a \
+         fixed time, recurring, scheduled, hourly, daily, weekly, crontab, 定时任务, 每小时, \
+         每天, or similar time-based job. Do not use NewTrigger for these scheduled jobs. \
+         Cron jobs are scoped to the current chat session by default."
+        .into(),
+    parameters: json!({
+        "type": "object",
+        "properties": {
+            "schedule": {
+                "type": "string",
+                "description": "A 5-field cron expression in local time (minute hour day-of-month month day-of-week), or a supported alias such as hourly / every hour / 每小时."
+            },
+            "action": {
+                "type": "string",
+                "description": "Natural-language instruction to run when the schedule is due."
+            }
+        },
+        "required": ["schedule", "action"],
+        "additionalProperties": false,
+    }),
+});
 
 #[cfg(test)]
 mod tests {

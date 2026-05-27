@@ -1205,7 +1205,7 @@ impl App {
         }
 
         lines.push(Line::raw(""));
-        lines.push(panel_line("Cron".to_string(), Color::Cyan, width));
+        lines.push(panel_line("Cron (session)".to_string(), Color::Cyan, width));
         if cron_jobs.is_empty() {
             lines.push(panel_line("none".to_string(), Color::DarkGray, width));
         } else {
@@ -2033,7 +2033,10 @@ mod tests {
         let text = buffer_text(terminal.backend().buffer());
 
         assert!(text.contains("Automation"), "panel title missing:\n{text}");
-        assert!(text.contains("Cron"), "cron section missing:\n{text}");
+        assert!(
+            text.contains("Cron (session)"),
+            "cron scope label missing:\n{text}"
+        );
         assert!(
             text.contains("enabled 1 · disabled 0"),
             "cron count summary missing:\n{text}"
