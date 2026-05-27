@@ -106,7 +106,7 @@ struct Cli {
     builtin_skill: Vec<String>,
 
     /// Poll interval for local dynamic trigger checks, in seconds. Defaults to
-    /// `[triggers] poll_interval_secs` from `~/.pie/config.toml`, or 60 when unset.
+    /// `[triggers] poll_interval_secs` from `~/.pie/config.toml`, or 600 when unset.
     #[arg(long = "trigger-poll-secs", value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..))]
     trigger_poll_secs: Option<u64>,
 
@@ -921,5 +921,33 @@ mod tests {
 
         cli.provider = Some("ds4".into());
         validate_base_url_override(&cli).unwrap();
+    }
+
+    #[tokio::test]
+    async fn trigger_poll_interval_defaults_to_ten_minutes_and_allows_overrides() {
+        let temp = tempfile::tempdir().unwrap();
+        let base_dir = temp.path();
+
+        let (default_secs, diagnostic) = read_trigger_poll_interval_secs(base_dir, None).await;
+        assert_eq!(
+            default_secs,
+            crate::triggers::dynamic::DEFAULT_DYNAMIC_TRIGGER_POLL_INTERVAL_SECS
+        );
+        assert_eq!(default_secs, 600);
+        assert!(diagnostic.is_none());
+
+        tokio::fs::write(
+            base_dir.join("config.toml"),
+            "[triggers]\npoll_interval_secs = 60\n",
+        )
+        .await
+        .unwrap();
+        let (config_secs, diagnostic) = read_trigger_poll_interval_secs(base_dir, None).await;
+        assert_eq!(config_secs, 60);
+        assert!(diagnostic.is_none());
+
+        let (cli_secs, diagnostic) = read_trigger_poll_interval_secs(base_dir, Some(15)).await;
+        assert_eq!(cli_secs, 15);
+        assert!(diagnostic.is_none());
     }
 }

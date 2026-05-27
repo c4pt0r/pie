@@ -190,18 +190,18 @@ records. If you explicitly ask for the result to be visible to future turns, the
 created with `promote_to_chat=true` and successful trigger output is inserted into the main
 chat context with a `[Trigger ...]` prefix.
 
-Local dynamic checks poll every 60 seconds by default, and only emit checks while at least
+Local dynamic checks poll every 10 minutes by default, and only emit checks while at least
 one enabled dynamic rule exists. Configure the interval in `~/.pie/config.toml`:
 
 ```toml
 [triggers]
-poll_interval_secs = 60
+poll_interval_secs = 600
 ```
 
 For one run, override it with:
 
 ```bash
-./target/release/pie --trigger-poll-secs 10
+./target/release/pie --trigger-poll-secs 60
 ```
 
 MCP notifications are treated as trigger sources too: a configured MCP server can push an
