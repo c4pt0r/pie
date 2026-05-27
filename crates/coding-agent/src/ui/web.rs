@@ -26,7 +26,6 @@ const SNAPSHOT_LINE_LIMIT: usize = 200;
 pub struct WebOptions {
     pub host: String,
     pub port: u16,
-    pub allow_remote: bool,
 }
 
 #[derive(Clone)]
@@ -336,10 +335,8 @@ fn bind_addr(options: &WebOptions) -> Result<SocketAddr> {
             .parse::<IpAddr>()
             .with_context(|| format!("parse --web-host `{host}` as an IP address"))?,
     };
-    if !ip.is_loopback() && !options.allow_remote {
-        bail!(
-            "refusing non-loopback web bind {ip}; pass --web-allow-remote only on a trusted network"
-        );
+    if !ip.is_loopback() {
+        bail!("refusing non-loopback web bind {ip}; Web UI is loopback-only");
     }
     Ok(SocketAddr::new(ip, options.port))
 }
@@ -448,7 +445,6 @@ mod tests {
         let err = bind_addr(&WebOptions {
             host: "0.0.0.0".into(),
             port: 0,
-            allow_remote: false,
         })
         .unwrap_err()
         .to_string();
@@ -460,7 +456,6 @@ mod tests {
         let local = bind_addr(&WebOptions {
             host: "127.0.0.1".into(),
             port: 0,
-            allow_remote: false,
         })
         .unwrap();
         assert!(local.ip().is_loopback());
@@ -468,21 +463,9 @@ mod tests {
         let named = bind_addr(&WebOptions {
             host: "localhost".into(),
             port: 0,
-            allow_remote: false,
         })
         .unwrap();
         assert!(named.ip().is_loopback());
-    }
-
-    #[test]
-    fn bind_addr_accepts_remote_only_with_flag() {
-        let addr = bind_addr(&WebOptions {
-            host: "0.0.0.0".into(),
-            port: 7777,
-            allow_remote: true,
-        })
-        .unwrap();
-        assert_eq!(addr.port(), 7777);
     }
 
     #[test]

@@ -82,7 +82,7 @@ history.
 ## Security and transport
 
 - `pie web` must bind to loopback by default.
-- Remote bind without an explicit token/auth story is a release blocker.
+- Non-loopback bind is not supported until there is an explicit token/auth story.
 - SSE/state endpoints send incremental or bounded compact snapshots, not repeated full transcripts.
 - API keys, auth-store values, base64 images, raw local trigger payloads, and raw oversized tool
   payloads must never be exposed over Web UI events.

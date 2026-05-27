@@ -117,15 +117,12 @@ struct Cli {
     /// Run the local browser UI instead of the terminal UI. Defaults to loopback-only.
     #[arg(long)]
     web: bool,
-    /// Host for `--web`. Non-loopback hosts require `--web-allow-remote`.
+    /// Host for `--web`. Must be a loopback address.
     #[arg(long = "web-host", default_value = "127.0.0.1", value_name = "HOST")]
     web_host: String,
     /// Port for `--web`; use 0 to bind a random free port.
     #[arg(long = "web-port", default_value_t = 0, value_name = "PORT")]
     web_port: u16,
-    /// Allow `--web-host` to bind non-loopback interfaces. Intended only for trusted networks.
-    #[arg(long = "web-allow-remote")]
-    web_allow_remote: bool,
 }
 
 #[tokio::main]
@@ -642,7 +639,6 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
         app.run_web(ui::web::WebOptions {
             host: cli.web_host.clone(),
             port: cli.web_port,
-            allow_remote: cli.web_allow_remote,
         })
         .await
     } else {
@@ -911,7 +907,6 @@ mod tests {
             web: false,
             web_host: "127.0.0.1".into(),
             web_port: 0,
-            web_allow_remote: false,
         };
         let err = validate_base_url_override(&cli).unwrap_err().to_string();
         assert!(
