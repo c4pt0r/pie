@@ -298,7 +298,29 @@ pub struct NewCronJobTool {
     harness: Option<HarnessCell>,
 }
 
+pub struct ListCronJobsTool;
+
+pub struct RemoveCronJobTool {
+    harness: Option<HarnessCell>,
+}
+
+pub struct SetCronJobStateTool {
+    harness: Option<HarnessCell>,
+}
+
 impl NewCronJobTool {
+    pub fn new(harness: Option<HarnessCell>) -> Self {
+        Self { harness }
+    }
+}
+
+impl RemoveCronJobTool {
+    pub fn new(harness: Option<HarnessCell>) -> Self {
+        Self { harness }
+    }
+}
+
+impl SetCronJobStateTool {
     pub fn new(harness: Option<HarnessCell>) -> Self {
         Self { harness }
     }
@@ -338,26 +360,8 @@ impl AgentTool for NewCronJobTool {
             .add_job(&schedule, action)
             .map_err(|e| AgentToolError::Message(e.to_string()))?;
 
-        let mut audit_entry_id = None;
-        if let Some(harness) = self.harness.as_ref().and_then(|cell| cell.get()) {
-            let audit = cron_control_plane_audit("add", "tool", None, Some(&job));
-            match harness
-                .session()
-                .append_custom("cron_control_plane", Some(audit))
-                .await
-            {
-                Ok(id) => audit_entry_id = Some(id),
-                Err(e) => {
-                    tracing::warn!(
-                        op = "add",
-                        actor = "tool",
-                        job_id = %job.id,
-                        error = %e,
-                        "cron_control_plane audit write failed; tool cron change itself succeeded"
-                    );
-                }
-            }
-        }
+        let audit_entry_id =
+            write_tool_cron_control_audit(&self.harness, "add", None, Some(&job)).await;
 
         Ok(AgentToolResult {
             content: vec![UserContentBlock::text(format!(
@@ -370,6 +374,202 @@ impl AgentTool for NewCronJobTool {
                 "id": job.id,
                 "schedule": job.schedule,
                 "action": job.action,
+                "enabled": job.enabled,
+                "scope": "session",
+                "audit_entry_id": audit_entry_id,
+            }),
+            terminate: None,
+        })
+    }
+}
+
+#[async_trait]
+impl AgentTool for ListCronJobsTool {
+    fn definition(&self) -> &Tool {
+        &LIST_CRON_JOBS_TOOL
+    }
+
+    fn label(&self) -> &str {
+        "ListCronJobs"
+    }
+
+    fn execution_mode(&self) -> Option<ToolExecutionMode> {
+        Some(ToolExecutionMode::Parallel)
+    }
+
+    async fn execute(
+        &self,
+        _id: &str,
+        _params: Value,
+        _cancel: CancellationToken,
+        _on_update: Option<AgentToolUpdate>,
+    ) -> Result<AgentToolResult, AgentToolError> {
+        let jobs = global_cron_registry().list();
+        let storage_path = global_cron_registry()
+            .storage_path()
+            .map(|path| path.display().to_string());
+        Ok(AgentToolResult {
+            content: vec![UserContentBlock::text(render_cron_jobs_for_tool(&jobs))],
+            details: json!({
+                "count": jobs.len(),
+                "scope": "session",
+                "storage_path": storage_path,
+                "jobs": jobs.iter().map(cron_job_details_for_model).collect::<Vec<_>>(),
+            }),
+            terminate: None,
+        })
+    }
+}
+
+#[async_trait]
+impl AgentTool for RemoveCronJobTool {
+    fn definition(&self) -> &Tool {
+        &REMOVE_CRON_JOB_TOOL
+    }
+
+    fn label(&self) -> &str {
+        "RemoveCronJob"
+    }
+
+    fn execution_mode(&self) -> Option<ToolExecutionMode> {
+        Some(ToolExecutionMode::Sequential)
+    }
+
+    async fn execute(
+        &self,
+        _id: &str,
+        params: Value,
+        _cancel: CancellationToken,
+        _on_update: Option<AgentToolUpdate>,
+    ) -> Result<AgentToolResult, AgentToolError> {
+        let id = params
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AgentToolError::from("missing required arg: id"))?;
+        let job = global_cron_registry()
+            .list()
+            .into_iter()
+            .find(|job| job.id == id);
+        let Some(job) = job else {
+            return Err(AgentToolError::Message(format!(
+                "no cron job with id '{id}'"
+            )));
+        };
+        let confirm = params
+            .get("confirm")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !confirm {
+            return Ok(AgentToolResult {
+                content: vec![UserContentBlock::text(format!(
+                    "remove cron job {} requires confirmation\nschedule: {}\naction: {}\ncall RemoveCronJob again with confirm=true only after the user confirms",
+                    job.id,
+                    job.schedule,
+                    preview_redacted(&job.action, MAX_ACTION_PREVIEW_CHARS)
+                ))],
+                details: json!({
+                    "id": job.id,
+                    "removed_count": 0,
+                    "confirmation_required": true,
+                    "scope": "session",
+                    "action_preview": preview_redacted(&job.action, MAX_ACTION_PREVIEW_CHARS),
+                }),
+                terminate: None,
+            });
+        }
+
+        let removed = global_cron_registry()
+            .remove_job(id)
+            .map_err(|e| AgentToolError::Message(e.to_string()))?;
+        let Some(job) = removed else {
+            return Err(AgentToolError::Message(format!(
+                "no cron job with id '{id}'"
+            )));
+        };
+
+        let audit_entry_id =
+            write_tool_cron_control_audit(&self.harness, "remove", Some(&job), None).await;
+        Ok(AgentToolResult {
+            content: vec![UserContentBlock::text(format!(
+                "removed cron job {}\nschedule: {}\naction: {}",
+                job.id,
+                job.schedule,
+                preview_redacted(&job.action, MAX_ACTION_PREVIEW_CHARS)
+            ))],
+            details: json!({
+                "id": job.id,
+                "removed_count": 1,
+                "scope": "session",
+                "audit_entry_id": audit_entry_id,
+            }),
+            terminate: None,
+        })
+    }
+}
+
+#[async_trait]
+impl AgentTool for SetCronJobStateTool {
+    fn definition(&self) -> &Tool {
+        &SET_CRON_JOB_STATE_TOOL
+    }
+
+    fn label(&self) -> &str {
+        "SetCronJobState"
+    }
+
+    fn execution_mode(&self) -> Option<ToolExecutionMode> {
+        Some(ToolExecutionMode::Sequential)
+    }
+
+    async fn execute(
+        &self,
+        _id: &str,
+        params: Value,
+        _cancel: CancellationToken,
+        _on_update: Option<AgentToolUpdate>,
+    ) -> Result<AgentToolResult, AgentToolError> {
+        let id = params
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AgentToolError::from("missing required arg: id"))?;
+        let enabled = params
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .ok_or_else(|| AgentToolError::from("missing required arg: enabled"))?;
+        if enabled {
+            return Err(AgentToolError::Message(
+                "enabling cron jobs from model-facing tools requires user confirmation; use /cron enable <id>"
+                    .into(),
+            ));
+        }
+        let before = global_cron_registry()
+            .list()
+            .into_iter()
+            .find(|job| job.id == id);
+        let updated = global_cron_registry()
+            .set_job_enabled(id, enabled)
+            .map_err(|e| AgentToolError::Message(e.to_string()))?;
+        let Some(job) = updated else {
+            return Err(AgentToolError::Message(format!(
+                "no cron job with id '{id}'"
+            )));
+        };
+
+        let op = if enabled { "enable" } else { "disable" };
+        let audit_entry_id =
+            write_tool_cron_control_audit(&self.harness, op, before.as_ref(), Some(&job)).await;
+        let state = if job.enabled { "enabled" } else { "disabled" };
+        Ok(AgentToolResult {
+            content: vec![UserContentBlock::text(format!(
+                "updated cron job {}\nstate: {}\nschedule: {}\naction: {}",
+                job.id,
+                state,
+                job.schedule,
+                preview_redacted(&job.action, MAX_ACTION_PREVIEW_CHARS)
+            ))],
+            details: json!({
+                "id": job.id,
+                "schedule": job.schedule,
                 "enabled": job.enabled,
                 "scope": "session",
                 "audit_entry_id": audit_entry_id,
@@ -750,6 +950,103 @@ pub fn cron_control_plane_audit(
     })
 }
 
+async fn write_tool_cron_control_audit(
+    harness: &Option<HarnessCell>,
+    op: &str,
+    before: Option<&CronJob>,
+    after: Option<&CronJob>,
+) -> Option<String> {
+    let harness = harness.as_ref().and_then(|cell| cell.get())?;
+    let audit = cron_control_plane_audit(op, "tool", before, after);
+    match harness
+        .session()
+        .append_custom("cron_control_plane", Some(audit))
+        .await
+    {
+        Ok(id) => Some(id),
+        Err(e) => {
+            let job = after.or(before);
+            tracing::warn!(
+                op,
+                actor = "tool",
+                job_id = job.map(|job| job.id.as_str()),
+                error = %e,
+                "cron_control_plane audit write failed; tool cron change itself succeeded"
+            );
+            None
+        }
+    }
+}
+
+fn render_cron_jobs_for_tool(jobs: &[CronJob]) -> String {
+    if jobs.is_empty() {
+        return "session cron jobs: none".into();
+    }
+
+    let now = Utc::now();
+    let mut lines = vec![format!("session cron jobs: {}", jobs.len())];
+    for job in jobs {
+        let state = if job.enabled { "enabled" } else { "disabled" };
+        lines.push(format!(
+            "- {} [{}] schedule: {} action: {}",
+            job.id,
+            state,
+            job.schedule,
+            preview_redacted(&job.action, MAX_ACTION_PREVIEW_CHARS)
+        ));
+        if let Some(next_run) = job
+            .enabled
+            .then(|| job.next_run_after(now))
+            .flatten()
+            .map(|dt| dt.to_rfc3339())
+        {
+            lines.push(format!("  next_run: {next_run}"));
+        }
+        if let Some(trace_id) = &job.running_trace_id {
+            lines.push(format!("  running_trace_id: {trace_id}"));
+        }
+        if let Some(last_error) = &job.last_error {
+            lines.push(format!(
+                "  last_error: {}",
+                preview_redacted(last_error, MAX_ACTION_PREVIEW_CHARS)
+            ));
+        }
+        if job.skipped_overlap_count > 0 {
+            lines.push(format!(
+                "  skipped_overlap_count: {}",
+                job.skipped_overlap_count
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
+fn cron_job_details_for_model(job: &CronJob) -> Value {
+    let now = Utc::now();
+    json!({
+        "id": job.id,
+        "schedule": job.schedule,
+        "action_preview": preview_redacted(&job.action, MAX_ACTION_PREVIEW_CHARS),
+        "enabled": job.enabled,
+        "scope": "session",
+        "running_trace_id": job.running_trace_id,
+        "last_due_at": job.last_due_at.map(|dt| dt.to_rfc3339()),
+        "last_fired_at": job.last_fired_at.map(|dt| dt.to_rfc3339()),
+        "last_completed_at": job.last_completed_at.map(|dt| dt.to_rfc3339()),
+        "last_error": job
+            .last_error
+            .as_ref()
+            .map(|err| preview_redacted(err, MAX_ACTION_PREVIEW_CHARS)),
+        "skipped_overlap_count": job.skipped_overlap_count,
+        "next_run": job
+            .enabled
+            .then(|| job.next_run_after(now))
+            .flatten()
+            .map(|dt| dt.to_rfc3339()),
+        "created_at": job.created_at.to_rfc3339(),
+    })
+}
+
 fn preview_redacted(input: &str, max_chars: usize) -> String {
     preview(&crate::bug_report::redact(input), max_chars)
 }
@@ -786,6 +1083,66 @@ static NEW_CRON_JOB_TOOL: once_cell::sync::Lazy<Tool> = once_cell::sync::Lazy::n
             }
         },
         "required": ["schedule", "action"],
+        "additionalProperties": false,
+    }),
+});
+
+static LIST_CRON_JOBS_TOOL: once_cell::sync::Lazy<Tool> = once_cell::sync::Lazy::new(|| Tool {
+    name: "ListCronJobs".into(),
+    description: "List the session-scoped cron scheduled jobs. Use this when the user asks to \
+         view, list, inspect, or find scheduled jobs, cron jobs, crontab entries, 定时任务, \
+         or recurring jobs."
+        .into(),
+    parameters: json!({
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false,
+    }),
+});
+
+static REMOVE_CRON_JOB_TOOL: once_cell::sync::Lazy<Tool> = once_cell::sync::Lazy::new(|| Tool {
+    name: "RemoveCronJob".into(),
+    description: "Preview or confirm removal of a session-scoped cron scheduled job by exact id. \
+         Use confirm=false first when the user asks to delete, remove, or clear a scheduled job, \
+         cron job, crontab entry, or 定时任务. Call confirm=true only after the user explicitly \
+         confirms removal."
+        .into(),
+    parameters: json!({
+        "type": "object",
+        "properties": {
+            "id": {
+                "type": "string",
+                "description": "Exact cron job id, for example cron-abc123."
+            },
+            "confirm": {
+                "type": "boolean",
+                "description": "false to preview the removal; true only after explicit user confirmation."
+            }
+        },
+        "required": ["id"],
+        "additionalProperties": false,
+    }),
+});
+
+static SET_CRON_JOB_STATE_TOOL: once_cell::sync::Lazy<Tool> = once_cell::sync::Lazy::new(|| Tool {
+    name: "SetCronJobState".into(),
+    description: "Disable a session-scoped cron scheduled job by exact id. Model-facing \
+             enable/resume is refused until control-plane confirmation is wired; use \
+             /cron enable <id> for enabling."
+        .into(),
+    parameters: json!({
+        "type": "object",
+        "properties": {
+            "id": {
+                "type": "string",
+                "description": "Exact cron job id, for example cron-abc123."
+            },
+            "enabled": {
+                "type": "boolean",
+                "description": "true to enable/resume the cron job; false to disable/pause it."
+            }
+        },
+        "required": ["id", "enabled"],
         "additionalProperties": false,
     }),
 });

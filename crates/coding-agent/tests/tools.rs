@@ -230,6 +230,140 @@ async fn new_cron_job_tool_registers_session_cron_job() {
     assert!(text.contains("created cron job"));
 }
 
+#[test]
+fn cron_management_tool_builders_expose_expected_catalog_names() {
+    let cell: tools::skill::SkillHarnessCell = Arc::new(once_cell::sync::OnceCell::new());
+    let new = tools::new_cron_job_tool(cell.clone());
+    let list = tools::list_cron_jobs_tool();
+    let remove = tools::remove_cron_job_tool(cell.clone());
+    let state = tools::set_cron_job_state_tool(cell);
+    let names = [
+        new.definition().name.as_str(),
+        list.definition().name.as_str(),
+        remove.definition().name.as_str(),
+        state.definition().name.as_str(),
+    ];
+    assert_eq!(
+        names,
+        [
+            "NewCronJob",
+            "ListCronJobs",
+            "RemoveCronJob",
+            "SetCronJobState"
+        ]
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn list_cron_jobs_tool_returns_redacted_session_jobs() {
+    let _guard = CRON_LOCK.lock().unwrap();
+    triggers::global_cron_registry().clear_for_tests();
+    let secret = "Bearer sk-cron-secret-token";
+    let job = triggers::global_cron_registry()
+        .add_job("0 * * * *", &format!("fetch Hacker News with {secret}"))
+        .unwrap();
+
+    let tool = tools::list_cron_jobs_tool();
+    let result = tool
+        .execute(
+            "list-cron-1",
+            serde_json::json!({}),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("tool should list cron jobs");
+
+    let text = match &result.content[0] {
+        pie_ai::UserContentBlock::Text(t) => t.text.clone(),
+        _ => panic!("expected text"),
+    };
+    assert!(text.contains("session cron jobs: 1"));
+    assert!(text.contains(&job.id));
+    assert!(!text.contains(secret));
+    assert_eq!(result.details["scope"], "session");
+    assert_eq!(result.details["jobs"][0]["id"], job.id);
+    assert!(result.details["jobs"][0].get("action").is_none());
+    assert!(!result.details.to_string().contains(secret));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn remove_cron_job_tool_removes_session_job() {
+    let _guard = CRON_LOCK.lock().unwrap();
+    triggers::global_cron_registry().clear_for_tests();
+    let job = triggers::global_cron_registry()
+        .add_job("0 * * * *", "Check the Hacker News front page")
+        .unwrap();
+
+    let tool = triggers::RemoveCronJobTool::new(None);
+    let preview = tool
+        .execute(
+            "preview-remove-cron-1",
+            serde_json::json!({ "id": job.id }),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("tool should preview cron job removal");
+    assert_eq!(preview.details["confirmation_required"], true);
+    assert_eq!(triggers::global_cron_registry().list().len(), 1);
+
+    let result = tool
+        .execute(
+            "remove-cron-1",
+            serde_json::json!({ "id": job.id, "confirm": true }),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("tool should remove cron job");
+
+    assert!(triggers::global_cron_registry().list().is_empty());
+    assert_eq!(result.details["removed_count"], 1);
+    let text = match &result.content[0] {
+        pie_ai::UserContentBlock::Text(t) => t.text.clone(),
+        _ => panic!("expected text"),
+    };
+    assert!(text.contains("removed cron job"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn set_cron_job_state_tool_disables_and_fails_closed_on_enable() {
+    let _guard = CRON_LOCK.lock().unwrap();
+    triggers::global_cron_registry().clear_for_tests();
+    let job = triggers::global_cron_registry()
+        .add_job("0 * * * *", "Check the Hacker News front page")
+        .unwrap();
+    let tool = triggers::SetCronJobStateTool::new(None);
+
+    let disabled = tool
+        .execute(
+            "disable-cron-1",
+            serde_json::json!({ "id": job.id, "enabled": false }),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("tool should disable cron job");
+    assert_eq!(disabled.details["enabled"], false);
+    assert!(!triggers::global_cron_registry().list()[0].enabled);
+
+    let enable_err = tool
+        .execute(
+            "enable-cron-1",
+            serde_json::json!({ "id": job.id, "enabled": true }),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect_err("model-facing enable should fail closed");
+    assert!(
+        format!("{enable_err}").contains("/cron enable"),
+        "enable error should point at slash confirmation path: {enable_err}"
+    );
+    assert!(!triggers::global_cron_registry().list()[0].enabled);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn new_trigger_tool_can_request_chat_promotion() {
     let _guard = DYNAMIC_TRIGGER_LOCK.lock().unwrap();

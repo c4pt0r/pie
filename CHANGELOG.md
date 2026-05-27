@@ -59,6 +59,11 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
   never writes a user-global cron file. The default dynamic-trigger poll interval is now
   10 minutes (`600s`) instead of 1 minute; `--trigger-poll-secs` and
   `[triggers] poll_interval_secs` still override it.
+- Model-facing cron management now includes `ListCronJobs`, `RemoveCronJob`, and
+  `SetCronJobState` alongside `NewCronJob`. Listing returns bounded/redacted session
+  previews, disable writes the shared `cron_control_plane` audit, remove is two-phase
+  preview/confirm, and enable/resume fails closed to `/cron enable <id>` until the
+  control-plane confirmation path is wired.
 - Interactive TUI prompts can now be queued while a turn is already running. Enter during
   an active agent turn appends the next user prompt or agent-running slash command to a FIFO
   queue, the status bar shows the queued count, queued previews are redacted/truncated for

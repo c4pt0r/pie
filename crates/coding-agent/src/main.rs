@@ -304,6 +304,9 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
     // overlay entry + reloads; builtin/project skills are refused (disable instead).
     tools.push(tools::remove_skill_tool(skill_harness_cell.clone()));
     tools.push(tools::new_cron_job_tool(skill_harness_cell.clone()));
+    tools.push(tools::list_cron_jobs_tool());
+    tools.push(tools::remove_cron_job_tool(skill_harness_cell.clone()));
+    tools.push(tools::set_cron_job_state_tool(skill_harness_cell.clone()));
     tools.push(tools::new_trigger_tool());
     tools.push(tools::list_triggers_tool());
     tools.push(tools::remove_trigger_tool());
@@ -773,6 +776,10 @@ fn render_base_prompt(tool_names: &[String]) -> String {
         "You are pie-coding-agent, a minimal coding assistant running in a terminal. \
 You have access to the following tools: {inventory}. \
 Prefer running a tool over guessing. When making file changes, read the file first to confirm the exact current contents, then edit or write. Keep responses concise. \
+When the user asks for a fixed time, recurring, scheduled, hourly, daily, weekly, crontab, 定时任务, 每小时, or similar time-based job, call NewCronJob instead of NewTrigger. \
+When the user asks to view, list, show, inspect, or find scheduled jobs or cron job ids, call ListCronJobs. \
+When the user asks to pause or disable a scheduled job or cron job, call SetCronJobState with enabled=false; enabling/resuming should point the user to /cron enable <id> until confirmation support is wired. \
+When the user asks to delete, remove, or clear scheduled jobs or cron jobs, call RemoveCronJob first with confirm=false to preview, then only call confirm=true after explicit user confirmation. \
 When the user asks to create a trigger, reminder, watcher, or automation, call NewTrigger and extract a natural-language condition and action from their request. Dynamic triggers fire once by default; set fire_once=false only when the user explicitly asks for a repeating trigger. Trigger output is shown in the TUI and audit by default; set promote_to_chat=true only when the user explicitly asks for trigger results to enter the main chat context or be visible to future turns. \
 When the user asks to view, list, show, inspect, or find trigger ids, call ListTriggers. \
 When the user asks to pause, disable, enable, or resume a dynamic trigger, call SetTriggerState. \
