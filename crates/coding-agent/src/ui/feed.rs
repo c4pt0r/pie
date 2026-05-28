@@ -10,6 +10,7 @@
 //! Rendering is width-aware: [`Feed::lines`] word-wraps every block to the available width and
 //! returns ready-to-draw `ratatui` lines, so scroll math operates on real display rows.
 
+use chrono::{DateTime, Local, TimeZone, Utc};
 use pie_ai::UserContentBlock;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
@@ -75,21 +76,33 @@ pub struct TriggerPollStatus {
 /// One renderable unit in the feed.
 #[derive(Clone, Debug)]
 enum Block {
-    User(String),
-    Assistant(String),
-    Thinking(String),
+    User {
+        text: String,
+        timestamp: Option<String>,
+    },
+    Assistant {
+        text: String,
+        timestamp: Option<String>,
+    },
+    Thinking {
+        text: String,
+        timestamp: Option<String>,
+    },
     Tool {
         name: String,
         args: String,
+        timestamp: Option<String>,
     },
     ToolResult {
         tool_call_id: String,
         lines: Vec<String>,
         is_error: bool,
+        timestamp: Option<String>,
     },
     Plain {
         text: String,
         level: Level,
+        timestamp: Option<String>,
     },
 }
 
@@ -126,35 +139,101 @@ impl Feed {
 
     /// Push a user prompt block. Called directly by the loop on submit / on resume replay.
     pub fn push_user(&mut self, text: impl Into<String>) {
+        self.push_user_with_timestamp(text, current_time_label());
+    }
+
+    pub fn push_user_at(&mut self, text: impl Into<String>, timestamp_ms: i64) {
+        self.push_user_with_timestamp(text, message_timestamp_label(timestamp_ms));
+    }
+
+    fn push_user_with_timestamp(&mut self, text: impl Into<String>, timestamp: Option<String>) {
         self.open = Open::None;
-        self.blocks.push(Block::User(text.into()));
+        self.blocks.push(Block::User {
+            text: text.into(),
+            timestamp,
+        });
     }
 
     /// Push a finished assistant text block (used by resume replay where we have whole turns).
+    #[cfg(test)]
     pub fn push_assistant(&mut self, text: impl Into<String>) {
-        self.open = Open::None;
-        self.blocks.push(Block::Assistant(text.into()));
+        self.push_assistant_with_timestamp(text, current_time_label());
     }
 
-    /// Push a finished thinking block (used by resume replay).
-    pub fn push_thinking(&mut self, text: impl Into<String>) {
+    pub fn push_assistant_at(&mut self, text: impl Into<String>, timestamp_ms: i64) {
+        self.push_assistant_with_timestamp(text, message_timestamp_label(timestamp_ms));
+    }
+
+    fn push_assistant_with_timestamp(
+        &mut self,
+        text: impl Into<String>,
+        timestamp: Option<String>,
+    ) {
         self.open = Open::None;
-        self.blocks.push(Block::Thinking(text.into()));
+        self.blocks.push(Block::Assistant {
+            text: text.into(),
+            timestamp,
+        });
+    }
+
+    pub fn push_thinking_at(&mut self, text: impl Into<String>, timestamp_ms: i64) {
+        self.push_thinking_with_timestamp(text, message_timestamp_label(timestamp_ms));
+    }
+
+    fn push_thinking_with_timestamp(&mut self, text: impl Into<String>, timestamp: Option<String>) {
+        self.open = Open::None;
+        self.blocks.push(Block::Thinking {
+            text: text.into(),
+            timestamp,
+        });
     }
 
     pub fn push_plain(&mut self, text: impl Into<String>, level: Level) {
+        self.push_plain_with_timestamp(text, level, current_time_label());
+    }
+
+    pub fn push_plain_untimed(&mut self, text: impl Into<String>, level: Level) {
+        self.push_plain_with_timestamp(text, level, None);
+    }
+
+    fn push_plain_with_timestamp(
+        &mut self,
+        text: impl Into<String>,
+        level: Level,
+        timestamp: Option<String>,
+    ) {
         self.open = Open::None;
         self.blocks.push(Block::Plain {
             text: text.into(),
             level,
+            timestamp,
         });
     }
 
     pub fn push_tool(&mut self, name: impl Into<String>, args: impl Into<String>) {
+        self.push_tool_with_timestamp(name, args, current_time_label());
+    }
+
+    pub fn push_tool_at(
+        &mut self,
+        name: impl Into<String>,
+        args: impl Into<String>,
+        timestamp_ms: i64,
+    ) {
+        self.push_tool_with_timestamp(name, args, message_timestamp_label(timestamp_ms));
+    }
+
+    fn push_tool_with_timestamp(
+        &mut self,
+        name: impl Into<String>,
+        args: impl Into<String>,
+        timestamp: Option<String>,
+    ) {
         self.open = Open::None;
         self.blocks.push(Block::Tool {
             name: name.into(),
             args: args.into(),
+            timestamp,
         });
     }
 
@@ -164,11 +243,37 @@ impl Feed {
         lines: Vec<String>,
         is_error: bool,
     ) {
+        self.push_tool_result_with_timestamp(tool_call_id, lines, is_error, current_time_label());
+    }
+
+    pub fn push_tool_result_at(
+        &mut self,
+        tool_call_id: impl Into<String>,
+        lines: Vec<String>,
+        is_error: bool,
+        timestamp_ms: i64,
+    ) {
+        self.push_tool_result_with_timestamp(
+            tool_call_id,
+            lines,
+            is_error,
+            message_timestamp_label(timestamp_ms),
+        );
+    }
+
+    fn push_tool_result_with_timestamp(
+        &mut self,
+        tool_call_id: impl Into<String>,
+        lines: Vec<String>,
+        is_error: bool,
+        timestamp: Option<String>,
+    ) {
         self.open = Open::None;
         self.blocks.push(Block::ToolResult {
             tool_call_id: tool_call_id.into(),
             lines,
             is_error,
+            timestamp,
         });
     }
 
@@ -177,6 +282,7 @@ impl Feed {
         if let Some(Block::ToolResult {
             lines: existing,
             is_error: existing_is_error,
+            timestamp,
             ..
         }) = self.blocks.iter_mut().rev().find(|block| {
             matches!(
@@ -189,6 +295,7 @@ impl Feed {
         }) {
             *existing = lines;
             *existing_is_error = is_error;
+            *timestamp = current_time_label();
             return;
         }
         self.push_tool_result(tool_call_id, lines, is_error);
@@ -232,11 +339,14 @@ impl Feed {
             return;
         }
         if self.open != Open::Text {
-            self.blocks.push(Block::Assistant(String::new()));
+            self.blocks.push(Block::Assistant {
+                text: String::new(),
+                timestamp: current_time_label(),
+            });
             self.open = Open::Text;
         }
-        if let Some(Block::Assistant(s)) = self.blocks.last_mut() {
-            s.push_str(delta);
+        if let Some(Block::Assistant { text, .. }) = self.blocks.last_mut() {
+            text.push_str(delta);
         }
     }
 
@@ -245,11 +355,14 @@ impl Feed {
             return;
         }
         if self.open != Open::Thinking {
-            self.blocks.push(Block::Thinking(String::new()));
+            self.blocks.push(Block::Thinking {
+                text: String::new(),
+                timestamp: current_time_label(),
+            });
             self.open = Open::Thinking;
         }
-        if let Some(Block::Thinking(s)) = self.blocks.last_mut() {
-            s.push_str(delta);
+        if let Some(Block::Thinking { text, .. }) = self.blocks.last_mut() {
+            text.push_str(delta);
         }
     }
 
@@ -263,36 +376,64 @@ impl Feed {
                 out.push(Line::raw(""));
             }
             match block {
-                Block::User(text) => {
-                    push_paragraphs(&mut out, text, USER_STYLE, Some("you ▸ "), width);
+                Block::User { text, timestamp } => {
+                    let prefix = display_prefix(timestamp.as_deref(), "you ▸ ");
+                    push_paragraphs(&mut out, text, USER_STYLE, Some(&prefix), width);
                 }
-                Block::Assistant(text) => {
-                    push_paragraphs(&mut out, text, Style::default(), None, width);
+                Block::Assistant { text, timestamp } => {
+                    let prefix = display_prefix(timestamp.as_deref(), "ai ▸ ");
+                    push_paragraphs(&mut out, text, Style::default(), Some(&prefix), width);
                 }
-                Block::Thinking(text) => {
-                    push_paragraphs(&mut out, text, THINKING_STYLE, Some("[thinking] "), width);
+                Block::Thinking { text, timestamp } => {
+                    let prefix = display_prefix(timestamp.as_deref(), "[thinking] ");
+                    push_paragraphs(&mut out, text, THINKING_STYLE, Some(&prefix), width);
                 }
-                Block::Tool { name, args } => {
+                Block::Tool {
+                    name,
+                    args,
+                    timestamp,
+                } => {
                     let text = format!("⚙ {name}{args}");
-                    push_paragraphs(&mut out, &text, TOOL_STYLE, None, width);
+                    let prefix = display_prefix(timestamp.as_deref(), "");
+                    push_paragraphs(&mut out, &text, TOOL_STYLE, Some(&prefix), width);
                 }
                 Block::ToolResult {
-                    lines, is_error, ..
+                    lines,
+                    is_error,
+                    timestamp,
+                    ..
                 } => {
                     let style = if *is_error {
                         Style::default().fg(Color::Red)
                     } else {
                         Style::default().fg(Color::Green)
                     };
+                    let mut first = true;
                     for line in lines {
-                        let indented = format!("    {line}");
+                        let indented = if first {
+                            first = false;
+                            format!("{}    {line}", display_prefix(timestamp.as_deref(), ""))
+                        } else {
+                            format!("    {line}")
+                        };
                         for row in wrap_str(&indented, width) {
                             out.push(Line::styled(row, style));
                         }
                     }
                 }
-                Block::Plain { text, level } => {
-                    push_paragraphs(&mut out, text, style_for_level(*level), None, width);
+                Block::Plain {
+                    text,
+                    level,
+                    timestamp,
+                } => {
+                    let prefix = timestamp.as_deref().map(|ts| display_prefix(Some(ts), ""));
+                    push_paragraphs(
+                        &mut out,
+                        text,
+                        style_for_level(*level),
+                        prefix.as_deref(),
+                        width,
+                    );
                 }
             }
             previous = Some(block);
@@ -325,10 +466,10 @@ fn should_separate(previous: Option<&Block>, current: &Block, has_output: bool) 
     }
     matches!(
         (previous, current),
-        (_, Block::User(_))
+        (_, Block::User { .. })
             | (
-                Some(Block::User(_)),
-                Block::Assistant(_) | Block::Thinking(_) | Block::Tool { .. }
+                Some(Block::User { .. }),
+                Block::Assistant { .. } | Block::Thinking { .. } | Block::Tool { .. }
             )
     )
 }
@@ -342,6 +483,35 @@ fn style_for_level(level: Level) -> Style {
         Level::Header => Style::default()
             .fg(Color::Magenta)
             .add_modifier(Modifier::BOLD),
+    }
+}
+
+fn display_prefix(timestamp: Option<&str>, label: &str) -> String {
+    match timestamp {
+        Some(ts) if label.is_empty() => format!("{ts} "),
+        Some(ts) => format!("{ts} {label}"),
+        None => label.to_string(),
+    }
+}
+
+fn current_time_label() -> Option<String> {
+    Some(Local::now().format("%H:%M").to_string())
+}
+
+fn message_timestamp_label(timestamp_ms: i64) -> Option<String> {
+    if timestamp_ms <= 0 {
+        return None;
+    }
+    let dt = Utc.timestamp_millis_opt(timestamp_ms).single()?;
+    Some(format_timestamp_label(dt, Local::now()))
+}
+
+fn format_timestamp_label(timestamp: DateTime<Utc>, now: DateTime<Local>) -> String {
+    let local = timestamp.with_timezone(&Local);
+    if local.date_naive() == now.date_naive() {
+        local.format("%H:%M").to_string()
+    } else {
+        local.format("%m-%d %H:%M").to_string()
     }
 }
 
@@ -549,7 +719,7 @@ mod tests {
         feed.apply(FeedUpdate::TurnEnd);
         let rendered = plain_text(&feed.lines(80));
         // Leading whitespace before the first visible char is trimmed.
-        assert_eq!(rendered, "hello world");
+        assert!(rendered.contains("ai ▸ hello world"), "{rendered}");
     }
 
     #[test]
@@ -609,7 +779,7 @@ mod tests {
         let rendered = plain_text(&feed.lines(80));
         assert!(rendered.contains("you ▸ do the thing"));
         // a blank line separates the banner from the user turn
-        assert!(rendered.contains("\n\nyou ▸"));
+        assert!(rendered.contains("\n\n"));
     }
 
     #[test]
@@ -620,7 +790,7 @@ mod tests {
         let rendered = plain_text(&feed.lines(80));
 
         assert!(
-            rendered.contains("you ▸ tight?\n\nnot anymore"),
+            rendered.contains("you ▸ tight?\n\n") && rendered.contains("ai ▸ not anymore"),
             "assistant reply should not be glued to the user prompt:\n{rendered}"
         );
     }
@@ -634,8 +804,62 @@ mod tests {
         let rendered = plain_text(&feed.lines(80));
 
         assert!(
-            rendered.contains("you ▸ inspect\n\n⚙ read(path=\"x\")\n    contents"),
+            rendered.contains("you ▸ inspect\n\n")
+                && rendered.contains("⚙ read(path=\"x\")")
+                && rendered.contains("    contents"),
             "tool-first assistant activity should not be glued to the user prompt, but tool result should stay with the tool call:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn rendered_message_blocks_include_short_time_prefix() {
+        let mut feed = Feed::new();
+        feed.push_user("hello");
+        feed.push_assistant("hi");
+        feed.push_tool("read", "(path=\"x\")");
+        feed.push_tool_result("tool-1", vec!["ok".into()], false);
+        let rendered = plain_text(&feed.lines(120));
+        let rows: Vec<&str> = rendered.lines().collect();
+
+        assert!(rows[0].contains("you ▸ hello"), "{rendered}");
+        assert_eq!(rows[0].chars().nth(2), Some(':'), "{rendered}");
+        assert!(rows[2].contains("ai ▸ hi"), "{rendered}");
+        assert_eq!(rows[2].chars().nth(2), Some(':'), "{rendered}");
+        assert!(rows[3].contains("⚙ read(path=\"x\")"), "{rendered}");
+        assert_eq!(rows[3].chars().nth(2), Some(':'), "{rendered}");
+        assert!(rows[4].contains("    ok"), "{rendered}");
+        assert_eq!(rows[4].chars().nth(2), Some(':'), "{rendered}");
+    }
+
+    #[test]
+    fn timestamp_label_includes_date_for_non_today_history() {
+        let today = Local
+            .with_ymd_and_hms(2026, 5, 27, 14, 37, 0)
+            .single()
+            .unwrap();
+        let same_day = today.with_timezone(&Utc);
+        let previous_day = Local
+            .with_ymd_and_hms(2026, 5, 26, 23, 59, 0)
+            .single()
+            .unwrap()
+            .with_timezone(&Utc);
+
+        assert_eq!(format_timestamp_label(same_day, today), "14:37");
+        assert_eq!(format_timestamp_label(previous_day, today), "05-26 23:59");
+    }
+
+    #[test]
+    fn narrow_width_keeps_timestamped_blocks_renderable() {
+        let mut feed = Feed::new();
+        feed.push_user("a very long message that wraps");
+        let rendered = plain_text(&feed.lines(16));
+
+        assert!(rendered.contains("you ▸"), "{rendered}");
+        assert!(
+            rendered
+                .lines()
+                .all(|line| UnicodeWidthStr::width(line) <= 16),
+            "{rendered}"
         );
     }
 

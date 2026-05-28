@@ -491,8 +491,19 @@ mod tests {
 
         let lines = bounded_feed_lines(&feed, SNAPSHOT_LINE_LIMIT);
         assert_eq!(lines.len(), SNAPSHOT_LINE_LIMIT);
-        assert_eq!(lines.first().map(String::as_str), Some("line 50"));
-        assert_eq!(lines.last().map(String::as_str), Some("line 249"));
+        assert!(
+            lines.first().is_some_and(|line| line.contains("line 50")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.last().is_some_and(|line| line.contains("line 249")),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines.first().and_then(|line| line.chars().nth(2)),
+            Some(':'),
+            "{lines:?}"
+        );
     }
 
     #[tokio::test]

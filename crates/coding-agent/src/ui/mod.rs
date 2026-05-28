@@ -191,15 +191,15 @@ impl App {
         tools: &[String],
     ) {
         self.feed
-            .push_plain("──────── pie-coding-agent ────────", Level::Header);
-        self.feed.push_plain(
+            .push_plain_untimed("──────── pie-coding-agent ────────", Level::Header);
+        self.feed.push_plain_untimed(
             format!(
                 "model:   {} ({}/{})",
                 model.name, model.provider.0, model.id
             ),
             Level::Output,
         );
-        self.feed.push_plain(
+        self.feed.push_plain_untimed(
             format!(
                 "session: {session_id}{}",
                 if resumed { "  [resumed]" } else { "" }
@@ -212,8 +212,8 @@ impl App {
             tools.join(", ")
         };
         self.feed
-            .push_plain(format!("tools:   {tools}"), Level::Output);
-        self.feed.push_plain(
+            .push_plain_untimed(format!("tools:   {tools}"), Level::Output);
+        self.feed.push_plain_untimed(
             "Enter send · Ctrl-V paste text/images · Ctrl-C abort/exit · /help",
             Level::System,
         );
@@ -255,26 +255,32 @@ impl App {
                         .collect::<Vec<_>>()
                         .join("\n"),
                 };
-                self.feed.push_user(text);
+                self.feed.push_user_at(text, u.timestamp);
             }
             AgentMessage::Llm(Message::Assistant(a)) => {
                 for b in &a.content {
                     match b {
-                        ContentBlock::Text(t) => self.feed.push_assistant(t.text.clone()),
-                        ContentBlock::Thinking(t) => self.feed.push_thinking(t.thinking.clone()),
-                        ContentBlock::ToolCall(tc) => self.feed.push_tool(
+                        ContentBlock::Text(t) => {
+                            self.feed.push_assistant_at(t.text.clone(), a.timestamp)
+                        }
+                        ContentBlock::Thinking(t) => {
+                            self.feed.push_thinking_at(t.thinking.clone(), a.timestamp)
+                        }
+                        ContentBlock::ToolCall(tc) => self.feed.push_tool_at(
                             tc.name.clone(),
                             feed::preview(&serde_json::Value::Object(tc.arguments.clone())),
+                            a.timestamp,
                         ),
                         ContentBlock::Image(_) => {}
                     }
                 }
             }
             AgentMessage::Llm(Message::ToolResult(tr)) => {
-                self.feed.push_tool_result(
+                self.feed.push_tool_result_at(
                     tr.tool_call_id.clone(),
                     feed::compact_tool_content_blocks(&tr.content, tr.is_error),
                     tr.is_error,
+                    tr.timestamp,
                 );
             }
             AgentMessage::Custom(_) => {}
@@ -1748,8 +1754,14 @@ mod tests {
             text.contains("you ▸ hello world"),
             "feed user line missing:\n{text}"
         );
+        let user_row = text.lines().find(|line| line.contains("you ▸ hello world"));
+        assert_eq!(
+            user_row.and_then(|line| line.chars().nth(2)),
+            Some(':'),
+            "feed user line should include a short timestamp prefix:\n{text}"
+        );
         assert!(
-            text.contains("hi there, the box is pinned"),
+            text.contains("ai ▸ hi there, the box is pinned"),
             "assistant line missing:\n{text}"
         );
         // The status rule (separator above the input) carries the model + ready state.
@@ -2367,5 +2379,48 @@ mod tests {
             !rendered.contains("line 25"),
             "middle of long tool output should be hidden in replay display:\n{rendered}"
         );
+    }
+
+    #[test]
+    fn replayed_messages_render_with_message_timestamps() {
+        let mut app = test_app();
+        let timestamp = chrono::Utc::now().timestamp_millis();
+        app.replay_message(&AgentMessage::Llm(Message::User(pie_ai::UserMessage {
+            role: pie_ai::UserRole::User,
+            content: UserContent::Text("historical question".into()),
+            timestamp,
+        })));
+        app.replay_message(&AgentMessage::Llm(Message::Assistant(
+            pie_ai::AssistantMessage {
+                role: pie_ai::AssistantRole::Assistant,
+                content: vec![ContentBlock::Text(pie_ai::TextContent {
+                    text: "historical answer".into(),
+                    ..Default::default()
+                })],
+                api: pie_ai::Api::from("faux"),
+                provider: pie_ai::Provider::from("faux"),
+                model: "faux".into(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
+                usage: pie_ai::Usage::default(),
+                stop_reason: pie_ai::StopReason::Stop,
+                error_message: None,
+                timestamp,
+            },
+        )));
+
+        let rendered = feed_lines_text(&app.feed.lines(120));
+        let user_row = rendered
+            .lines()
+            .find(|line| line.contains("you ▸ historical question"))
+            .expect("user row");
+        let assistant_row = rendered
+            .lines()
+            .find(|line| line.contains("ai ▸ historical answer"))
+            .expect("assistant row");
+
+        assert_eq!(user_row.chars().nth(2), Some(':'), "{rendered}");
+        assert_eq!(assistant_row.chars().nth(2), Some(':'), "{rendered}");
     }
 }
