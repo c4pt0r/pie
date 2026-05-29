@@ -15,6 +15,10 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
   `/logout`, `/find`, `/history`.
 - **#25 PR B** `/skill <name>` attaches an already-loaded skill to the next prompt, and
   `/skills` now shows source and `disable_model_invocation` status without printing skill bodies.
+- Loaded, enabled skills now expose dynamic slash shortcuts such as `/db9 [prompt]`.
+  The shortcut runs the prompt with that skill attached, `/db9` without text attaches it to
+  the next turn, and builtin name conflicts or disabled skills stay hidden from help and
+  completion while showing only bounded skill metadata in the feed.
 - **#32** Optional bundled `karpathy-guidelines` built-in skill. Off by default; enable
   per-run with `--builtin-skill karpathy-guidelines` or persistently via
   `~/.pie/config.toml` `[builtin_skills] enabled = ["karpathy-guidelines"]`. CLI and config

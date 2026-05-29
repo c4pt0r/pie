@@ -748,7 +748,11 @@ impl SlashCommand for SkillCommand {
                 "skill '{name}' is disabled (disable_model_invocation=true); edit the skill frontmatter to enable it"
             ));
         }
-        cprintln!("attached skill: {name} for next turn");
+        cprintln!(
+            "using skill: {} ({}) for next turn",
+            skill.name,
+            skill.source.label()
+        );
         CommandOutcome::AttachSkill { name: name.clone() }
     }
 }
@@ -918,23 +922,33 @@ impl SlashCommand for ThinkingCommand {
     }
 }
 
+#[allow(dead_code)]
 pub fn print_help(registry: &Registry, topic: Option<&str>) {
-    emit_multiline(&help_text(registry, topic));
+    emit_multiline(&help_text_with_skills(registry, topic, &[]));
 }
 
+pub fn print_help_with_skills(registry: &Registry, topic: Option<&str>, skills: &[Skill]) {
+    emit_multiline(&help_text_with_skills(registry, topic, skills));
+}
+
+#[allow(dead_code)]
 fn help_text(registry: &Registry, topic: Option<&str>) -> String {
+    help_text_with_skills(registry, topic, &[])
+}
+
+fn help_text_with_skills(registry: &Registry, topic: Option<&str>, skills: &[Skill]) -> String {
     let Some(topic) = topic.map(str::trim).filter(|topic| !topic.is_empty()) else {
-        return general_help_text(registry);
+        return general_help_text(registry, skills);
     };
     let topic = topic.trim_start_matches('/');
     if topic == "models" {
         return model_catalog_text(None).unwrap_or_else(|e| e);
     }
 
-    command_help_text(registry, topic)
+    command_help_text(registry, topic, skills)
 }
 
-fn general_help_text(registry: &Registry) -> String {
+fn general_help_text(registry: &Registry, skills: &[Skill]) -> String {
     let mut lines = vec![String::new(), "Commands:".into()];
     for cmd in registry.commands() {
         let aliases = if cmd.aliases().is_empty() {
@@ -955,6 +969,24 @@ fn general_help_text(registry: &Registry) -> String {
             aliases
         ));
     }
+    let shortcuts = skill_shortcuts(skills, registry);
+    if !shortcuts.is_empty() {
+        lines.push(String::new());
+        lines.push("Skill commands:".into());
+        for shortcut in shortcuts {
+            let description = if shortcut.description.is_empty() {
+                String::new()
+            } else {
+                format!(" — {}", shortcut.description)
+            };
+            lines.push(format!(
+                "  {} [prompt]    use loaded skill ({}){}",
+                shortcut.command,
+                shortcut.source.label(),
+                description
+            ));
+        }
+    }
     lines.push(String::new());
     lines.push("Models:".into());
     for line in model_help_summary_lines() {
@@ -966,13 +998,34 @@ fn general_help_text(registry: &Registry) -> String {
     lines.join("\n")
 }
 
-fn command_help_text(registry: &Registry, topic: &str) -> String {
+fn command_help_text(registry: &Registry, topic: &str, skills: &[Skill]) -> String {
     let Some(cmd) = registry.find(topic) else {
+        if let Ok(Some(skill)) = resolve_skill_shortcut(skills, registry, topic) {
+            let mut lines = vec![
+                format!("/{topic} [prompt]"),
+                format!(
+                    "  use loaded skill '{}' ({})",
+                    skill.name,
+                    skill.source.label()
+                ),
+            ];
+            if !skill.description.is_empty() {
+                lines.push(format!("  {}", preview_text(&skill.description, 120)));
+            }
+            lines.push(format!("  equivalent: /skill {}", skill.name));
+            return lines.join("\n");
+        }
         let suggestions = registry
             .commands()
             .iter()
             .filter(|cmd| cmd.name().starts_with(topic) || cmd.aliases().contains(&topic))
             .map(|cmd| format!("/{}", cmd.name()))
+            .chain(
+                skill_shortcuts(skills, registry)
+                    .into_iter()
+                    .filter(|shortcut| shortcut.command[1..].starts_with(topic))
+                    .map(|shortcut| shortcut.command),
+            )
             .take(5)
             .collect::<Vec<_>>();
         let suggestion = if suggestions.is_empty() {
@@ -2433,6 +2486,92 @@ fn preview_text(text: &str, max_chars: usize) -> String {
     preview.replace('\n', " ")
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkillShortcut {
+    pub command: String,
+    pub source: SkillSource,
+    pub description: String,
+}
+
+pub fn skill_shortcuts(skills: &[Skill], registry: &Registry) -> Vec<SkillShortcut> {
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for skill in skills
+        .iter()
+        .filter(|skill| !skill.disable_model_invocation)
+    {
+        *counts.entry(skill.name.as_str()).or_default() += 1;
+    }
+    let mut shortcuts = skills
+        .iter()
+        .filter(|skill| !skill.disable_model_invocation)
+        .filter(|skill| counts.get(skill.name.as_str()) == Some(&1))
+        .filter(|skill| registry.find(&skill.name).is_none())
+        .map(|skill| SkillShortcut {
+            command: format!("/{}", skill.name),
+            source: skill.source,
+            description: preview_text(&skill.description, 72),
+        })
+        .collect::<Vec<_>>();
+    shortcuts.sort_by(|a, b| a.command.cmp(&b.command));
+    shortcuts
+}
+
+fn resolve_skill_shortcut<'a>(
+    skills: &'a [Skill],
+    registry: &Registry,
+    name: &str,
+) -> Result<Option<&'a Skill>, String> {
+    if registry.find(name).is_some() {
+        return Ok(None);
+    }
+    let matching = skills
+        .iter()
+        .filter(|skill| skill.name == name)
+        .collect::<Vec<_>>();
+    if matching.is_empty() {
+        return Ok(None);
+    }
+    let enabled = matching
+        .iter()
+        .copied()
+        .filter(|skill| !skill.disable_model_invocation)
+        .collect::<Vec<_>>();
+    match enabled.as_slice() {
+        [skill] => Ok(Some(*skill)),
+        [] => Err(format!(
+            "skill '{name}' is disabled; run /skills enable {name} [source] or /skills to list loaded skills"
+        )),
+        _ => Err(format!(
+            "multiple enabled skills named '{name}'; use /skill {name} after resolving the source with /skills show {name} [source]"
+        )),
+    }
+}
+
+fn run_skill_shortcut(
+    name: &str,
+    argv: &[String],
+    registry: &Registry,
+    ctx: &CommandCtx<'_>,
+) -> Option<CommandOutcome> {
+    match resolve_skill_shortcut(&ctx.harness.skills(), registry, name) {
+        Ok(Some(skill)) => {
+            cprintln!("using skill: {} ({})", skill.name, skill.source.label());
+            if argv.is_empty() {
+                Some(CommandOutcome::AttachSkill {
+                    name: skill.name.clone(),
+                })
+            } else {
+                Some(CommandOutcome::RunAgentPrompt {
+                    prompt: attach_skill_prompt(argv.join(" "), Some(&skill.name)),
+                    error_context: "skill command failed: ",
+                })
+            }
+        }
+        Ok(None) => None,
+        Err(e) => Some(CommandOutcome::Error(e)),
+    }
+}
+
 pub async fn dispatch(input: &str, registry: &Registry, ctx: &CommandCtx<'_>) -> CommandOutcome {
     let (name, argv) = match parse(input) {
         Some(parts) => parts,
@@ -2440,11 +2579,17 @@ pub async fn dispatch(input: &str, registry: &Registry, ctx: &CommandCtx<'_>) ->
     };
     // Special-case `/help`: the handler can't see the registry, so we render here.
     if name == "help" {
-        print_help(registry, argv.first().map(String::as_str));
+        print_help_with_skills(
+            registry,
+            argv.first().map(String::as_str),
+            &ctx.harness.skills(),
+        );
         return CommandOutcome::Handled;
     }
     let Some(cmd) = registry.find(&name) else {
-        return CommandOutcome::Error(format!("unknown command: /{name} (try /help)"));
+        return run_skill_shortcut(&name, &argv, registry, ctx).unwrap_or_else(|| {
+            CommandOutcome::Error(format!("unknown command: /{name} (try /help)"))
+        });
     };
     cmd.run(&argv, ctx).await
 }

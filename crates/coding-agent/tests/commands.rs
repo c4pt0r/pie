@@ -325,6 +325,137 @@ async fn dispatch_unknown_command_returns_error_outcome() {
 }
 
 #[tokio::test]
+async fn dynamic_skill_slash_command_attaches_skill_without_body_echo() {
+    let _guard = COMMAND_OUTPUT_LOCK.lock().unwrap();
+    let _capture = OutputCapture::install();
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage as Arc<dyn SessionStorage>);
+    let mut opts = AgentHarnessOptions::new(faux_model(), session);
+    opts.skills = vec![skill("db9", "SECRET SKILL BODY", false)];
+    let harness = Arc::new(AgentHarness::new(opts));
+
+    let registry = commands::Registry::with_builtins();
+    let cwd = std::env::current_dir().unwrap();
+    let ctx = commands::CommandCtx {
+        harness: &harness,
+        session_id: "test",
+        log_path: None,
+        tool_count: 0,
+        cwd: &cwd,
+    };
+    let outcome = commands::dispatch("/db9", &registry, &ctx).await;
+
+    match outcome {
+        commands::CommandOutcome::AttachSkill { name } => assert_eq!(name, "db9"),
+        other => panic!("expected AttachSkill outcome, got {other:?}"),
+    }
+    let output = _capture.text();
+    assert!(output.contains("using skill: db9 (user)"), "{output}");
+    assert!(!output.contains("SECRET SKILL BODY"), "{output}");
+}
+
+#[tokio::test]
+async fn dynamic_skill_slash_command_with_prompt_runs_skill_wrapped_turn() {
+    let _guard = COMMAND_OUTPUT_LOCK.lock().unwrap();
+    let _capture = OutputCapture::install();
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage as Arc<dyn SessionStorage>);
+    let mut opts = AgentHarnessOptions::new(faux_model(), session);
+    opts.skills = vec![skill("db9", "SECRET SKILL BODY", false)];
+    let harness = Arc::new(AgentHarness::new(opts));
+
+    let registry = commands::Registry::with_builtins();
+    let cwd = std::env::current_dir().unwrap();
+    let ctx = commands::CommandCtx {
+        harness: &harness,
+        session_id: "test",
+        log_path: None,
+        tool_count: 0,
+        cwd: &cwd,
+    };
+    let outcome = commands::dispatch("/db9 create a table", &registry, &ctx).await;
+
+    match outcome {
+        commands::CommandOutcome::RunAgentPrompt { prompt, .. } => {
+            assert!(prompt.contains("Skill tool"));
+            assert!(prompt.contains("db9"));
+            assert!(prompt.contains("create a table"));
+            assert!(!prompt.contains("SECRET SKILL BODY"));
+        }
+        other => panic!("expected RunAgentPrompt outcome, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn dynamic_skill_slash_command_hides_disabled_and_builtin_conflicts() {
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage as Arc<dyn SessionStorage>);
+    let mut opts = AgentHarnessOptions::new(faux_model(), session);
+    opts.skills = vec![
+        skill("disabled-skill", "body", true),
+        skill("help", "conflicting body", false),
+    ];
+    let harness = Arc::new(AgentHarness::new(opts));
+
+    let registry = commands::Registry::with_builtins();
+    let shortcuts = commands::skill_shortcuts(&harness.skills(), &registry);
+    assert!(
+        shortcuts
+            .iter()
+            .all(|shortcut| shortcut.command != "/disabled-skill")
+    );
+    assert!(shortcuts.iter().all(|shortcut| shortcut.command != "/help"));
+
+    let cwd = std::env::current_dir().unwrap();
+    let ctx = commands::CommandCtx {
+        harness: &harness,
+        session_id: "test",
+        log_path: None,
+        tool_count: 0,
+        cwd: &cwd,
+    };
+    let outcome = commands::dispatch("/disabled-skill", &registry, &ctx).await;
+    match outcome {
+        commands::CommandOutcome::Error(msg) => {
+            assert!(msg.contains("/skills enable"), "{msg}");
+        }
+        other => panic!("expected Error outcome, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn help_lists_dynamic_skill_commands_without_body() {
+    let _guard = COMMAND_OUTPUT_LOCK.lock().unwrap();
+    let capture = OutputCapture::install();
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage as Arc<dyn SessionStorage>);
+    let mut opts = AgentHarnessOptions::new(faux_model(), session);
+    opts.skills = vec![
+        skill("db9", "SECRET SKILL BODY", false),
+        skill("hidden-skill", "SECRET HIDDEN BODY", true),
+    ];
+    let harness = Arc::new(AgentHarness::new(opts));
+
+    let registry = commands::Registry::with_builtins();
+    let cwd = std::env::current_dir().unwrap();
+    let ctx = commands::CommandCtx {
+        harness: &harness,
+        session_id: "test",
+        log_path: None,
+        tool_count: 0,
+        cwd: &cwd,
+    };
+    let outcome = commands::dispatch("/help", &registry, &ctx).await;
+
+    assert!(matches!(outcome, commands::CommandOutcome::Handled));
+    let text = capture.text();
+    assert!(text.contains("Skill commands:"), "{text}");
+    assert!(text.contains("/db9 [prompt]"), "{text}");
+    assert!(!text.contains("/hidden-skill"), "{text}");
+    assert!(!text.contains("SECRET"), "{text}");
+}
+
+#[tokio::test]
 async fn dispatch_triggers_status_is_read_only_and_available() {
     // Serialize with the other trigger tests: they share the process-global rule registry, so
     // an unlocked `clear_for_tests()` here can wipe another test's rule mid-run.

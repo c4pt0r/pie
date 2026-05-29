@@ -5,7 +5,8 @@
 //! input line it returns the slash commands whose names share the typed prefix. The app renders
 //! those as a completion popup above the input and cycles/accepts them on Tab.
 
-use crate::commands::Registry;
+use crate::commands::{Registry, skill_shortcuts};
+use pie_agent_core::Skill;
 
 /// Precomputed, sorted, de-duplicated list of `/command` strings (canonical names + aliases).
 #[derive(Clone, Debug, Default)]
@@ -14,7 +15,12 @@ pub struct SlashCompleter {
 }
 
 impl SlashCompleter {
+    #[allow(dead_code)]
     pub fn from_registry(registry: &Registry) -> Self {
+        Self::from_registry_and_skills(registry, &[])
+    }
+
+    pub fn from_registry_and_skills(registry: &Registry, skills: &[Skill]) -> Self {
         let mut commands = Vec::new();
         for command in registry.commands() {
             commands.push(format!("/{}", command.name()));
@@ -22,6 +28,11 @@ impl SlashCompleter {
                 commands.push(format!("/{alias}"));
             }
         }
+        commands.extend(
+            skill_shortcuts(skills, registry)
+                .into_iter()
+                .map(|shortcut| shortcut.command),
+        );
         commands.sort();
         commands.dedup();
         Self { commands }
@@ -65,6 +76,17 @@ fn slash_token(line: &str) -> Option<&str> {
 mod tests {
     use super::*;
 
+    fn skill(name: &str, disabled: bool) -> Skill {
+        Skill {
+            name: name.into(),
+            description: format!("description for {name}"),
+            file_path: format!("/tmp/{name}/SKILL.md"),
+            content: "SECRET SKILL BODY".into(),
+            disable_model_invocation: disabled,
+            source: pie_agent_core::SkillSource::User,
+        }
+    }
+
     fn completer() -> SlashCompleter {
         SlashCompleter::from_registry(&Registry::with_builtins())
     }
@@ -93,5 +115,27 @@ mod tests {
     fn exact_unique_match_is_not_offered() {
         // Already fully typed and unique — nothing left to complete.
         assert!(completer().matches("/thinking").is_empty());
+    }
+
+    #[test]
+    fn includes_enabled_skill_commands_and_hides_disabled_or_conflicting() {
+        let registry = Registry::with_builtins();
+        let completer = SlashCompleter::from_registry_and_skills(
+            &registry,
+            &[
+                skill("db9", false),
+                skill("hidden-skill", true),
+                skill("help", false),
+            ],
+        );
+
+        let m = completer.matches("/d");
+        assert!(m.contains(&"/db9".to_string()));
+        assert!(
+            !completer
+                .matches("/hidden")
+                .contains(&"/hidden-skill".to_string())
+        );
+        assert!(!completer.matches("/help").contains(&"/help".to_string()));
     }
 }

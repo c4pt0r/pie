@@ -146,7 +146,8 @@ pub struct App {
 
 impl App {
     pub fn new(config: AppConfig) -> Self {
-        let completer = SlashCompleter::from_registry(&config.registry);
+        let completer =
+            SlashCompleter::from_registry_and_skills(&config.registry, &config.harness.skills());
         Self {
             kernel: ReplKernel::new(config.harness, config.retry),
             registry: config.registry,
@@ -885,6 +886,10 @@ impl App {
     }
 
     fn refresh_completions(&mut self) {
+        self.completer = SlashCompleter::from_registry_and_skills(
+            &self.registry,
+            &self.kernel.harness().skills(),
+        );
         self.completions = if self.input_is_single_line() {
             self.completer.matches(&self.input_text())
         } else {
@@ -2082,6 +2087,24 @@ mod tests {
         assert_eq!(first, options[0]);
         assert_eq!(second, options[1]);
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn tab_completion_includes_hot_loaded_skill_commands() {
+        let mut app = test_app();
+        app.kernel.harness().replace_skills(vec![ui_skill(
+            "db9",
+            pie_agent_core::SkillSource::User,
+            false,
+        )]);
+
+        app.set_input("/d");
+
+        assert!(
+            app.completions.contains(&"/db9".to_string()),
+            "skill command should be offered after hot catalog update: {:?}",
+            app.completions
+        );
     }
 
     #[test]
