@@ -65,6 +65,10 @@ Every sub-issue below MUST address the same five axes in its design write-up bef
 
 - [ ] #16 — Multi-modal IO (image input, terminal image rendering)
 
+### Tier 8 — cross-agent connectivity (RFC)
+
+- [ ] **#18 — RFC: `pie.0xfefe.me` public MCP hub** (RFC / not implementation-ready; see [[18-rfc-fefe-mcp-hub]])
+
 ## Non-goals (explicit)
 
 - No Windows support.

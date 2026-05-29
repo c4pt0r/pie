@@ -1,0 +1,348 @@
+# RFC: pie.0xfefe.me public MCP hub
+
+> Parent: [[00-master]] roadmap.
+> Tier: 4 (framework depth). Extends [[08-mcp-client]] and [[17-harness-expansion]].
+> Status: **draft v0.1 (scaffold)** — NOT implementation-ready. Do not open Worker, `/hub` CLI/TUI, or `~/.pie/mcp.toml` UX PRs against this design until §1, §3, §5 reviewed.
+> Coordinator: @alice
+>
+> Chapter authors:
+> - §1 Architecture overview — @Tools-MCP-Lead + @Runtime-dev-lead (co-author)
+> - §2 Hub MCP protocol surface — @Tools-MCP-Lead
+> - §3 Identity / Auth / Session / Namespace / Agent registry — @Provider-Auth-Lead
+> - §4 Visibility model — @alice (seed draft below)
+> - §5 Notification routing / delivery semantics — @Runtime-dev-lead
+> - §6 Client integration — @Tools-MCP-Lead
+> - §7 Worker implementation + storage model — **TBD**
+> - §8 Deployment / `~/cf_token` boundary / CI / acceptance / release gate — @QA-Release-Lead
+
+## Goal
+
+`pie.0xfefe.me` is a publicly-reachable Cloudflare Worker that exposes an MCP (Model Context Protocol) service. Pie agents — and any other MCP client — connect to it to discover and notify other agents under a per-user namespace.
+
+Ship:
+
+- Public MCP service exposing `register_agent`, `list_agents`, `discover_public_agents`, `send_notification`, and server-pushed notifications to connected agents.
+- Username + password registration establishes a human namespace; each registered agent gets a globally-unique UUID and a namespace-scoped readable handle.
+- Visibility model that decouples discovery from inbox writeability.
+- First-contact gate that reuses the issue #110 `ControlPlaneWrite` user-prompt mechanism — no new prompt protocol.
+- Pie client integration via a new `HttpMcpTransport` in `crates/mcp/` (parallel deliverable, not bound to this hub).
+
+## Non-goals
+
+- **Not a provider credential plane.** `pie.0xfefe.me` does not store, proxy, or know about OpenAI / Anthropic / Deepseek / Bedrock / Vertex credentials. Those continue to live in `~/.pie/auth.json` on the user's machine.
+- **Not a Slack / IRC replacement.** No channels, threads, search, or long-lived chat history beyond what notification idempotency and audit require.
+- **No new runtime hook traits.** Inbound notifications flow through existing `McpNotificationHook` → `Trigger` envelope → `register_notification_hook` pipeline. The hub is just another MCP server from the runtime's point of view.
+- **No Windows support.** macOS + Linux only (matches the master roadmap de-scoping).
+
+## Architecture (overview — §1 expands)
+
+```
+                                  ┌─────────────────────────────┐
+                                  │   pie.0xfefe.me (CF Worker) │
+                                  │   ┌───────────────────────┐ │
+                                  │   │ public MCP service    │ │
+                                  │   │  • register_agent     │ │
+                                  │   │  • list_agents        │ │
+                                  │   │  • send_notification  │ │
+                                  │   │  • SSE push channel   │ │
+                                  │   └───────────────────────┘ │
+                                  │   ┌───────────────────────┐ │
+                                  │   │ admin website         │ │
+                                  │   │  • account / login    │ │
+                                  │   │  • agent registry     │ │
+                                  │   │  • token rotate       │ │
+                                  │   └───────────────────────┘ │
+                                  │   storage: D1 / KV / DO     │
+                                  └─────────────┬───────────────┘
+                                                │ MCP over HTTP (POST + SSE)
+                  ┌─────────────────────────────┼─────────────────────────────┐
+                  │                             │                             │
+        ┌─────────▼────────┐         ┌──────────▼─────────┐         ┌─────────▼────────┐
+        │ pie agent A      │         │ pie agent B        │         │ external agent   │
+        │ HttpMcpTransport │         │ HttpMcpTransport   │         │ (any MCP client) │
+        └──────────────────┘         └────────────────────┘         └──────────────────┘
+```
+
+### Chapter map
+
+| §   | Title                                                          | Owner                                       | Status              |
+| --- | -------------------------------------------------------------- | ------------------------------------------- | ------------------- |
+| 1   | Architecture overview                                          | @Tools-MCP-Lead + @Runtime-dev-lead         | TBD                 |
+| 2   | Hub MCP protocol surface                                       | @Tools-MCP-Lead                             | TBD                 |
+| 3   | Identity / Auth / Session / Namespace / Agent registry         | @Provider-Auth-Lead                         | TBD                 |
+| 4   | Visibility model                                               | @alice                                      | **seed draft below** |
+| 5   | Notification routing / delivery semantics                      | @Runtime-dev-lead                           | TBD                 |
+| 6   | Client integration                                             | @Tools-MCP-Lead                             | TBD                 |
+| 7   | Worker implementation + storage                                | **TBD**                                     | TBD                 |
+| 8   | Deployment / `~/cf_token` / CI / acceptance / release gate     | @QA-Release-Lead                            | TBD                 |
+
+---
+
+## §1 Architecture overview
+
+TBD — @Tools-MCP-Lead (hub MCP service model) + @Runtime-dev-lead (RFC 1 trigger pipeline reuse boundary; envelope contract with §4 / §5).
+
+## §2 Hub MCP protocol surface
+
+TBD — @Tools-MCP-Lead. Tool / resource / notification schemas, error codes, body cap, versioning, `additionalProperties: false` discipline.
+
+## §3 Identity / Auth / Session / Namespace / Agent registry
+
+TBD — @Provider-Auth-Lead.
+
+Scope (per 2026-05-29 discussion):
+
+- Human account: username + password registration, password hashing, session expiry / revocation, rate limit.
+- Agent credential: hub-issued token scoped to `{user_id, namespace, agent_id, permissions}`. Rotatable, revocable, server stores hash + identifier only — never plaintext.
+- Trust scope minimum tuple for `Always` grants: `{receiver_agent_id, sender_agent_id, action_class=notification}`. Any extension to namespace / team scope requires explicit risk write-up + UI copy.
+- `discoverable` controls listing only; `inbox` controls write. Every send path re-authorizes against `inbox` policy — discover result is never an authorization input.
+- MCP errors return recovery hints (re-login, re-register agent, token revoked). Never echo tokens, namespace secrets, internal binding names.
+
+## §4 Visibility model — seed draft (@alice)
+
+Owns the *what* (identity, visibility, trust semantics, profile shape). The *how* (envelope, transport, hooks) lives in §5.
+
+### §4.1 Identity: UUID is the address, handle is the language
+
+**Rule.** Every agent owns an immutable `agent_id` (UUID, server-issued at registration). Every agent additionally picks a human-readable `handle`, unique within its namespace. The wire-level display form is `@handle@namespace`, e.g. `@alice@dongxu`.
+
+**Why.** UUIDs are unspeakable: LLMs that see only UUIDs will hallucinate them, and users will misaddress. But UUIDs are robust against rename, namespace migration, and typosquat. Handles are durable for human and LLM use; UUIDs are durable for the system.
+
+**Application.**
+
+- MCP tool args accept either `agent_id` or `agent_handle`. The hub resolver maps `agent_handle` → `agent_id` at call site. **All authorization, audit, trust, and block decisions key on `agent_id` only.**
+- Listings render `@handle@namespace` plus a short form of `agent_id` for disambiguation against handle reuse and typosquatting.
+- Handle rename does **not** migrate or invalidate trust or block state. A handle is an alias; the trust contract is signed against the immutable `agent_id`. After rename, listings show "previously known as `@oldhandle`" for `last_seen_at + N days`.
+- Namespace-scoped uniqueness: `@alice@dongxu` and `@alice@otheruser` are distinct identities. Same handle within the same namespace is rejected at registration.
+- Handle character set: `[a-z0-9_-]{2,32}` (open question — confirm in review).
+
+### §4.2 Two-axis visibility — do NOT ship `public` / `private` as one switch
+
+**Rule.** Replace the binary with two orthogonal axes.
+
+| Axis           | Values                                          | Meaning                                                    |
+| -------------- | ----------------------------------------------- | ---------------------------------------------------------- |
+| `discoverable` | `public` / `namespace` / `none`                 | Whether this agent appears in `discover_public_agents`.    |
+| `inbox`        | `open` / `namespace` / `invited` / `closed`     | Who is permitted to send notifications to this agent.      |
+
+**Recommended defaults at registration:** `discoverable = public`, `inbox = namespace`.
+
+**Why.** Being visible is not the same as being writable. Coupling them ships a confused product *and* a soft attack surface: any newly-visible agent becomes an immediate spam target. The common operator wish is "anyone can find me; only people I know can ping me," which the single-switch model cannot express.
+
+**Application.**
+
+- `inbox = open` is the dangerous setting. Surface it as a deliberate opt-in in the registration / admin UI; never as a default. (Open question §4.OQ-1: ship `open` in v0 at all?)
+- `inbox = invited` is the trust-list-managed state populated by the first-contact gate (§4.3).
+- `discoverable = none` is hard hide — not listed even in own-namespace `discover` results unless the caller is the owner.
+- **`discoverable` is never an authorization input for send paths.** The hub MUST re-check `inbox` policy on every `send_notification` regardless of how the sender obtained the target's `agent_id`.
+
+### §4.3 First-contact gate — reuse issue #110 user-prompt mechanism
+
+**Rule.** A notification from a sender `agent_id` that is (a) not in the receiver's trust list and (b) originates outside the receiver's namespace does **not** enter `NotificationHook → Trigger` directly. The receiver-side pie client surfaces a user prompt via the issue #110 `ControlPlaneWrite` gate:
+
+```
+@bar@cloudflare-bot wants to send a notification to @alice@dongxu.
+Sender description: "ci-status notifier"
+Capabilities: ["github-status", "deploy-alerts"]
+Choice:  Accept once    Always (notification-only)    Block
+```
+
+- **Accept once** — current notification routes through; sender is NOT added to trust list.
+- **Always** — sender enters the trust list with scope `{sender_agent_id, receiver_agent_id, action_class=notification, namespace?}`. Future notifications route directly.
+- **Block** — sender enters the block list; future attempts silent-drop, no further prompt.
+
+**Why.** Inbox-open without consent is spam. The issue #110 control-plane gate is already in flight for `ControlPlaneWrite` operations (`NewTrigger`, `InstallSkill`, `SetSkillState`, etc.); first-contact is the same shape — an authorization decision the model cannot self-confirm — so reuse the gate semantics rather than invent a new trust UI.
+
+**Application.**
+
+- Implementation lives in `BeforeTriggerHook::Prompt` policy on the runtime side (per @Runtime-dev-lead, §5). No new prompt protocol; no new audit type.
+- Trust list and block list are **receiver-owned**, persisted as `~/.pie/hub-trust.json` (key tuple per @Provider-Auth-Lead). Audited to `SessionTreeEntry::Custom { custom_type: "fefe_trust_decision", … }`. Body holds `{sender_agent_id, receiver_agent_id, decision, scope, at}` — never notification payload.
+- Trust scope is the narrowest useful tuple. **Never global, never "trust the whole namespace," never "trust all MCP tools."** (Per @Provider-Auth-Lead.)
+- `action_class` starts as `notification`. New action classes (e.g. `tool_call`, `data_read`) each get their own gate; granting one does not grant another.
+- Handle rename does not migrate or invalidate trust — keyed on `agent_id`.
+
+### §4.4 Sender profile is product copy, not decoration
+
+**Rule.** Profile fields are the input that other agents' LLMs read when deciding whether to accept a notification or send one. They are the agent's marketplace listing. Treat them like product copy: bounded, structured, no ambiguity, no escape hatches.
+
+**Minimum profile schema (v0).**
+
+| Field           | Type        | Constraint                                                                              |
+| --------------- | ----------- | --------------------------------------------------------------------------------------- |
+| `agent_id`      | UUID        | Server-issued; immutable.                                                               |
+| `handle`        | string      | `[a-z0-9_-]{2,32}`; namespace-unique.                                                   |
+| `namespace`     | string      | Owner's namespace.                                                                      |
+| `display_name`  | string      | ≤ 48 chars; no markdown; no URL.                                                        |
+| `description`   | string      | ≤ 200 chars; plain text; no markdown link; no URL.                                      |
+| `capabilities`  | string[]    | ≤ 8 items; each ≤ 32 chars; lowercase kebab-case; from registered taxonomy (open §4.OQ-2). |
+| `discoverable`  | enum        | Per §4.2. Const-locked enum, description per variant.                                   |
+| `inbox`         | enum        | Per §4.2. Const-locked enum, description per variant.                                   |
+| `created_at`    | timestamp   | Server-issued.                                                                          |
+| `last_seen_at`  | timestamp   | Server-updated on each authenticated request.                                           |
+
+**Why.**
+
+- Vague descriptions ("I'm a helper bot") make the agent useless to discover and easy to spam.
+- Over-claiming descriptions ("can do X, Y, Z with full repo access") trick receiving LLMs into over-trusting and over-routing.
+- Markdown links in `description` are a phishing vector — the receiver LLM may follow the link as the sender's "true identity."
+
+**Application.**
+
+- All enforcement at the hub MCP server's field filter. Reject at registration with a recovery hint, not a technical error code ("description too long — please tighten to 200 chars," not `VALIDATION_ERR field=description`).
+- **Separate listing schema vs detail schema.** `list_agents` returns only the minimal subset `{handle, agent_id, display_name, capabilities, discoverable, inbox}`. The detail view returns more. `list_agents` MUST NOT leak raw registration metadata.
+- Profile updates are control-plane writes — through the same audit channel as `set_my_visibility`. Never bypass.
+- Field naming follows "tool schema = LLM API" discipline (per @Tools-MCP-Lead): snake_case, unambiguous, each field's purpose stated in its JSON-Schema `description` so the listing LLM knows what each field is for. Enums const-locked with per-variant descriptions. `additionalProperties: false` at every level.
+
+### §4 × §5 contract
+
+`§4` owns *what* (identity, visibility, trust semantics, profile shape). `§5` owns *how* (envelope, transport, hooks):
+
+- `TriggerAuthority.principal_id` carries `agent_id` (UUID) — the authorization key.
+- `TriggerAuthority.principal_label` carries `@handle@namespace` — display only.
+- Hub-pushed notifications enter via the `mcp:pie-hub:...` source label namespace.
+- Ack / dedup via `pie_dedup_key`; default `payload_visibility = Local`; ordering not guaranteed.
+- First-contact prompt is `BeforeTriggerHook::Prompt` keyed on `{receiver_agent_id, sender_agent_id, action_class=notification}` — same prompt channel as issue #110.
+
+§4 references this envelope. §4 does **not** redefine envelope shape.
+
+### §4 open questions
+
+| ID         | Question                                                                                         | @alice take                                              |
+| ---------- | ------------------------------------------------------------------------------------------------ | -------------------------------------------------------- |
+| §4.OQ-1    | Ship `inbox = open` in v0, or skip until a concrete use case appears?                            | Skip until concrete reason.                              |
+| §4.OQ-2    | `capabilities` taxonomy: registered enum / free-form / hybrid with `taxonomy?: string` discriminator? | Registered taxonomy from day one; free-form invites SEO-style abuse. |
+| §4.OQ-3    | Trust TTL: do `Always` decisions expire? Block decisions?                                        | 90 days for `Always`, indefinite for `Block`. Re-prompt is cheap; latent over-trust is dangerous. |
+| §4.OQ-4    | `inbox = invited` in v0 or follow-up after `namespace` proves out?                               | Ship in v0; it's how the first-contact gate populates.   |
+| §4.OQ-5    | Handle character set `[a-z0-9_-]{2,32}` — confirm or widen?                                      | Lock at this for v0; widening later is additive.         |
+
+---
+
+## §5 Notification routing / delivery semantics
+
+TBD — @Runtime-dev-lead. Scope per 2026-05-29 commitment:
+
+- Client side: hub MCP server pushes `notifications/...` → `McpNotificationHook` → `Trigger` envelope → existing `register_notification_hook` supervisor. No new hook trait.
+- `TriggerAuthority` fields: `principal_id = agent_id` (UUID), `principal_label = @handle@namespace` (display only).
+- Envelope: source label `mcp:pie-hub:...`, ack / dedup via `pie_dedup_key`, default `payload_visibility = Local`, redelivery / idempotency semantics, offline + reconnect backlog bounds, ordering not guaranteed.
+- Hub-side fan-out / inbox delivery semantics live in §6 / §7; §5 covers the boundary from client receive to `Trigger` conversion.
+
+## §6 Client integration
+
+TBD — @Tools-MCP-Lead. `HttpMcpTransport` (MCP spec 2025-03-26 streamable HTTP — POST for requests, SSE for server-push), `~/.pie/mcp.toml` hub entry shape, `/hub *` CLI / TUI surface, first-contact gate cite to issue #110.
+
+`HttpMcpTransport` is a parallel deliverable independent of hub schema; it benefits any MCP-over-HTTP server.
+
+## §7 Worker implementation + storage model
+
+**Owner: TBD.** EdHuang to nominate, or self-assign once §1 / §3 / §5 stabilize.
+
+Carry-forward open questions for the §7 owner:
+
+- Storage choice: D1 (relational) vs KV vs Durable Objects vs combination. Trade-offs: D1 for joins / queries; KV for cheap reads; DO for stateful per-namespace coordination and consistent fan-out.
+- Sharding strategy and migration story.
+- Rate-limit numbers (per namespace / per agent / per source IP).
+- Body cap numbers.
+- Cold-start budget for serverless invocation.
+- Notification at-least-once delivery: durable queue or DO replay?
+
+## §8 Deployment / `~/cf_token` / CI / acceptance / release gate
+
+TBD — @QA-Release-Lead.
+
+Phased gates (per 2026-05-29 outline). Each gate must explicitly state: required tests, manual verification, rollback / disable path, content forbidden from logs / audit / session.
+
+1. **RFC approval gate** — §1–§6 reviewed; §7 owner assigned; threat model written.
+2. **Transport PR gate** — `HttpMcpTransport` lands as a generic capability with faux HTTP / SSE tests; no real Cloudflare in CI.
+3. **Worker local / faux gate** — Worker implementation passes against local fixture (`wrangler dev` or Miniflare); no real `~/cf_token` used in CI.
+4. **Deploy gate** — manual `~/cf_token` use only; README / CHANGELOG with bindings, migrations, deploy steps, rollback procedure.
+5. **Client UX gate** — `/hub *` CLI / TUI commands, `~/.pie/mcp.toml` hub entry shape, first-contact prompt UX, error → recovery-action wording.
+
+`~/cf_token` boundary: usable only in manual deploy steps. MUST NOT appear in repo, CI, runtime config, session, audit, bug report, or any MCP / notification payload.
+
+---
+
+## Stability / Extensibility / Performance / Testing roll-up
+
+The master roadmap requires every sub-issue to address the five working principles. This RFC distributes them across chapters:
+
+| Axis              | Primary chapters                                                                                              |
+| ----------------- | ------------------------------------------------------------------------------------------------------------- |
+| Architecture      | §1, §2, §6, §7                                                                                                |
+| Stability         | §5 (delivery, dedup, retry, ordering, offline); §3 (token rotate / revoke, password lockout); §6 (transport reconnect, backoff) |
+| Extensibility     | §2 (versioning, additive schema, capability negotiation); §4 (capability taxonomy); §3 (`action_class` extension) |
+| Performance       | §7 (storage choice, rate limit, body cap, cold start); §6 (transport efficiency, SSE backpressure)            |
+| Testing           | §8 (acceptance matrix, phased gates); each chapter contributes tests in its layer                             |
+
+## Review checkpoints (apply to every chapter — per @QA-Release-Lead)
+
+Every chapter author MUST self-check before requesting review:
+
+1. **Scope is testable.** Concrete enough that QA can write an acceptance test.
+2. **Security / redaction is fail-closed.** Default-deny on missing permission; secrets and payloads never enter logs / audit / session / bug report.
+3. **Each implementation phase has clear "preconditions to merge."** No phase is mergeable without its predecessor's gate.
+
+## Acceptance criteria (master roll-up)
+
+Owned by @QA-Release-Lead in §8. Required contents:
+
+- Threat model.
+- Test matrix across all phased gates.
+- Migration / rollback plan.
+- Explicit "what can be merged before real Cloudflare deploy."
+- Per-phase mergeable preconditions.
+
+## Out of scope
+
+- Provider credential plane (remains in `~/.pie/auth.json`).
+- Windows support.
+- Real Cloudflare API calls in CI.
+- Direct agent-to-agent file / blob transfer (notification payload only; large objects deferred past v0).
+- Multi-cloud / multi-region hub federation.
+- Long-lived chat history beyond notification idempotency + audit retention.
+
+## Coordinator-maintained appendices
+
+### Terminology
+
+| Term                 | Meaning                                                                                          |
+| -------------------- | ------------------------------------------------------------------------------------------------ |
+| **hub**              | The `pie.0xfefe.me` Cloudflare Worker MCP service.                                              |
+| **namespace**        | Per-human-user namespace, established at password registration. Every agent belongs to exactly one. |
+| **agent_id**         | Server-issued UUID. Immutable. The address of an agent. All authorization and audit key on this. |
+| **handle**           | Human / LLM-readable alias for an agent. Unique within namespace. Format `[a-z0-9_-]{2,32}`.    |
+| **`@handle@namespace`** | Wire-level display form, e.g. `@alice@dongxu`. Never an authorization input.                 |
+| **discoverable**     | Whether an agent appears in `list_agents` / `discover_public_agents`. Values: `public` / `namespace` / `none`. |
+| **inbox**            | Who can send notifications. Values: `open` / `namespace` / `invited` / `closed`.                |
+| **trust list**       | Receiver-owned list of `{sender_agent_id, action_class}` granted past first-contact gate.       |
+| **block list**       | Receiver-owned list of `{sender_agent_id}` whose notifications are silently dropped.            |
+| **action_class**     | Authorization scope for a trust grant. v0: `notification`. Future: `tool_call`, `data_read`, etc. |
+| **first-contact gate** | User prompt on first notification from an untrusted, cross-namespace sender. Reuses issue #110 `ControlPlaneWrite` gate. |
+| **hub-issued token** | Credential the hub issues per agent for authenticating MCP calls. Stored hashed server-side. Separate from provider keys. |
+| **`~/cf_token`**     | Cloudflare API token used **only** for deploying the Worker. Must never appear in repo, CI, runtime, session, audit, bug report. |
+
+### Defaults
+
+| Field                | Default at registration |
+| -------------------- | ----------------------- |
+| `discoverable`       | `public`                |
+| `inbox`              | `namespace`             |
+| Trust TTL (`Always`) | 90 days                 |
+| Trust TTL (`Block`)  | indefinite              |
+| `payload_visibility` | `Local`                 |
+
+### Cross-chapter open questions
+
+| ID            | Question                                                                                  | Status / take                                         |
+| ------------- | ----------------------------------------------------------------------------------------- | ----------------------------------------------------- |
+| RFC-OQ-1      | §7 Worker implementation owner.                                                            | Awaiting @EdHuang.                                    |
+| RFC-OQ-2      | `inbox = open` in v0? (§4.OQ-1)                                                            | @alice: skip until concrete reason.                   |
+| RFC-OQ-3      | `capabilities` taxonomy: registered / free-form / hybrid? (§4.OQ-2)                        | @alice: registered taxonomy day 1.                    |
+| RFC-OQ-4      | Trust TTL: `Always` expires? Block expires? (§4.OQ-3)                                      | @alice: 90 d Always, indefinite Block.                |
+| RFC-OQ-5      | `inbox = invited` in v0? (§4.OQ-4)                                                         | @alice: ship in v0; gate populates it.                |
+| RFC-OQ-6      | Handle character set `[a-z0-9_-]{2,32}` — confirm or widen? (§4.OQ-5)                      | @alice: lock at this for v0.                          |
+
+### Change log
+
+| Date       | By     | Change                                                                                  |
+| ---------- | ------ | --------------------------------------------------------------------------------------- |
+| 2026-05-29 | @alice | v0.1 scaffold: chapter map, §4 seed draft, terminology, defaults, open-questions log.   |
