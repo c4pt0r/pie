@@ -15,6 +15,7 @@ mod config;
 mod debug;
 mod export;
 mod extensions;
+mod goal;
 mod history;
 mod hooks;
 mod images;
@@ -38,6 +39,7 @@ mod triggers;
 mod ui;
 
 use std::io::IsTerminal as _;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
@@ -364,6 +366,7 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
         skills_state::apply(&state, &mut combined_skills);
     }
 
+    let goal_harness_cell: Arc<OnceLock<Arc<AgentHarness>>> = Arc::new(OnceLock::new());
     let mut opts = AgentHarnessOptions::new(model.clone(), session.clone());
     opts.system_prompt = system_prompt;
     opts.thinking_level = thinking;
@@ -398,6 +401,8 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
             })
         })
     });
+    opts.on_turn_end = Some(goal::stop_hook(goal_harness_cell.clone()));
+    opts.turn_continuation_cap = Some(goal::MAX_CONTINUATIONS);
     opts.before_tool_call =
         Some(PermissionPolicy::default_for_coding_agent().as_before_tool_call());
     // Triggers from MCP servers configured with `inject_summary` / `inject_and_run` bypass
@@ -437,6 +442,10 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
     assert!(
         skill_harness_cell.set(harness.clone()).is_ok(),
         "Skill tool harness cell was set twice; main.rs wiring is the only setter"
+    );
+    assert!(
+        goal_harness_cell.set(harness.clone()).is_ok(),
+        "Goal hook harness cell was set twice; main.rs wiring is the only setter"
     );
 
     // Wire each MCP server's trigger-source adapter into the harness now that all

@@ -19,6 +19,11 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
   The shortcut runs the prompt with that skill attached, `/db9` without text attaches it to
   the next turn, and builtin name conflicts or disabled skills stay hidden from help and
   completion while showing only bounded skill metadata in the feed.
+- Added `/goal <condition>` session goal mode. After each successful turn, pie runs a
+  no-tools evaluator over a bounded transcript; if the transcript lacks explicit evidence
+  for the goal, pie injects a continuation prompt with the missing evidence reason. `/goal`,
+  `/goal pause`, `/goal resume`, and `/goal clear` manage the session goal, while TUI/Web
+  status surfaces show bounded goal state and evaluation reasons.
 - **#32** Optional bundled `karpathy-guidelines` built-in skill. Off by default; enable
   per-run with `--builtin-skill karpathy-guidelines` or persistently via
   `~/.pie/config.toml` `[builtin_skills] enabled = ["karpathy-guidelines"]`. CLI and config

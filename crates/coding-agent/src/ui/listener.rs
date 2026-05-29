@@ -203,6 +203,34 @@ fn map_harness_event(
                 level: Level::System,
             })
         }
+        HarnessEvent::TurnEnded {
+            decision,
+            reason,
+            next_prompt_preview,
+            ..
+        } => match *decision {
+            "continue" => Some(FeedUpdate::Plain {
+                text: format!(
+                    "[goal continuing] {}",
+                    debug_text(
+                        debug,
+                        next_prompt_preview
+                            .as_deref()
+                            .unwrap_or("continuing toward the active goal"),
+                        160
+                    )
+                ),
+                level: Level::System,
+            }),
+            "pause" | "budget_limited" => Some(FeedUpdate::Plain {
+                text: format!(
+                    "[goal paused] {}",
+                    debug_text(debug, reason.as_deref().unwrap_or(*decision), 160)
+                ),
+                level: Level::Error,
+            }),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -447,6 +475,35 @@ mod tests {
         assert!(text.contains("trigger result line 29"));
         assert!(text.ends_with(&summary));
         assert!(!text.contains("truncated"));
+    }
+
+    #[test]
+    fn turn_end_continue_surfaces_goal_status_line() {
+        let update = map_harness_event_for_test(&HarnessEvent::TurnEnded {
+            decision: "continue",
+            continuation_count: 1,
+            reason: None,
+            next_prompt_preview: Some("缺口: missing verification output. 继续。".into()),
+        })
+        .expect("continue should render");
+
+        let FeedUpdate::Plain { text, level } = update else {
+            panic!("expected plain update");
+        };
+        assert_eq!(level, Level::System);
+        assert!(text.contains("[goal continuing]"));
+        assert!(text.contains("missing verification output"));
+    }
+
+    #[test]
+    fn turn_end_stop_stays_quiet() {
+        let update = map_harness_event_for_test(&HarnessEvent::TurnEnded {
+            decision: "stop",
+            continuation_count: 0,
+            reason: None,
+            next_prompt_preview: None,
+        });
+        assert!(update.is_none(), "normal stop should not add feed noise");
     }
 
     #[test]

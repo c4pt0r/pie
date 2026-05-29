@@ -6,10 +6,12 @@
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 
 use pie_agent_core::{
-    AgentHarness, AgentHarnessOptions, AgentTool, LoadSkillsOutput, MemorySessionStorage,
-    ReloadSkillsFn, Session, SessionStorage, SessionTreeEntry, Skill, SkillSource, ThinkingLevel,
+    AgentHarness, AgentHarnessOptions, AgentMessage, AgentTool, LoadSkillsOutput,
+    MemorySessionStorage, OnTurnEndContext, ReloadSkillsFn, Session, SessionStorage,
+    SessionTreeEntry, Skill, SkillSource, ThinkingLevel, TurnEndAction,
 };
 use pie_ai::{
     AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream, AssistantRole,
@@ -39,6 +41,9 @@ mod config;
 #[allow(dead_code)]
 #[path = "../src/export.rs"]
 mod export;
+#[allow(dead_code)]
+#[path = "../src/goal.rs"]
+mod goal;
 #[allow(dead_code)]
 #[path = "../src/history.rs"]
 mod history;
@@ -322,6 +327,143 @@ async fn dispatch_unknown_command_returns_error_outcome() {
         commands::CommandOutcome::Error(msg) => assert!(msg.contains("unknown command")),
         other => panic!("expected Error outcome, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn dispatch_goal_sets_and_reports_session_goal() {
+    let _guard = COMMAND_OUTPUT_LOCK.lock().unwrap();
+    let capture = OutputCapture::install();
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage as Arc<dyn SessionStorage>);
+    let opts = AgentHarnessOptions::new(faux_model(), session.clone());
+    let harness = Arc::new(AgentHarness::new(opts));
+
+    let registry = commands::Registry::with_builtins();
+    let cwd = std::env::current_dir().unwrap();
+    let ctx = commands::CommandCtx {
+        harness: &harness,
+        session_id: "test",
+        log_path: None,
+        tool_count: 0,
+        cwd: &cwd,
+    };
+
+    let outcome =
+        commands::dispatch("/goal finish only after cargo test passes", &registry, &ctx).await;
+    assert!(matches!(outcome, commands::CommandOutcome::Handled));
+
+    let state = goal::current(&harness).await.expect("goal state");
+    assert_eq!(state.status, goal::GoalStatus::Pursuing);
+    assert_eq!(state.condition, "finish only after cargo test passes");
+
+    let outcome = commands::dispatch("/goal", &registry, &ctx).await;
+    assert!(matches!(outcome, commands::CommandOutcome::Handled));
+
+    let output = capture.text();
+    assert!(output.contains("goal set: finish only after cargo test passes"));
+    assert!(output.contains("status: pursuing"), "{output}");
+    assert!(output.contains("iterations: 0"), "{output}");
+
+    let entries = session.entries().await.unwrap();
+    assert!(
+        entries.iter().any(|entry| matches!(
+            entry,
+            SessionTreeEntry::Custom { custom_type, data, .. }
+                if custom_type == goal::CUSTOM_TYPE
+                    && data.as_ref().is_some_and(|d| d["condition"] == "finish only after cargo test passes")
+        )),
+        "goal command must persist session metadata: {entries:#?}"
+    );
+}
+
+#[tokio::test]
+async fn dispatch_goal_clear_hides_current_goal() {
+    let _guard = COMMAND_OUTPUT_LOCK.lock().unwrap();
+    let capture = OutputCapture::install();
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage as Arc<dyn SessionStorage>);
+    let opts = AgentHarnessOptions::new(faux_model(), session);
+    let harness = Arc::new(AgentHarness::new(opts));
+    goal::set(&harness, "ship a release".into()).await.unwrap();
+
+    let registry = commands::Registry::with_builtins();
+    let cwd = std::env::current_dir().unwrap();
+    let ctx = commands::CommandCtx {
+        harness: &harness,
+        session_id: "test",
+        log_path: None,
+        tool_count: 0,
+        cwd: &cwd,
+    };
+
+    let outcome = commands::dispatch("/goal clear", &registry, &ctx).await;
+    assert!(matches!(outcome, commands::CommandOutcome::Handled));
+
+    assert!(goal::current(&harness).await.is_none());
+    let output = capture.text();
+    assert!(output.contains("goal cleared"), "{output}");
+}
+
+#[tokio::test]
+async fn goal_evaluator_false_returns_continuation_and_audits_reason() {
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage as Arc<dyn SessionStorage>);
+    let mut opts = AgentHarnessOptions::new(faux_model(), session.clone());
+    opts.stream_fn = Some(Arc::new(|_, _, _| {
+        stream_one(assistant_text(
+            "{\"ok\":false,\"reason\":\"missing cargo test output\"}",
+        ))
+    }));
+    let harness = Arc::new(AgentHarness::new(opts));
+    let harness_cell = Arc::new(OnceLock::new());
+    assert!(harness_cell.set(harness.clone()).is_ok());
+    let hook = goal::stop_hook(harness_cell);
+    goal::set(&harness, "finish only after cargo test passes".into())
+        .await
+        .unwrap();
+
+    let decision = hook(
+        OnTurnEndContext {
+            transcript: vec![AgentMessage::Llm(Message::User(pie_ai::UserMessage {
+                role: pie_ai::UserRole::User,
+                content: pie_ai::UserContent::Text("ran cargo build only".into()),
+                timestamp: 0,
+            }))],
+            continuation_count: 0,
+            last_user_prompt: Some("ran cargo build only".into()),
+        },
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
+    let TurnEndAction::Continue { prompt } = decision.action else {
+        panic!("expected continuation, got {:?}", decision.action);
+    };
+    assert!(prompt.contains("finish only after cargo test passes"));
+    assert!(prompt.contains("missing cargo test output"));
+    assert_eq!(decision.payload.as_ref().unwrap()["ok"], false);
+    assert_eq!(
+        decision.payload.as_ref().unwrap()["reason"],
+        "missing cargo test output"
+    );
+
+    let state = goal::current(&harness).await.expect("goal state");
+    assert_eq!(state.iterations, 1);
+    assert_eq!(
+        state.last_reason.as_deref(),
+        Some("missing cargo test output")
+    );
+
+    let entries = session.entries().await.unwrap();
+    assert!(
+        entries.iter().any(|entry| matches!(
+            entry,
+            SessionTreeEntry::Custom { custom_type, data, .. }
+                if custom_type == goal::CUSTOM_TYPE
+                    && data.as_ref().is_some_and(|d| d["status"] == "pursuing"
+                        && d["last_reason"] == "missing cargo test output")
+        )),
+        "goal hook must persist updated goal state: {entries:#?}"
+    );
 }
 
 #[tokio::test]

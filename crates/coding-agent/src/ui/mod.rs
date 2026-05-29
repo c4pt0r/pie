@@ -124,6 +124,7 @@ pub struct App {
 
     feed: Feed,
     latest_trigger_poll: Option<TriggerPollStatus>,
+    latest_goal: Option<crate::goal::GoalState>,
     feed_rx: Option<UnboundedReceiver<FeedUpdate>>,
     main_run_rx: Option<UnboundedReceiver<String>>,
     panel_status: PanelStatus,
@@ -164,6 +165,7 @@ impl App {
             pending_pasted_images: Vec::new(),
             feed: Feed::new(),
             latest_trigger_poll: None,
+            latest_goal: None,
             feed_rx: Some(config.feed_rx),
             main_run_rx: Some(config.main_run_rx),
             panel_status: config.panel_status,
@@ -312,6 +314,7 @@ impl App {
         let mut feed_rx = self.feed_rx.take().expect("feed_rx taken once");
         let mut main_run_rx = self.main_run_rx.take().expect("main_run_rx taken once");
         let mut turn = TurnState::default();
+        self.refresh_goal_state().await;
 
         loop {
             terminal.draw(|f| self.render(f))?;
@@ -321,7 +324,7 @@ impl App {
             tokio::select! {
                 biased;
                 result = poll_turn(&mut turn.fut), if turn.fut.is_some() => {
-                    self.finish_turn(&mut turn, result);
+                    self.finish_turn(&mut turn, result).await;
                 }
                 maybe_event = reader.next() => {
                     match maybe_event {
@@ -350,7 +353,11 @@ impl App {
     }
 
     /// Wrap up a finished turn: clear the busy state and surface an aborted/error line.
-    fn finish_turn(&mut self, turn: &mut TurnState, result: Result<Option<String>, AgentRunError>) {
+    async fn finish_turn(
+        &mut self,
+        turn: &mut TurnState,
+        result: Result<Option<String>, AgentRunError>,
+    ) {
         turn.fut = None;
         self.busy = false;
         self.spinner_frame = 0;
@@ -369,6 +376,7 @@ impl App {
         }
         turn.aborted = false;
         turn.prefix = "";
+        self.refresh_goal_state().await;
         self.start_next_queued_turn(turn);
     }
 
@@ -649,12 +657,12 @@ impl App {
         self.system_line(format!("removed queued message: {preview}"));
     }
 
-    fn start_next_queued_turn(&mut self, turn: &mut TurnState) {
+    fn start_next_queued_turn(&mut self, turn: &mut TurnState) -> bool {
         if turn.fut.is_some() {
-            return;
+            return true;
         }
         let Some(job) = self.queued_turns.pop_front() else {
-            return;
+            return false;
         };
         let remaining = self.queued_turns.len();
         self.system_line(if remaining == 0 {
@@ -692,6 +700,11 @@ impl App {
                 self.start_compaction_turn(custom, turn);
             }
         }
+        true
+    }
+
+    async fn refresh_goal_state(&mut self) {
+        self.latest_goal = crate::goal::current(self.kernel.harness()).await;
     }
 
     async fn dispatch_slash(
@@ -759,6 +772,9 @@ impl App {
                 self.login(&provider, terminal).await;
             }
             CommandOutcome::Handled => {}
+        }
+        if input.trim_start().starts_with("/goal") {
+            self.refresh_goal_state().await;
         }
     }
 
@@ -1104,6 +1120,7 @@ impl App {
             || !crate::triggers::global_registry().list().is_empty()
             || !crate::triggers::global_cron_registry().list().is_empty()
             || self.latest_trigger_poll.is_some()
+            || self.latest_goal.is_some()
             || self.panel_status.mcp_servers > 0
             || self.panel_status.mcp_notification_hooks > 0
     }
@@ -1213,6 +1230,39 @@ impl App {
                 Color::DarkGray,
                 width,
             ));
+        }
+
+        if let Some(goal) = &self.latest_goal {
+            lines.push(Line::raw(""));
+            lines.push(panel_line("Goal".to_string(), Color::Cyan, width));
+            let color = match goal.status {
+                crate::goal::GoalStatus::Pursuing => Color::Yellow,
+                crate::goal::GoalStatus::Achieved => Color::Green,
+                crate::goal::GoalStatus::Paused | crate::goal::GoalStatus::BudgetLimited => {
+                    Color::DarkGray
+                }
+                crate::goal::GoalStatus::Cleared => Color::DarkGray,
+            };
+            lines.push(panel_line(goal.status.as_str().to_string(), color, width));
+            lines.push(panel_line(
+                panel_rule_preview(&goal.condition, width),
+                Color::DarkGray,
+                width,
+            ));
+            if goal.iterations > 0 {
+                lines.push(panel_line(
+                    format!("checks {}", goal.iterations),
+                    Color::DarkGray,
+                    width,
+                ));
+            }
+            if let Some(reason) = goal.last_reason.as_deref() {
+                lines.push(panel_line(
+                    format!("  {}", panel_rule_preview(reason, width)),
+                    Color::DarkGray,
+                    width,
+                ));
+            }
         }
 
         lines.push(Line::raw(""));
@@ -1661,6 +1711,10 @@ mod tests {
         let storage = Arc::new(MemorySessionStorage::new());
         let session = Session::new(storage as Arc<dyn SessionStorage>);
         let opts = AgentHarnessOptions::new(model, session);
+        test_app_with_options(opts)
+    }
+
+    fn test_app_with_options(opts: AgentHarnessOptions) -> App {
         let harness = Arc::new(AgentHarness::new(opts));
         let (_ftx, feed_rx) = tokio::sync::mpsc::unbounded_channel();
         let (_mtx, main_run_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2158,8 +2212,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finished_turn_starts_next_queued_prompt_fifo() {
+    #[tokio::test]
+    async fn finished_turn_starts_next_queued_prompt_fifo() {
         let mut app = test_app();
         let mut turn = TurnState {
             fut: Some(Box::pin(async {
@@ -2172,7 +2226,7 @@ mod tests {
         app.queue_user_prompt("next question".into(), "next question".into(), Vec::new());
         assert_eq!(app.queued_turns.len(), 1);
 
-        app.finish_turn(&mut turn, Ok(None));
+        app.finish_turn(&mut turn, Ok(None)).await;
 
         assert!(turn.fut.is_some(), "queued prompt should start immediately");
         assert!(app.busy, "starting queued prompt should mark UI busy");
@@ -2181,6 +2235,34 @@ mod tests {
         assert!(text.contains("queued next message #1: next question"));
         assert!(text.contains("running queued message"));
         assert!(text.contains("you ▸ next question"));
+    }
+
+    #[tokio::test]
+    async fn finished_turn_refreshes_goal_panel_state() {
+        let mut app = test_app();
+        crate::goal::set(
+            app.kernel.harness(),
+            "run verification before stopping".into(),
+        )
+        .await
+        .unwrap();
+        let mut turn = TurnState {
+            fut: Some(Box::pin(async {
+                Ok::<Option<String>, AgentRunError>(None)
+            })),
+            aborted: false,
+            prefix: "",
+        };
+
+        app.finish_turn(&mut turn, Ok(None)).await;
+
+        let goal = app.latest_goal.as_ref().expect("goal state");
+        assert_eq!(goal.condition, "run verification before stopping");
+        assert_eq!(goal.status, crate::goal::GoalStatus::Pursuing);
+        assert!(
+            turn.fut.is_none(),
+            "runtime OnTurnEndHook, not the UI, owns continuation"
+        );
     }
 
     #[test]

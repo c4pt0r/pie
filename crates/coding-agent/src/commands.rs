@@ -156,6 +156,7 @@ impl Registry {
         r.register(Arc::new(LogoutCommand));
         r.register(Arc::new(FindCommand));
         r.register(Arc::new(HistoryCommand));
+        r.register(Arc::new(GoalCommand));
         r.register(Arc::new(TriggersCommand));
         r.register(Arc::new(NewTriggerCommand));
         r.register(Arc::new(CronCommand));
@@ -918,6 +919,85 @@ impl SlashCommand for ThinkingCommand {
                 CommandOutcome::Handled
             }
             Err(e) => CommandOutcome::Error(format!("set_thinking_level failed: {e}")),
+        }
+    }
+}
+
+struct GoalCommand;
+
+#[async_trait]
+impl SlashCommand for GoalCommand {
+    fn name(&self) -> &'static str {
+        "goal"
+    }
+
+    fn description(&self) -> &'static str {
+        "set, view, pause, resume, or clear the session goal stop hook"
+    }
+
+    fn usage(&self) -> &'static str {
+        "[<condition>|pause|resume|clear]"
+    }
+
+    async fn run(&self, argv: &[String], ctx: &CommandCtx<'_>) -> CommandOutcome {
+        match argv.first().map(String::as_str) {
+            None => {
+                print_goal_status(ctx).await;
+                CommandOutcome::Handled
+            }
+            Some("pause") if argv.len() == 1 => match crate::goal::pause(ctx.harness).await {
+                Ok(state) => {
+                    cprintln!("goal paused: {}", state.condition);
+                    CommandOutcome::Handled
+                }
+                Err(e) => CommandOutcome::Error(e),
+            },
+            Some("resume") if argv.len() == 1 => match crate::goal::resume(ctx.harness).await {
+                Ok(state) => {
+                    cprintln!("goal resumed: {}", state.condition);
+                    CommandOutcome::Handled
+                }
+                Err(e) => CommandOutcome::Error(e),
+            },
+            Some("clear") if argv.len() == 1 => match crate::goal::clear(ctx.harness).await {
+                Ok(_) => {
+                    cprintln!("goal cleared");
+                    CommandOutcome::Handled
+                }
+                Err(e) => CommandOutcome::Error(e),
+            },
+            Some(_) => {
+                let condition = argv.join(" ").trim().to_string();
+                if condition.is_empty() {
+                    return CommandOutcome::Error("usage: /goal <condition>".into());
+                }
+                match crate::goal::set(ctx.harness, condition).await {
+                    Ok(state) => {
+                        cprintln!("goal set: {}", state.condition);
+                        cprintln!(
+                            "goal will continue after each successful turn until transcript evidence satisfies the condition"
+                        );
+                        CommandOutcome::Handled
+                    }
+                    Err(e) => CommandOutcome::Error(e),
+                }
+            }
+        }
+    }
+}
+
+async fn print_goal_status(ctx: &CommandCtx<'_>) {
+    match crate::goal::current(ctx.harness).await {
+        Some(state) if state.active() || state.status == crate::goal::GoalStatus::Achieved => {
+            cprintln!("goal: {}", state.condition);
+            cprintln!("status: {}", state.status.as_str());
+            cprintln!("iterations: {}", state.iterations);
+            if let Some(reason) = state.last_reason.as_deref() {
+                cprintln!("last evaluator reason: {}", preview_text(reason, 240));
+            }
+        }
+        _ => {
+            cprintln!("no active goal; set one with /goal <condition>");
         }
     }
 }

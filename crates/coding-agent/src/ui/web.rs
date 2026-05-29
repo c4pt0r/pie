@@ -48,7 +48,16 @@ struct WebSnapshot {
     busy: bool,
     queued_count: usize,
     latest_trigger_poll: Option<super::feed::TriggerPollStatus>,
+    goal: Option<WebGoalSnapshot>,
     feed_lines: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct WebGoalSnapshot {
+    condition: String,
+    status: String,
+    iterations: u32,
+    last_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -85,13 +94,14 @@ impl App {
         let mut feed_rx = self.feed_rx.take().expect("feed_rx taken once");
         let mut main_run_rx = self.main_run_rx.take().expect("main_run_rx taken once");
         let mut turn = TurnState::default();
+        self.refresh_goal_state().await;
         self.publish_snapshot(&latest, &snapshot_tx).await;
 
         loop {
             tokio::select! {
                 biased;
                 result = poll_turn(&mut turn.fut), if turn.fut.is_some() => {
-                    self.finish_turn(&mut turn, result);
+                    self.finish_turn(&mut turn, result).await;
                     self.publish_snapshot(&latest, &snapshot_tx).await;
                 }
                 Some(command) = command_rx.recv() => {
@@ -227,6 +237,9 @@ impl App {
             }
             CommandOutcome::Handled => {}
         }
+        if input.trim_start().starts_with("/goal") {
+            self.refresh_goal_state().await;
+        }
     }
 
     fn web_snapshot(&self) -> WebSnapshot {
@@ -244,6 +257,12 @@ impl App {
             busy: self.busy,
             queued_count: self.queued_turns.len(),
             latest_trigger_poll: self.latest_trigger_poll.clone(),
+            goal: self.latest_goal.as_ref().map(|goal| WebGoalSnapshot {
+                condition: crate::bug_report::redact(&goal.condition),
+                status: goal.status.as_str().to_string(),
+                iterations: goal.iterations,
+                last_reason: goal.last_reason.as_deref().map(crate::bug_report::redact),
+            }),
             feed_lines: bounded_feed_lines(&self.feed, SNAPSHOT_LINE_LIMIT),
         }
     }
@@ -516,6 +535,7 @@ mod tests {
             busy: false,
             queued_count: 0,
             latest_trigger_poll: None,
+            goal: None,
             feed_lines: vec!["ready".into()],
         }));
         let router = web_router(HttpState {
@@ -583,6 +603,7 @@ mod tests {
                 busy: true,
                 queued_count: 1,
                 latest_trigger_poll: None,
+                goal: None,
                 feed_lines: vec!["streamed".into()],
             })
             .unwrap();
