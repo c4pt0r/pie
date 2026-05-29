@@ -672,8 +672,9 @@ impl From<TurnEndAction> for TurnEndDecision {
 ///
 /// Returning [`TurnEndAction::Continue { prompt }`] starts a new prompt cycle with the
 /// given text appended as a `Message::User`. Returning [`TurnEndAction::Stop`] or
-/// [`TurnEndAction::Pause`] returns control to the caller. `None` (no hook configured)
-/// is equivalent to `Stop`.
+/// [`TurnEndAction::Pause`] returns control to the caller with an audit/event.
+/// Returning [`TurnEndAction::Noop`] returns control without audit/event, matching the
+/// no-hook path. `None` (no hook configured) is equivalent to `Noop`.
 ///
 /// The hook runs **after** the persistence listener has flushed every `MessageEnd` to
 /// the session, so `transcript` matches what `--resume` would replay. It runs **before**
@@ -766,7 +767,7 @@ pub struct AgentHarnessOptions {
     /// Optional hook invoked after every prompt cycle completes. Powers `/goal` and
     /// any other turn-completion driven orchestrator. See [`OnTurnEndHook`] for the
     /// contract. `None` is equivalent to a hook that always returns
-    /// [`TurnEndAction::Stop`] (i.e. current behavior).
+    /// [`TurnEndAction::Noop`] (i.e. current behavior).
     pub on_turn_end: Option<OnTurnEndHook>,
     /// Cap on the number of [`TurnEndAction::Continue`] decisions the runtime applies
     /// to a single prompt cycle. `None` uses [`DEFAULT_TURN_CONTINUATION_CAP`]. Set
