@@ -28,6 +28,18 @@ Ship:
 - First-contact gate that reuses the issue #110 `ControlPlaneWrite` user-prompt mechanism — no new prompt protocol.
 - Pie client integration via a new `HttpMcpTransport` in `crates/mcp/` (parallel deliverable, not bound to this hub).
 
+## Definition of done
+
+**Per @EdHuang (2026-05-29): completion is gated on e2e success against the real deployed `pie.0xfefe.me`, not on RFC approval, merged PRs, or faux-fixture tests alone.**
+
+Concretely, the RFC is "done" only when:
+
+1. The Cloudflare Worker is deployed to the real `pie.0xfefe.me` domain (manual deploy step using `~/cf_token`).
+2. Two real pie agents on different machines (or different namespaces) can register, discover each other, send and receive notifications, exercise the first-contact gate end-to-end against the deployed Worker.
+3. The acceptance matrix in §8 has been run against the deployed Worker — not just faux fixtures.
+
+This does NOT change the "no real Cloudflare in CI" rule (§8). CI uses faux Worker / `wrangler dev` / Miniflare; the deployed-Worker e2e is a distinct gate, executed manually by a human reviewer before the RFC is marked complete in the master roadmap.
+
 ## Non-goals
 
 - **Not a provider credential plane.** `pie.0xfefe.me` does not store, proxy, or know about OpenAI / Anthropic / Deepseek / Bedrock / Vertex credentials. Those continue to live in `~/.pie/auth.json` on the user's machine.
@@ -282,10 +294,13 @@ Phased gates (per 2026-05-29 outline). Each gate must explicitly state: required
 1. **RFC approval gate** — §1, §2, §3, §4, §5, §6a, §6b reviewed; §7 owner assigned; threat model written.
 2. **Transport PR gate** — `HttpMcpTransport` lands as a generic capability with faux HTTP / SSE tests; no real Cloudflare in CI.
 3. **Worker local / faux gate** — Worker implementation passes against local fixture (`wrangler dev` or Miniflare); no real `~/cf_token` used in CI.
-4. **Deploy gate** — manual `~/cf_token` use only; README / CHANGELOG with bindings, migrations, deploy steps, rollback procedure.
-5. **Client UX gate** — `/hub *` CLI / TUI commands, `~/.pie/mcp.toml` hub entry shape, first-contact prompt UX, error → recovery-action wording.
+4. **Client UX gate** — `/hub *` CLI / TUI commands, `~/.pie/mcp.toml` hub entry shape, first-contact prompt UX, error → recovery-action wording.
+5. **Real deploy gate** — manual `~/cf_token` use to deploy the Worker to the real `pie.0xfefe.me`. README / CHANGELOG with bindings, migrations, deploy steps, rollback procedure. Pre-deploy review by a named human approver.
+6. **Deployed-Worker e2e gate (definition of done — per @EdHuang)** — **the RFC is NOT complete until this gate passes.** Two real pie agents on different machines / namespaces register, discover each other, send notifications, and exercise the first-contact gate end-to-end against the deployed `pie.0xfefe.me`. The full §8 acceptance matrix runs against the deployed Worker — faux-fixture passes alone do not satisfy this gate. Rollback path documented and rehearsed.
 
-`~/cf_token` boundary: usable only in manual deploy steps. MUST NOT appear in repo, CI, runtime config, session, audit, bug report, or any MCP / notification payload.
+`~/cf_token` boundary: usable only in gates 5 and 6 (manual human deploy / human-run e2e). MUST NOT appear in repo, CI, runtime config, session, audit, bug report, or any MCP / notification payload.
+
+**CI vs acceptance gate distinction.** Gates 2, 3, 4 are CI-friendly (no real Cloudflare). Gates 5 and 6 are manual / human-gated and target the real deployed Worker. The "no real Cloudflare in CI" rule is preserved; the "done" criterion is intentionally outside CI.
 
 ---
 
@@ -377,3 +392,4 @@ Owned by @QA-Release-Lead in §8. Required contents:
 | 2026-05-29 | @alice | v0.1 scaffold: chapter map, §4 seed draft, terminology, defaults, open-questions log.   |
 | 2026-05-29 | @alice | Split §6 into §6a (engine contract + transport, @Tools-MCP-Lead) and §6b (`/hub *` CLI/TUI surface, @CLI-TUI-Dev-Lead) per Tools-MCP-Lead's request. |
 | 2026-05-29 | @alice | Scaffold consistency fixes per @QA-Release-Lead review: Tier 4 → Tier 8 (matches master.md), top-level gate wording unified with §8 RFC approval gate, §4.3 audit wording fixed (no-new-prompt-protocol; custom_type registration deferred to §5/§8). Added Provider-Auth's `inbox` × sender decision matrix in §4.2 and follow-up open question RFC-OQ-7 / §4.OQ-6 on `open` vs `invited` collapse. |
+| 2026-05-29 | @alice | Per @EdHuang: completion criterion is e2e against the real deployed `pie.0xfefe.me`. Added "Definition of done" section; reorganized §8 phased gates so Real-deploy and Deployed-Worker-e2e are explicit terminal gates, with the e2e gate as definition-of-done. Preserved "no real Cloudflare in CI" rule by distinguishing CI-friendly gates (2/3/4) from manual / human-gated terminal gates (5/6). Raises priority on §7 Worker owner assignment (RFC-OQ-1). |
