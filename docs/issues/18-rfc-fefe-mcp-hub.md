@@ -1,8 +1,8 @@
 # RFC: pie.0xfefe.me public MCP hub
 
 > Parent: [[00-master]] roadmap.
-> Tier: 4 (framework depth). Extends [[08-mcp-client]] and [[17-harness-expansion]].
-> Status: **draft v0.1 (scaffold)** — NOT implementation-ready. Do not open Worker, `/hub` CLI/TUI, or `~/.pie/mcp.toml` UX PRs against this design until §1, §3, §5 reviewed.
+> Tier: 8 (cross-agent connectivity). Extends [[08-mcp-client]] and [[17-harness-expansion]].
+> Status: **draft v0.1 (scaffold)** — NOT implementation-ready. Implementation PRs are gated by §8's RFC approval gate (§1–§6b reviewed; §7 owner assigned; threat model written). Until that gate passes, do not open Worker, `/hub` CLI/TUI, or `~/.pie/mcp.toml` UX PRs against this design.
 > Coordinator: @alice
 >
 > Chapter authors:
@@ -138,6 +138,23 @@ Owns the *what* (identity, visibility, trust semantics, profile shape). The *how
 - `discoverable = none` is hard hide — not listed even in own-namespace `discover` results unless the caller is the owner.
 - **`discoverable` is never an authorization input for send paths.** The hub MUST re-check `inbox` policy on every `send_notification` regardless of how the sender obtained the target's `agent_id`.
 
+**`inbox` × sender state — decision matrix.** Pins what happens for every combination of `inbox` value and sender's relationship to the receiver. This is the §4 × §5 / §6a / §7 contract for `send_notification`.
+
+| `inbox` value  | Same-namespace sender | Cross-namespace, in trust list | Cross-namespace, no record       | Cross-namespace, in block list |
+| -------------- | --------------------- | ------------------------------ | -------------------------------- | ------------------------------ |
+| `open`         | direct route          | direct route                   | **first-contact prompt** (§4.3)  | silent drop                    |
+| `invited`      | direct route          | direct route                   | **first-contact prompt** (§4.3)  | silent drop                    |
+| `namespace`    | direct route          | n/a — denied regardless        | hub denies (no prompt)           | silent drop                    |
+| `closed`       | hub denies            | hub denies                     | hub denies                       | silent drop                    |
+
+Notes:
+
+- "direct route" = `NotificationHook → Trigger → handle_trigger` per §5; no user prompt.
+- "first-contact prompt" = `BeforeTriggerHook::Prompt` via the issue #110 gate per §4.3.
+- "hub denies" = `send_notification` returns a bounded `permission_denied` recovery hint to the sender (per @Provider-Auth-Lead's redaction rule). No prompt fires on the receiver side.
+- "silent drop" = receiver-side block list match; sender sees a non-distinguishing delivery result (sender can't probe the block list).
+- Open question §4.OQ-6 (new): `open` and `invited` are functionally identical in this matrix; do we collapse them in v0 or keep both for operator signal?
+
 ### §4.3 First-contact gate — reuse issue #110 user-prompt mechanism
 
 **Rule.** A notification from a sender `agent_id` that is (a) not in the receiver's trust list and (b) originates outside the receiver's namespace does **not** enter `NotificationHook → Trigger` directly. The receiver-side pie client surfaces a user prompt via the issue #110 `ControlPlaneWrite` gate:
@@ -157,8 +174,8 @@ Choice:  Accept once    Always (notification-only)    Block
 
 **Application.**
 
-- Implementation lives in `BeforeTriggerHook::Prompt` policy on the runtime side (per @Runtime-dev-lead, §5). No new prompt protocol; no new audit type.
-- Trust list and block list are **receiver-owned**, persisted as `~/.pie/hub-trust.json` (key tuple per @Provider-Auth-Lead). Audited to `SessionTreeEntry::Custom { custom_type: "fefe_trust_decision", … }`. Body holds `{sender_agent_id, receiver_agent_id, decision, scope, at}` — never notification payload.
+- Implementation lives in `BeforeTriggerHook::Prompt` policy on the runtime side (per @Runtime-dev-lead, §5). **No new prompt protocol** — reuses the existing issue #110 gate channel.
+- Trust list and block list are **receiver-owned**, persisted as `~/.pie/hub-trust.json` (key tuple per @Provider-Auth-Lead). Audit record uses the existing `SessionTreeEntry::Custom` mechanism with `custom_type = "fefe_trust_decision"`; body holds `{sender_agent_id, receiver_agent_id, decision, scope, at}` — never notification payload. The custom_type registration and field schema land in §5 (Runtime owns audit records) or §8 (QA defines redaction acceptance); §4 only states the bounded contract.
 - Trust scope is the narrowest useful tuple. **Never global, never "trust the whole namespace," never "trust all MCP tools."** (Per @Provider-Auth-Lead.)
 - `action_class` starts as `notification`. New action classes (e.g. `tool_call`, `data_read`) each get their own gate; granting one does not grant another.
 - Handle rename does not migrate or invalidate trust — keyed on `agent_id`.
@@ -216,6 +233,7 @@ Choice:  Accept once    Always (notification-only)    Block
 | §4.OQ-3    | Trust TTL: do `Always` decisions expire? Block decisions?                                        | 90 days for `Always`, indefinite for `Block`. Re-prompt is cheap; latent over-trust is dangerous. |
 | §4.OQ-4    | `inbox = invited` in v0 or follow-up after `namespace` proves out?                               | Ship in v0; it's how the first-contact gate populates.   |
 | §4.OQ-5    | Handle character set `[a-z0-9_-]{2,32}` — confirm or widen?                                      | Lock at this for v0; widening later is additive.         |
+| §4.OQ-6    | `inbox = open` and `inbox = invited` are functionally identical in the decision matrix — collapse in v0 or keep both as operator signal? | Lean keep both: `discover_public_agents` should be able to filter on `open` as a "welcomes new contact" hint. |
 
 ---
 
@@ -261,7 +279,7 @@ TBD — @QA-Release-Lead.
 
 Phased gates (per 2026-05-29 outline). Each gate must explicitly state: required tests, manual verification, rollback / disable path, content forbidden from logs / audit / session.
 
-1. **RFC approval gate** — §1–§6 reviewed; §7 owner assigned; threat model written.
+1. **RFC approval gate** — §1, §2, §3, §4, §5, §6a, §6b reviewed; §7 owner assigned; threat model written.
 2. **Transport PR gate** — `HttpMcpTransport` lands as a generic capability with faux HTTP / SSE tests; no real Cloudflare in CI.
 3. **Worker local / faux gate** — Worker implementation passes against local fixture (`wrangler dev` or Miniflare); no real `~/cf_token` used in CI.
 4. **Deploy gate** — manual `~/cf_token` use only; README / CHANGELOG with bindings, migrations, deploy steps, rollback procedure.
@@ -350,6 +368,7 @@ Owned by @QA-Release-Lead in §8. Required contents:
 | RFC-OQ-4      | Trust TTL: `Always` expires? Block expires? (§4.OQ-3)                                      | @alice: 90 d Always, indefinite Block.                |
 | RFC-OQ-5      | `inbox = invited` in v0? (§4.OQ-4)                                                         | @alice: ship in v0; gate populates it.                |
 | RFC-OQ-6      | Handle character set `[a-z0-9_-]{2,32}` — confirm or widen? (§4.OQ-5)                      | @alice: lock at this for v0.                          |
+| RFC-OQ-7      | Collapse `inbox=open` and `inbox=invited` in v0? (§4.OQ-6)                                 | @alice: lean keep both as operator signal.            |
 
 ### Change log
 
@@ -357,3 +376,4 @@ Owned by @QA-Release-Lead in §8. Required contents:
 | ---------- | ------ | --------------------------------------------------------------------------------------- |
 | 2026-05-29 | @alice | v0.1 scaffold: chapter map, §4 seed draft, terminology, defaults, open-questions log.   |
 | 2026-05-29 | @alice | Split §6 into §6a (engine contract + transport, @Tools-MCP-Lead) and §6b (`/hub *` CLI/TUI surface, @CLI-TUI-Dev-Lead) per Tools-MCP-Lead's request. |
+| 2026-05-29 | @alice | Scaffold consistency fixes per @QA-Release-Lead review: Tier 4 → Tier 8 (matches master.md), top-level gate wording unified with §8 RFC approval gate, §4.3 audit wording fixed (no-new-prompt-protocol; custom_type registration deferred to §5/§8). Added Provider-Auth's `inbox` × sender decision matrix in §4.2 and follow-up open question RFC-OQ-7 / §4.OQ-6 on `open` vs `invited` collapse. |
