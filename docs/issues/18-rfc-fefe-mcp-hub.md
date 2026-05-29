@@ -11,7 +11,8 @@
 > - §3 Identity / Auth / Session / Namespace / Agent registry — @Provider-Auth-Lead
 > - §4 Visibility model — @alice (seed draft below)
 > - §5 Notification routing / delivery semantics — @Runtime-dev-lead
-> - §6 Client integration — @Tools-MCP-Lead
+> - §6a Client integration (contract + runtime boundary) — @Tools-MCP-Lead
+> - §6b `/hub *` CLI / TUI surface — @CLI-TUI-Dev-Lead
 > - §7 Worker implementation + storage model — **TBD**
 > - §8 Deployment / `~/cf_token` boundary / CI / acceptance / release gate — @QA-Release-Lead
 
@@ -72,7 +73,8 @@ Ship:
 | 3   | Identity / Auth / Session / Namespace / Agent registry         | @Provider-Auth-Lead                         | TBD                 |
 | 4   | Visibility model                                               | @alice                                      | **seed draft below** |
 | 5   | Notification routing / delivery semantics                      | @Runtime-dev-lead                           | TBD                 |
-| 6   | Client integration                                             | @Tools-MCP-Lead                             | TBD                 |
+| 6a  | Client integration (contract + runtime boundary)               | @Tools-MCP-Lead                             | TBD                 |
+| 6b  | `/hub *` CLI / TUI surface                                     | @CLI-TUI-Dev-Lead                           | TBD                 |
 | 7   | Worker implementation + storage                                | **TBD**                                     | TBD                 |
 | 8   | Deployment / `~/cf_token` / CI / acceptance / release gate     | @QA-Release-Lead                            | TBD                 |
 
@@ -226,11 +228,19 @@ TBD — @Runtime-dev-lead. Scope per 2026-05-29 commitment:
 - Envelope: source label `mcp:pie-hub:...`, ack / dedup via `pie_dedup_key`, default `payload_visibility = Local`, redelivery / idempotency semantics, offline + reconnect backlog bounds, ordering not guaranteed.
 - Hub-side fan-out / inbox delivery semantics live in §6 / §7; §5 covers the boundary from client receive to `Trigger` conversion.
 
-## §6 Client integration
+## §6a Client integration — contract + runtime boundary
 
-TBD — @Tools-MCP-Lead. `HttpMcpTransport` (MCP spec 2025-03-26 streamable HTTP — POST for requests, SSE for server-push), `~/.pie/mcp.toml` hub entry shape, `/hub *` CLI / TUI surface, first-contact gate cite to issue #110.
+TBD — @Tools-MCP-Lead. `HttpMcpTransport` (MCP spec 2025-03-26 streamable HTTP — POST for requests, SSE for server-push), `~/.pie/mcp.toml` hub entry shape, `mcp_loader.rs` adapter, `McpNotificationHook` wiring, first-contact gate cite to issue #110.
 
 `HttpMcpTransport` is a parallel deliverable independent of hub schema; it benefits any MCP-over-HTTP server.
+
+This chapter owns the **engine API**: connect / register / list / send / poll signatures, error mapping to recovery hints, transport reconnect and backoff semantics. The CLI / TUI in §6b consumes this API; it does not start a parallel hub client.
+
+## §6b `/hub *` CLI / TUI surface
+
+TBD — @CLI-TUI-Dev-Lead. User-facing surface: `/hub login`, `/hub register`, `/hub status`, `/hub list`, Hub panel in the TUI, Feed-line display rules for hub-originated notifications, error wording with next-step recovery actions (per Provider-Auth-Lead's "internal vocabulary → user recovery action" rule).
+
+**§6a × §6b contract.** CLI commands call §6a's engine API only. CLI does not parse hub MCP responses directly, does not own connection state, does not run a parallel client. Schema lives in §6a. Mirrors the engine / slash-command split in [[02-slash-commands]] task #23.
 
 ## §7 Worker implementation + storage model
 
@@ -267,11 +277,11 @@ The master roadmap requires every sub-issue to address the five working principl
 
 | Axis              | Primary chapters                                                                                              |
 | ----------------- | ------------------------------------------------------------------------------------------------------------- |
-| Architecture      | §1, §2, §6, §7                                                                                                |
-| Stability         | §5 (delivery, dedup, retry, ordering, offline); §3 (token rotate / revoke, password lockout); §6 (transport reconnect, backoff) |
+| Architecture      | §1, §2, §6a, §7                                                                                               |
+| Stability         | §5 (delivery, dedup, retry, ordering, offline); §3 (token rotate / revoke, password lockout); §6a (transport reconnect, backoff) |
 | Extensibility     | §2 (versioning, additive schema, capability negotiation); §4 (capability taxonomy); §3 (`action_class` extension) |
-| Performance       | §7 (storage choice, rate limit, body cap, cold start); §6 (transport efficiency, SSE backpressure)            |
-| Testing           | §8 (acceptance matrix, phased gates); each chapter contributes tests in its layer                             |
+| Performance       | §7 (storage choice, rate limit, body cap, cold start); §6a (transport efficiency, SSE backpressure)           |
+| Testing           | §8 (acceptance matrix, phased gates); each chapter contributes tests in its layer (§6b owns user-path TUI / CLI tests) |
 
 ## Review checkpoints (apply to every chapter — per @QA-Release-Lead)
 
@@ -346,3 +356,4 @@ Owned by @QA-Release-Lead in §8. Required contents:
 | Date       | By     | Change                                                                                  |
 | ---------- | ------ | --------------------------------------------------------------------------------------- |
 | 2026-05-29 | @alice | v0.1 scaffold: chapter map, §4 seed draft, terminology, defaults, open-questions log.   |
+| 2026-05-29 | @alice | Split §6 into §6a (engine contract + transport, @Tools-MCP-Lead) and §6b (`/hub *` CLI/TUI surface, @CLI-TUI-Dev-Lead) per Tools-MCP-Lead's request. |
