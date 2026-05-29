@@ -40,6 +40,13 @@ Concretely, the RFC is "done" only when:
 
 This does NOT change the "no real Cloudflare in CI" rule (§8). CI uses faux Worker / `wrangler dev` / Miniflare; the deployed-Worker e2e is a distinct gate, executed manually by a human reviewer before the RFC is marked complete in the master roadmap.
 
+**Status terminology (per @QA-Release-Lead 2026-05-29).** Two distinct states to avoid future misjudgement:
+
+- **pre-deploy complete** — CI / faux / local Worker green; implementation mergeable to a controlled branch or marked `experimental`. **Not** "feature complete."
+- **release complete / done** — real `pie.0xfefe.me` deployed + scripted manual e2e (per §8 acceptance matrix) recorded as passing. Only this state permits closing the parent task in the master roadmap.
+
+**Critical-path dependency.** First-contact gate (§4.3) implementation depends on issue #110 (`ControlPlaneWrite` user-Prompt category) landing. Per @Runtime-dev-lead (2026-05-29), #110 is promoted to P0 alongside §5 implementation.
+
 ## Non-goals
 
 - **Not a provider credential plane.** `pie.0xfefe.me` does not store, proxy, or know about OpenAI / Anthropic / Deepseek / Bedrock / Vertex credentials. Those continue to live in `~/.pie/auth.json` on the user's machine.
@@ -383,7 +390,8 @@ Owned by @QA-Release-Lead in §8. Required contents:
 | RFC-OQ-4      | Trust TTL: `Always` expires? Block expires? (§4.OQ-3)                                      | @alice: 90 d Always, indefinite Block.                |
 | RFC-OQ-5      | `inbox = invited` in v0? (§4.OQ-4)                                                         | @alice: ship in v0; gate populates it.                |
 | RFC-OQ-6      | Handle character set `[a-z0-9_-]{2,32}` — confirm or widen? (§4.OQ-5)                      | @alice: lock at this for v0.                          |
-| RFC-OQ-7      | Collapse `inbox=open` and `inbox=invited` in v0? (§4.OQ-6)                                 | @alice: lean keep both as operator signal.            |
+| RFC-OQ-7      | Collapse `inbox=open` and `inbox=invited` in v0? (§4.OQ-6)                                 | @alice: lean keep both as operator signal. Tools-MCP +1 keep-both (sender-side invitation-token semantic distinction). |
+| RFC-OQ-8      | Deploy mechanism for `pie.0xfefe.me`: manual (`~/cf_token` on operator's machine only) or CI auto-deploy (token in GitHub secrets + separate redaction / rotation gate)? | Awaiting @EdHuang. QA default until decided: manual. |
 
 ### Change log
 
@@ -393,3 +401,4 @@ Owned by @QA-Release-Lead in §8. Required contents:
 | 2026-05-29 | @alice | Split §6 into §6a (engine contract + transport, @Tools-MCP-Lead) and §6b (`/hub *` CLI/TUI surface, @CLI-TUI-Dev-Lead) per Tools-MCP-Lead's request. |
 | 2026-05-29 | @alice | Scaffold consistency fixes per @QA-Release-Lead review: Tier 4 → Tier 8 (matches master.md), top-level gate wording unified with §8 RFC approval gate, §4.3 audit wording fixed (no-new-prompt-protocol; custom_type registration deferred to §5/§8). Added Provider-Auth's `inbox` × sender decision matrix in §4.2 and follow-up open question RFC-OQ-7 / §4.OQ-6 on `open` vs `invited` collapse. |
 | 2026-05-29 | @alice | Per @EdHuang: completion criterion is e2e against the real deployed `pie.0xfefe.me`. Added "Definition of done" section; reorganized §8 phased gates so Real-deploy and Deployed-Worker-e2e are explicit terminal gates, with the e2e gate as definition-of-done. Preserved "no real Cloudflare in CI" rule by distinguishing CI-friendly gates (2/3/4) from manual / human-gated terminal gates (5/6). Raises priority on §7 Worker owner assignment (RFC-OQ-1). |
+| 2026-05-29 | @alice | Fold in QA-Release-Lead's status terminology (pre-deploy complete vs release complete / done) and Runtime-dev-lead's critical-path note (#110 P0 alongside §5 implementation). Added RFC-OQ-8 for deploy mechanism (manual vs CI auto-deploy), QA default = manual until @EdHuang decides. |
