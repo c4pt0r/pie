@@ -4506,6 +4506,57 @@ async fn on_turn_end_hook_unset_keeps_legacy_single_cycle_behavior() {
 }
 
 #[tokio::test]
+async fn on_turn_end_hook_noop_writes_no_audit_no_event() {
+    use parking_lot::Mutex;
+    use pie_agent_core::{OnTurnEndHook, TurnEndAction, TurnEndDecision};
+
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage.clone() as Arc<dyn SessionStorage>);
+
+    let mut opts = AgentHarnessOptions::new(faux_model(), session.clone());
+    opts.stream_fn = Some(faux_stream_fn("just answering"));
+    // Hook is permanently registered (e.g. `/goal` always-on hook), but
+    // returns Noop when there's no active goal — should look identical to
+    // "no hook configured" from the session's point of view.
+    let invocation_count = Arc::new(Mutex::new(0u32));
+    let ic = invocation_count.clone();
+    let hook: OnTurnEndHook = Arc::new(move |_ctx, _cancel| {
+        let ic = ic.clone();
+        Box::pin(async move {
+            *ic.lock() += 1;
+            TurnEndDecision {
+                action: TurnEndAction::Noop,
+                payload: Some(serde_json::json!({ "ignored": true })),
+            }
+        })
+    });
+    opts.on_turn_end = Some(hook);
+
+    let harness = AgentHarness::new(opts);
+    let received: Arc<Mutex<Vec<HarnessEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let r2 = received.clone();
+    let listener: HarnessListener = Arc::new(move |ev| r2.lock().push(ev));
+    let _unsub = harness.subscribe_harness(listener);
+
+    harness.prompt("hi").await.unwrap();
+
+    assert_eq!(
+        *invocation_count.lock(),
+        1,
+        "hook fires exactly once per turn even when it returns Noop",
+    );
+    let turn_end_count = received
+        .lock()
+        .iter()
+        .filter(|e| matches!(e, HarnessEvent::TurnEnded { .. }))
+        .count();
+    assert_eq!(turn_end_count, 0, "Noop emits no TurnEnded event");
+
+    let audits = read_custom_entries(storage, "turn_end_decision").await;
+    assert!(audits.is_empty(), "Noop writes no turn_end_decision audit");
+}
+
+#[tokio::test]
 async fn on_turn_end_hook_stop_emits_event_and_audits_payload() {
     use parking_lot::Mutex;
     use pie_agent_core::{OnTurnEndContext, OnTurnEndHook, TurnEndAction, TurnEndDecision};

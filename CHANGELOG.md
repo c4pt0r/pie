@@ -130,9 +130,13 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
 ### Added — Framework
 
 - **`OnTurnEndHook` runtime extension point.** New `AgentHarnessOptions::on_turn_end:
-  Option<OnTurnEndHook>` slot plus matching `TurnEndAction` (`Stop` / `Pause { reason }`
-  / `Continue { prompt }`), `TurnEndDecision { action, payload }`, and `OnTurnEndContext
-  { transcript, continuation_count, last_user_prompt }`. After every prompt cycle in
+  Option<OnTurnEndHook>` slot plus matching `TurnEndAction` (`Noop` / `Stop` / `Pause
+  { reason }` / `Continue { prompt }`), `TurnEndDecision { action, payload }`, and
+  `OnTurnEndContext { transcript, continuation_count, last_user_prompt }`. `Noop` is
+  the "hook recused itself for this turn" decision and behaves identically to "no
+  hook configured" — no `turn_end_decision` audit, no `HarnessEvent::TurnEnded` — so
+  long-lived hook registrations (e.g. `/goal`'s always-on `GoalStopHook`) don't
+  accumulate empty audit entries on every plain turn. After every prompt cycle in
   `AgentHarness::prompt` / `prompt_with_images` / `continue_` the harness now invokes the
   hook (when configured), and on `Continue` appends the returned text as a fresh
   `Message::User`, re-runs auto-compaction + budget-cap checks, and drives another

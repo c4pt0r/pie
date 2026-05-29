@@ -592,13 +592,27 @@ pub struct OnTurnEndContext {
 
 /// What the runtime should do after [`OnTurnEndHook`] inspects a completed prompt cycle.
 ///
-/// Each variant maps to a stable `decision` string in the persisted `turn_end_decision`
-/// audit entry (`"continue"` / `"stop"` / `"pause"`); a fourth `"budget_limited"` value
-/// is reserved for the runtime-emitted audit when the continuation cap is hit before the
-/// hook can run, so call sites never need to invent that string themselves.
+/// `Stop` / `Pause` / `Continue` each map to a stable `decision` string in the persisted
+/// `turn_end_decision` audit entry (`"stop"` / `"pause"` / `"continue"`); a fourth
+/// `"budget_limited"` value is reserved for the runtime-emitted audit when the
+/// continuation cap is hit before the hook can run, so call sites never need to invent
+/// that string themselves. `Noop` is intentionally not in that list — it deliberately
+/// writes nothing.
 #[derive(Clone, Debug)]
 pub enum TurnEndAction {
-    /// Normal completion. Runtime returns control to the caller.
+    /// Hook is currently inactive and has nothing to record for this turn. Behaves
+    /// identically to "no `on_turn_end` configured": **no `turn_end_decision` audit
+    /// entry is written, and no [`HarnessEvent::TurnEnded`] is emitted**. Use when the
+    /// hook is permanently registered but only meaningful in specific session states
+    /// — e.g. `/goal` returns `Noop` when there is no active goal, when the goal is
+    /// already `achieved`, or when the user has paused it externally — so untouched
+    /// sessions don't accumulate noise audit entries on every prompt.
+    ///
+    /// `TurnEndDecision::payload` is ignored when `action == Noop`; pass `None`.
+    Noop,
+    /// Normal completion. Runtime returns control to the caller. Records
+    /// `decision: "stop"` in the `turn_end_decision` audit and emits
+    /// [`HarnessEvent::TurnEnded`].
     Stop,
     /// Soft stop with an explanatory reason (e.g. "evaluator unavailable", "user
     /// requested pause"). Persisted in `turn_end_decision.data.reason` and surfaced
@@ -611,14 +625,17 @@ pub enum TurnEndAction {
 }
 
 impl TurnEndAction {
-    /// Stable `decision` string for the `turn_end_decision` audit entry. Avoid
-    /// stringifying the `Debug` representation — these values are part of the audit
-    /// contract and downstream JSONL readers compare against them.
-    pub fn as_audit_str(&self) -> &'static str {
+    /// Stable `decision` string for the `turn_end_decision` audit entry. `Noop` is
+    /// intentionally unmapped — it returns `None` and signals to the runtime that no
+    /// audit / event should be emitted for this turn. Avoid stringifying the `Debug`
+    /// representation — these values are part of the audit contract and downstream
+    /// JSONL readers compare against them.
+    pub fn as_audit_str(&self) -> Option<&'static str> {
         match self {
-            Self::Stop => "stop",
-            Self::Pause { .. } => "pause",
-            Self::Continue { .. } => "continue",
+            Self::Noop => None,
+            Self::Stop => Some("stop"),
+            Self::Pause { .. } => Some("pause"),
+            Self::Continue { .. } => Some("continue"),
         }
     }
 }
@@ -1623,6 +1640,13 @@ impl AgentHarness {
             *self.active_hook_cancel.lock() = None;
 
             match decision.action {
+                TurnEndAction::Noop => {
+                    // Hook deliberately recused itself — behave as if no hook were
+                    // configured: no audit, no event. Lets long-lived hooks (e.g.
+                    // `/goal`'s permanent registration) stay quiet on every plain
+                    // turn that doesn't have an active goal.
+                    return Ok(());
+                }
                 TurnEndAction::Stop => {
                     self.record_turn_end_decision(
                         "stop",
