@@ -188,6 +188,26 @@ pub enum HarnessEvent {
         template_name: Option<String>,
         preview: Option<String>,
     },
+    /// Emitted once per prompt-cycle boundary after [`OnTurnEndHook`] returns (or after
+    /// the runtime decides not to invoke it because the continuation cap was reached).
+    /// Lets the TUI / UI render "evaluator says: keep going" between continuation runs
+    /// without snooping the `turn_end_decision` audit entry.
+    ///
+    /// `decision` mirrors [`TurnEndAction::as_audit_str`] (`"stop"` / `"pause"` /
+    /// `"continue"`) plus `"budget_limited"` for the cap-exceeded path. `reason` carries
+    /// the pause reason (or the cap value rendered as a sentence) when applicable.
+    /// `next_prompt_preview` is the first ~80 chars of the continuation prompt on
+    /// `Continue` decisions; `None` otherwise.
+    ///
+    /// `continuation_count` is the *post*-decision counter: it reflects the iteration
+    /// number after the runtime applied the decision. For `Stop` / `Pause` this equals
+    /// the count of `Continue` decisions that fired earlier in the same prompt cycle.
+    TurnEnded {
+        decision: &'static str,
+        continuation_count: u32,
+        reason: Option<String>,
+        next_prompt_preview: Option<String>,
+    },
 }
 
 /// Listener for [`HarnessEvent`]. Shape mirrors `crate::agent::AgentListener` so the same Fn
@@ -536,6 +556,152 @@ pub type BeforeTriggerActionHook = Arc<
         + Sync,
 >;
 
+// ─────────────────────────────────────────────────────────────────────────────────────────
+// OnTurnEnd hook (powers `/goal` and other turn-completion driven orchestrators)
+// ─────────────────────────────────────────────────────────────────────────────────────────
+
+/// Snapshot passed into [`OnTurnEndHook`] after a prompt-cycle reaches a natural stop
+/// (assistant turned in a no-tool-call message, the agent's own `should_stop_after_turn`
+/// returned true, etc.). The hook owns the cross-prompt decision: should the harness
+/// start another prompt cycle in the same conversation (for `/goal` evaluator-driven
+/// continuation), pause it, or stop normally.
+///
+/// `transcript` is a **clone** of `Agent::state().messages` taken at the boundary — the
+/// mutex is released before the hook runs, so the hook future is `'static`. The hook is
+/// responsible for bounding what it forwards downstream (e.g. last N messages, token cap)
+/// when it builds an evaluator prompt; the runtime does not pre-trim because different
+/// orchestrators want different windows.
+///
+/// `continuation_count` is the number of times this same prompt-cycle has already been
+/// continued by an earlier `TurnEndAction::Continue` decision. Starts at 0 on the
+/// original user/template/continue entry, increments by 1 each time the hook decides to
+/// continue. The hard cap is [`AgentHarnessOptions::turn_continuation_cap`]; the runtime
+/// stops calling the hook (and records `decision: "budget_limited"`) once it would be
+/// exceeded — no need for the hook to enforce the cap itself.
+///
+/// `last_user_prompt` carries the text of the most recent `Message::User` text content,
+/// when one is identifiable, so evaluators can render "the user asked for X" without
+/// re-walking the transcript. `None` when no user-text message exists (e.g. `continue_`
+/// from a transcript with only assistant + tool messages).
+#[derive(Clone)]
+pub struct OnTurnEndContext {
+    pub transcript: Vec<AgentMessage>,
+    pub continuation_count: u32,
+    pub last_user_prompt: Option<String>,
+}
+
+/// What the runtime should do after [`OnTurnEndHook`] inspects a completed prompt cycle.
+///
+/// Each variant maps to a stable `decision` string in the persisted `turn_end_decision`
+/// audit entry (`"continue"` / `"stop"` / `"pause"`); a fourth `"budget_limited"` value
+/// is reserved for the runtime-emitted audit when the continuation cap is hit before the
+/// hook can run, so call sites never need to invent that string themselves.
+#[derive(Clone, Debug)]
+pub enum TurnEndAction {
+    /// Normal completion. Runtime returns control to the caller.
+    Stop,
+    /// Soft stop with an explanatory reason (e.g. "evaluator unavailable", "user
+    /// requested pause"). Persisted in `turn_end_decision.data.reason` and surfaced
+    /// through [`HarnessEvent::TurnEnded`]. Runtime returns control to the caller.
+    Pause { reason: String },
+    /// Run another prompt cycle in the same conversation. The runtime appends `prompt`
+    /// as a user `AgentMessage`, runs auto-compaction again, then drives the inner
+    /// agent's loop. `continuation_count` increments by 1 before the next hook call.
+    Continue { prompt: String },
+}
+
+impl TurnEndAction {
+    /// Stable `decision` string for the `turn_end_decision` audit entry. Avoid
+    /// stringifying the `Debug` representation — these values are part of the audit
+    /// contract and downstream JSONL readers compare against them.
+    pub fn as_audit_str(&self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::Pause { .. } => "pause",
+            Self::Continue { .. } => "continue",
+        }
+    }
+}
+
+/// Decision envelope returned from [`OnTurnEndHook`]. Wrapping the action lets the hook
+/// attach an opaque embedder-owned `payload` that gets persisted into the
+/// `turn_end_decision` audit record under `data.payload` — runtime never inspects it.
+/// `/goal` uses this to record evaluator JSON, evidence quotes, evaluator model id, etc.,
+/// without runtime needing to know about goal-mode-specific fields.
+#[derive(Clone, Debug)]
+pub struct TurnEndDecision {
+    pub action: TurnEndAction,
+    /// Optional structured payload merged into the `turn_end_decision` audit entry as
+    /// `data.payload`. `None` writes `data.payload: null`. The embedder is responsible
+    /// for keeping this serializable and small — bodies should be capped before being
+    /// returned, just like trigger result summaries.
+    pub payload: Option<serde_json::Value>,
+}
+
+impl From<TurnEndAction> for TurnEndDecision {
+    fn from(action: TurnEndAction) -> Self {
+        Self {
+            action,
+            payload: None,
+        }
+    }
+}
+
+/// Hook invoked at the boundary between two prompt cycles inside
+/// [`AgentHarness::prompt`] / [`AgentHarness::continue_`]. Fires exactly once after the
+/// inner agent's loop returns (success or `AgentRunError` short-circuit), with the cancel
+/// token wired to [`AgentHarness::abort`] so user-driven aborts interrupt the hook's own
+/// awaits (e.g. an evaluator sub-agent call).
+///
+/// Returning [`TurnEndAction::Continue { prompt }`] starts a new prompt cycle with the
+/// given text appended as a `Message::User`. Returning [`TurnEndAction::Stop`] or
+/// [`TurnEndAction::Pause`] returns control to the caller. `None` (no hook configured)
+/// is equivalent to `Stop`.
+///
+/// The hook runs **after** the persistence listener has flushed every `MessageEnd` to
+/// the session, so `transcript` matches what `--resume` would replay. It runs **before**
+/// the runtime writes the `turn_end_decision` audit entry — the entry's `payload` field
+/// comes from the returned [`TurnEndDecision::payload`].
+pub type OnTurnEndHook = Arc<
+    dyn Fn(
+            OnTurnEndContext,
+            tokio_util::sync::CancellationToken,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TurnEndDecision> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Default maximum number of [`TurnEndAction::Continue`] iterations per prompt cycle.
+/// When exceeded, the runtime records a `turn_end_decision` audit with
+/// `decision: "budget_limited"` and returns control to the caller without invoking the
+/// hook again. Embedders override via [`AgentHarnessOptions::turn_continuation_cap`].
+pub const DEFAULT_TURN_CONTINUATION_CAP: u32 = 25;
+
+/// Result of [`AgentHarness::run_evaluator`]. The evaluator is a sub-agent with
+/// `tools: []` and an in-memory session, so its only durable artifact is the assistant
+/// text it produced. Callers (e.g. the `/goal` `GoalStopHook`) typically parse this as
+/// JSON; the helper does not attempt to parse — that keeps the evaluator's prompt and
+/// expected response shape entirely embedder-owned.
+#[derive(Clone, Debug)]
+pub struct EvaluatorOutput {
+    /// Text content of the evaluator's last assistant message, truncated to 4 KiB on a
+    /// char boundary (same cap [`compute_sub_agent_outcome`] applies to trigger
+    /// summaries). `None` when the evaluator produced no assistant text (e.g. the run
+    /// was cancelled before the first token).
+    pub last_assistant_text: Option<String>,
+}
+
+/// Why [`AgentHarness::run_evaluator`] could not return a usable output. Distinct from
+/// `AgentRunError` so callers can render policy-specific messages ("evaluator failed —
+/// goal paused").
+#[derive(Debug, thiserror::Error)]
+pub enum EvaluatorError {
+    #[error("evaluator agent failed: {0}")]
+    Run(#[from] AgentRunError),
+    #[error("evaluator cancelled")]
+    Cancelled,
+}
+
 pub struct AgentHarnessOptions {
     /// Base system prompt prepended to the rendered skill catalog.
     pub system_prompt: String,
@@ -580,6 +746,16 @@ pub struct AgentHarnessOptions {
     /// reload (e.g. after `InstallSkillTool` writes a new `SKILL.md`) share one source of
     /// truth.
     pub reload_skills_fn: Option<ReloadSkillsFn>,
+    /// Optional hook invoked after every prompt cycle completes. Powers `/goal` and
+    /// any other turn-completion driven orchestrator. See [`OnTurnEndHook`] for the
+    /// contract. `None` is equivalent to a hook that always returns
+    /// [`TurnEndAction::Stop`] (i.e. current behavior).
+    pub on_turn_end: Option<OnTurnEndHook>,
+    /// Cap on the number of [`TurnEndAction::Continue`] decisions the runtime applies
+    /// to a single prompt cycle. `None` uses [`DEFAULT_TURN_CONTINUATION_CAP`]. Set
+    /// `0` to disable continuation entirely (the hook still fires once for audit /
+    /// observability, but `Continue` decisions are treated as `budget_limited`).
+    pub turn_continuation_cap: Option<u32>,
 }
 
 impl AgentHarnessOptions {
@@ -601,6 +777,8 @@ impl AgentHarnessOptions {
             before_trigger: None,
             before_trigger_action: None,
             reload_skills_fn: None,
+            on_turn_end: None,
+            turn_continuation_cap: None,
         }
     }
 }
@@ -674,6 +852,16 @@ pub struct AgentHarness {
     /// `TriggerExecutionStarted` and removed after the terminal `Completed`/`Failed`
     /// event so snapshots reflect what's really running.
     running_triggers: Arc<Mutex<std::collections::HashMap<String, RunningTriggerHandle>>>,
+    /// Optional turn-completion hook. See [`OnTurnEndHook`]. `None` keeps the legacy
+    /// "one prompt cycle per call" behavior.
+    on_turn_end: Option<OnTurnEndHook>,
+    /// Resolved continuation cap — defaults to [`DEFAULT_TURN_CONTINUATION_CAP`] when
+    /// `AgentHarnessOptions::turn_continuation_cap` is `None`.
+    turn_continuation_cap: u32,
+    /// Cancellation token for the currently-running `OnTurnEndHook` future, when one
+    /// is in flight. Wired so [`Self::abort`] cancels the hook (e.g. an evaluator
+    /// sub-agent call) the same way it cancels the inner agent loop.
+    active_hook_cancel: Mutex<Option<tokio_util::sync::CancellationToken>>,
 }
 
 /// Internal record kept under `AgentHarness::running_triggers`. The public-facing snapshot
@@ -724,6 +912,11 @@ impl AgentHarness {
             before_tool_call: options.before_tool_call,
             after_tool_call: options.after_tool_call,
             running_triggers: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            on_turn_end: options.on_turn_end,
+            turn_continuation_cap: options
+                .turn_continuation_cap
+                .unwrap_or(DEFAULT_TURN_CONTINUATION_CAP),
+            active_hook_cancel: Mutex::new(None),
         }
     }
 
@@ -1178,6 +1371,12 @@ impl AgentHarness {
 
     pub fn abort(&self) {
         self.agent.abort();
+        // If an `OnTurnEndHook` future is currently in flight (typically waiting on an
+        // evaluator sub-agent), cancel it too so Ctrl-C / `/cancel` interrupts the
+        // entire prompt+continuation pipeline, not just the inner agent loop.
+        if let Some(token) = self.active_hook_cancel.lock().as_ref() {
+            token.cancel();
+        }
     }
 
     pub fn enqueue_steering(&self, message: AgentMessage) {
@@ -1318,6 +1517,166 @@ impl AgentHarness {
 
     async fn prompt_with_message(&self, msg: AgentMessage) -> Result<(), AgentRunError> {
         self.ensure_session_start_emitted();
+        self.check_budget_cap()?;
+        // Run compaction if we've crossed the threshold. This must happen before the user
+        // message is appended so the cut point doesn't risk splitting the current turn.
+        self.run_auto_compaction().await?;
+
+        // First iteration runs `agent.prompt(msg)` with the caller's user message; any
+        // `TurnEndAction::Continue` follow-up runs `agent.prompt(<new user msg>)` with the
+        // text the hook returned. `run_turn_with_continuation` handles the hook loop,
+        // persistence listener wiring, audit emission, and continuation cap enforcement.
+        let last_user_prompt = extract_user_prompt_text(&msg);
+        self.run_turn_with_continuation(Some(msg), last_user_prompt)
+            .await
+    }
+
+    pub async fn continue_(&self) -> Result<(), AgentRunError> {
+        self.ensure_session_start_emitted();
+        self.check_budget_cap()?;
+        self.run_auto_compaction().await?;
+
+        // `continue_` runs `agent.continue_()` on the first iteration (no new user
+        // message), and falls back to `agent.prompt(<hook text>)` on continuations
+        // exactly like the `prompt_with_message` path.
+        let last_user_prompt = self.last_user_text_from_state();
+        self.run_turn_with_continuation(None, last_user_prompt)
+            .await
+    }
+
+    /// Common driver for one prompt cycle plus zero or more `OnTurnEndHook`-driven
+    /// continuation cycles. `first_msg = Some(_)` triggers `agent.prompt(msg)` on the
+    /// first iteration; `None` triggers `agent.continue_()` (used by the public
+    /// [`Self::continue_`] entry). Subsequent iterations always go through
+    /// `agent.prompt(<user msg built from hook text>)`.
+    async fn run_turn_with_continuation(
+        &self,
+        first_msg: Option<AgentMessage>,
+        last_user_prompt: Option<String>,
+    ) -> Result<(), AgentRunError> {
+        let mut continuation_count: u32 = 0;
+        let mut pending_user_msg = first_msg;
+        let mut is_first_iteration = true;
+        let mut last_user_prompt = last_user_prompt;
+
+        loop {
+            let (listener, persist_errors) = make_session_listener(self.session.clone());
+            let unsub = self.agent.subscribe(listener);
+            let result = if is_first_iteration {
+                match pending_user_msg.take() {
+                    Some(msg) => self.agent.prompt(msg).await,
+                    None => self.agent.continue_().await,
+                }
+            } else {
+                // Continuation: every iteration after the first runs as a fresh prompt.
+                let msg = pending_user_msg.take().expect(
+                    "continuation iteration must have a pending user message from the hook",
+                );
+                self.agent.prompt(msg).await
+            };
+            unsub();
+            finish_persisted_run(result, persist_errors)?;
+            is_first_iteration = false;
+
+            // No hook configured → behave like the legacy single-cycle path. Skip event
+            // and audit emission so embedders that never opt in pay zero overhead and
+            // see no schema change in their session jsonl.
+            let Some(hook) = self.on_turn_end.clone() else {
+                return Ok(());
+            };
+
+            // Cap enforcement: if the previous iteration was already a continuation and
+            // the cap is exhausted, record `budget_limited` and stop without invoking
+            // the hook again. Counted on `continuation_count`, not the loop iteration
+            // count, so the initial turn never counts against the cap.
+            if continuation_count >= self.turn_continuation_cap {
+                let reason = format!(
+                    "continuation cap reached: {} >= {}",
+                    continuation_count, self.turn_continuation_cap
+                );
+                self.record_turn_end_decision(
+                    "budget_limited",
+                    continuation_count,
+                    Some(reason.clone()),
+                    None,
+                    None,
+                )
+                .await;
+                return Ok(());
+            }
+
+            // Snapshot transcript outside the hook future so the parking_lot guard is
+            // released before any `.await`. The hook is responsible for trimming.
+            let transcript_snapshot = self.agent.state().messages.clone();
+            let ctx = OnTurnEndContext {
+                transcript: transcript_snapshot,
+                continuation_count,
+                last_user_prompt: last_user_prompt.clone(),
+            };
+
+            // Wire a cancel token to harness.abort() for the duration of the hook
+            // future. Released in all exit paths below so abort() does not see stale
+            // tokens between turns.
+            let cancel = tokio_util::sync::CancellationToken::new();
+            *self.active_hook_cancel.lock() = Some(cancel.clone());
+            let decision = hook(ctx, cancel).await;
+            *self.active_hook_cancel.lock() = None;
+
+            match decision.action {
+                TurnEndAction::Stop => {
+                    self.record_turn_end_decision(
+                        "stop",
+                        continuation_count,
+                        None,
+                        None,
+                        decision.payload,
+                    )
+                    .await;
+                    return Ok(());
+                }
+                TurnEndAction::Pause { reason } => {
+                    self.record_turn_end_decision(
+                        "pause",
+                        continuation_count,
+                        Some(reason),
+                        None,
+                        decision.payload,
+                    )
+                    .await;
+                    return Ok(());
+                }
+                TurnEndAction::Continue { prompt } => {
+                    continuation_count = continuation_count.saturating_add(1);
+                    let preview = Some(preview_for_banner(&prompt, 80));
+                    self.record_turn_end_decision(
+                        "continue",
+                        continuation_count,
+                        None,
+                        preview,
+                        decision.payload,
+                    )
+                    .await;
+                    // Build the follow-up user message and loop. Re-check the budget cap
+                    // before each continuation iteration so a `Continue` decision cannot
+                    // bypass a tripped cap. Compaction also runs again because the
+                    // previous turn may have grown the transcript past the threshold.
+                    self.check_budget_cap()?;
+                    self.run_auto_compaction().await?;
+                    let user_msg = AgentMessage::Llm(PiMessage::User(pie_ai::UserMessage {
+                        role: pie_ai::UserRole::User,
+                        content: pie_ai::UserContent::Text(prompt.clone()),
+                        timestamp: chrono::Utc::now().timestamp_millis(),
+                    }));
+                    last_user_prompt = Some(prompt);
+                    pending_user_msg = Some(user_msg);
+                }
+            }
+        }
+    }
+
+    /// Shared budget-cap precondition used by every entry path
+    /// (`prompt` / `prompt_with_images` / `continue_` / continuation iterations).
+    fn check_budget_cap(&self) -> Result<(), AgentRunError> {
         if let Some(cap) = self.budget_cap_usd {
             let total = self.cost.snapshot().tokens.cost.total;
             if total >= cap {
@@ -1326,25 +1685,55 @@ impl AgentHarness {
                 )));
             }
         }
-        // Run compaction if we've crossed the threshold. This must happen before the user
-        // message is appended so the cut point doesn't risk splitting the current turn.
-        self.run_auto_compaction().await?;
-
-        let (listener, persist_errors) = make_session_listener(self.session.clone());
-        let unsub = self.agent.subscribe(listener);
-        let result = self.agent.prompt(msg).await;
-        unsub();
-        finish_persisted_run(result, persist_errors)
+        Ok(())
     }
 
-    pub async fn continue_(&self) -> Result<(), AgentRunError> {
-        self.ensure_session_start_emitted();
-        self.run_auto_compaction().await?;
-        let (listener, persist_errors) = make_session_listener(self.session.clone());
-        let unsub = self.agent.subscribe(listener);
-        let result = self.agent.continue_().await;
-        unsub();
-        finish_persisted_run(result, persist_errors)
+    /// Walk the current agent transcript in reverse and return the text of the most
+    /// recent `Message::User` with text content, if any. Used by `continue_` to fill
+    /// `OnTurnEndContext::last_user_prompt` so evaluators don't need to re-scan.
+    fn last_user_text_from_state(&self) -> Option<String> {
+        let state = self.agent.state();
+        state.messages.iter().rev().find_map(|m| match m {
+            AgentMessage::Llm(PiMessage::User(u)) => extract_user_message_text(u),
+            _ => None,
+        })
+    }
+
+    /// Persist a `turn_end_decision` audit entry and emit the matching
+    /// [`HarnessEvent::TurnEnded`] event. Best-effort: persistence failures do not
+    /// abort the surrounding prompt cycle (the event still fires so observers can
+    /// flag the lost audit), matching the trigger audit reflux pattern.
+    async fn record_turn_end_decision(
+        &self,
+        decision: &'static str,
+        continuation_count: u32,
+        reason: Option<String>,
+        next_prompt_preview: Option<String>,
+        payload: Option<serde_json::Value>,
+    ) {
+        let data = serde_json::json!({
+            "decision": decision,
+            "continuation_count": continuation_count,
+            "reason": reason,
+            "next_prompt_preview": next_prompt_preview,
+            "payload": payload.unwrap_or(serde_json::Value::Null),
+        });
+        if let Err(e) = self
+            .session
+            .append_custom("turn_end_decision", Some(data))
+            .await
+        {
+            self.emit_harness_event(HarnessEvent::PersistenceError {
+                context: "turn_end_decision".into(),
+                message: format!("turn_end_decision append failed: {:?}", e.code),
+            });
+        }
+        self.emit_harness_event(HarnessEvent::TurnEnded {
+            decision,
+            continuation_count,
+            reason,
+            next_prompt_preview,
+        });
     }
 
     /// Force a compaction immediately, regardless of token thresholds. Useful for `/compact`-
@@ -1354,6 +1743,73 @@ impl AgentHarness {
         custom_instructions: Option<String>,
     ) -> Result<bool, AgentRunError> {
         self.do_compact(true, custom_instructions).await
+    }
+
+    /// Run a tool-less, in-memory evaluator sub-agent and return its last assistant
+    /// text. Used by `OnTurnEndHook` implementations (e.g. the `/goal` stop hook) that
+    /// need to ask a separate model "is the user's goal met by this transcript?"
+    /// without contaminating the parent session, cost tracker, or audit log.
+    ///
+    /// Behavior:
+    /// - The sub-agent has `tools: []`. The evaluator is a judge, not an actor — it
+    ///   must never invoke a tool, even if the embedder accidentally leaves tool
+    ///   hooks on. Mirrors the `disable_model_invocation` posture for evaluators.
+    /// - The sub-agent uses [`MemorySessionStorage`] so its conversation is discarded
+    ///   when this call returns. No `--resume` artifact is created.
+    /// - `system_prompt` and `user_prompt` are passed verbatim — the caller owns the
+    ///   evaluator's JSON-output contract.
+    /// - `cancel` is honored on the sub-agent's `Agent::abort()` path: the call
+    ///   returns [`EvaluatorError::Cancelled`] if the token is tripped (typically by
+    ///   the surrounding hook getting `cancel.cancelled()` from
+    ///   [`AgentHarness::abort`]).
+    /// - Cost is **not** attributed to the parent `CostTracker`. The evaluator runs
+    ///   on a bare `Agent` without a tracker subscriber — same honesty rule the
+    ///   `trigger_result.cost_usd: null` audit follows. Embedders that need cost
+    ///   accounting on evaluators should subscribe their own listener.
+    pub async fn run_evaluator(
+        &self,
+        system_prompt: String,
+        user_prompt: String,
+        model: Model,
+        thinking_level: ThinkingLevel,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<EvaluatorOutput, EvaluatorError> {
+        let mut state = AgentState::default();
+        state.model = Some(model);
+        state.thinking_level = Some(thinking_level);
+        state.tools = Vec::new();
+        state.system_prompt = system_prompt;
+
+        let eval_agent = Agent::new(AgentOptions {
+            initial_state: Some(state),
+            stream_fn: self.stream_fn.clone(),
+            // Intentionally no before/after_tool_call hooks — evaluator has no tools.
+            ..Default::default()
+        });
+
+        let user_message = AgentMessage::Llm(PiMessage::User(pie_ai::UserMessage {
+            role: pie_ai::UserRole::User,
+            content: pie_ai::UserContent::Text(user_prompt),
+            timestamp: chrono::Utc::now().timestamp_millis(),
+        }));
+
+        let run_outcome: Result<(), AgentRunError> = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                eval_agent.abort();
+                return Err(EvaluatorError::Cancelled);
+            }
+            res = eval_agent.prompt(user_message) => res,
+        };
+        run_outcome?;
+
+        let last_assistant_text = {
+            let state = eval_agent.state();
+            last_assistant_text(&state)
+        };
+        Ok(EvaluatorOutput {
+            last_assistant_text,
+        })
     }
 
     async fn run_auto_compaction(&self) -> Result<(), AgentRunError> {
@@ -2588,4 +3044,43 @@ fn preview_for_banner(text: &str, max_chars: usize) -> String {
     let mut out: String = text.chars().take(max_chars).collect();
     out.push('…');
     out
+}
+
+/// Extract the text body of a `Message::User`, joining `Blocks` text content. Returns
+/// `None` for image-only messages or empty text. Used to fill
+/// [`OnTurnEndContext::last_user_prompt`] for the most recent user message in the
+/// transcript.
+fn extract_user_message_text(u: &pie_ai::UserMessage) -> Option<String> {
+    match &u.content {
+        pie_ai::UserContent::Text(s) => {
+            if s.is_empty() {
+                None
+            } else {
+                Some(s.clone())
+            }
+        }
+        pie_ai::UserContent::Blocks(blocks) => {
+            let mut out = String::new();
+            for block in blocks {
+                if let pie_ai::UserContentBlock::Text(t) = block {
+                    if !out.is_empty() {
+                        out.push('\n');
+                    }
+                    out.push_str(&t.text);
+                }
+            }
+            if out.is_empty() { None } else { Some(out) }
+        }
+    }
+}
+
+/// Extract the text payload from the `AgentMessage` the caller passed into
+/// `prompt_with_message`. Returns `None` for non-LLM or non-user messages and for empty
+/// content. Used to fill [`OnTurnEndContext::last_user_prompt`] for the freshly-arrived
+/// user prompt before the transcript has been mutated.
+fn extract_user_prompt_text(msg: &AgentMessage) -> Option<String> {
+    match msg {
+        AgentMessage::Llm(PiMessage::User(u)) => extract_user_message_text(u),
+        _ => None,
+    }
 }

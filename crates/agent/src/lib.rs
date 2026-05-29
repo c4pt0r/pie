@@ -26,10 +26,12 @@ pub use types::{
 pub use harness::{
     agent_harness::{
         AgentHarness, AgentHarnessOptions, BeforeTriggerActionContext, BeforeTriggerActionHook,
-        BeforeTriggerContext, BeforeTriggerDecision, BeforeTriggerHook, HarnessEvent,
-        HarnessListener, NotificationStatusSnapshot, PromoteAction, PromotionCondition,
-        PromotionConditionSkipReason, ReloadSkillsError, ReloadSkillsFn, RunningTriggerState,
-        TriggerAction, TriggerDelivery,
+        BeforeTriggerContext, BeforeTriggerDecision, BeforeTriggerHook,
+        DEFAULT_TURN_CONTINUATION_CAP, EvaluatorError, EvaluatorOutput, HarnessEvent,
+        HarnessListener, NotificationStatusSnapshot, OnTurnEndContext, OnTurnEndHook,
+        PromoteAction, PromotionCondition, PromotionConditionSkipReason, ReloadSkillsError,
+        ReloadSkillsFn, RunningTriggerState, TriggerAction, TriggerDelivery, TurnEndAction,
+        TurnEndDecision,
     },
     compaction::{
         branch_summarization::{BranchSummaryResult, summarize_branch},

@@ -129,6 +129,37 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
 
 ### Added — Framework
 
+- **`OnTurnEndHook` runtime extension point.** New `AgentHarnessOptions::on_turn_end:
+  Option<OnTurnEndHook>` slot plus matching `TurnEndAction` (`Stop` / `Pause { reason }`
+  / `Continue { prompt }`), `TurnEndDecision { action, payload }`, and `OnTurnEndContext
+  { transcript, continuation_count, last_user_prompt }`. After every prompt cycle in
+  `AgentHarness::prompt` / `prompt_with_images` / `continue_` the harness now invokes the
+  hook (when configured), and on `Continue` appends the returned text as a fresh
+  `Message::User`, re-runs auto-compaction + budget-cap checks, and drives another
+  prompt cycle through the same single turn slot. `TurnEndAction::Stop` (or no hook
+  configured) keeps the legacy "one cycle per call" behavior. Powers `/goal` and any
+  future evaluator-driven orchestrator while staying domain-agnostic — the runtime
+  records a `turn_end_decision` `Custom` session entry (decision string, post-decision
+  `continuation_count`, optional `reason`, `next_prompt_preview`, and embedder-owned
+  `payload`) and emits the parallel `HarnessEvent::TurnEnded` so TUIs can render
+  continuation status without snooping audit. A new
+  `AgentHarnessOptions::turn_continuation_cap: Option<u32>` (default
+  `DEFAULT_TURN_CONTINUATION_CAP = 25`) hard-caps the loop; reaching the cap records
+  `decision: "budget_limited"` without invoking the hook again so runaway evaluators
+  cannot burn unbounded turns. `AgentHarness::abort` cancels in-flight hook futures
+  (e.g. an evaluator sub-agent call) by tripping a hook-scoped cancel token alongside
+  the inner agent abort. Companion helper `AgentHarness::run_evaluator(system_prompt,
+  user_prompt, model, thinking_level, cancel) -> Result<EvaluatorOutput, EvaluatorError>`
+  spawns an isolated tool-less sub-agent on an in-memory session (no parent transcript,
+  no parent cost attribution, no session write) and returns the assistant text verbatim
+  — embedders own the JSON contract. New tests: hook unset preserves legacy behavior
+  (no audit, no `TurnEnded` event), `Stop` decision emits a single event + audit with
+  the embedder payload, `Continue` decision runs a second turn whose transcript
+  contains the hook-supplied user message followed by the second assistant message,
+  continuation cap emits exactly N `continue` events followed by `budget_limited`
+  without re-invoking the hook, evaluator returns the model's text verbatim while
+  leaving the parent session empty, and a pre-tripped cancel token short-circuits the
+  evaluator with `EvaluatorError::Cancelled`.
 - **`InstallSkill` builtin tool (issue #87 sub-PR B)** New harness tool that installs a skill
   into the user-global skills directory (`~/.pie/skills/<name>/SKILL.md`) from one of three
   sources: an `https://` URL, an absolute local path, or inline content. After the atomic
