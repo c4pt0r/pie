@@ -131,6 +131,22 @@ jobs:
             npm install
           fi
 
+      - name: apply D1 migrations
+        working-directory: ${{ steps.validate.outputs.worker_dir }}
+        # `CF_API_KEY` is exposed only to protected deploy-lane Cloudflare
+        # steps. This migration step uses the same validated wrangler version
+        # and worker directory as the deploy step; it does not read raw
+        # workflow inputs.
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_KEY }}
+          WRANGLER_VERSION: ${{ steps.validate.outputs.wrangler_version }}
+        run: |
+          # Run schema migrations before deploy so first live e2e can exercise
+          # register/login/notification paths against the real D1 database.
+          npx --yes "wrangler@${WRANGLER_VERSION}" d1 migrations apply pie_fefe_hub \
+            --remote \
+            --yes
+
       - name: deploy worker
         id: deploy
         working-directory: ${{ steps.validate.outputs.worker_dir }}

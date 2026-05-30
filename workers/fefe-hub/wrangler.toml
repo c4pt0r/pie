@@ -8,7 +8,7 @@ HUB_VERSION = "0.1.0"
 [[d1_databases]]
 binding = "DB"
 database_name = "pie_fefe_hub"
-database_id = "00000000-0000-0000-0000-000000000000"
+database_id = "5fdff213-1e2f-464a-87e0-a62b8065a5a5"
 migrations_dir = "migrations"
 
 [[durable_objects.bindings]]
