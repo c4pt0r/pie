@@ -103,6 +103,9 @@ mod tests {
     fn filters_by_prefix() {
         let m = completer().matches("/thi");
         assert_eq!(m, vec!["/thinking".to_string()]);
+
+        let m = completer().matches("/goal-s");
+        assert_eq!(m, vec!["/goal-start".to_string()]);
     }
 
     #[test]

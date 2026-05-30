@@ -164,6 +164,7 @@ impl Registry {
         r.register(Arc::new(FindCommand));
         r.register(Arc::new(HistoryCommand));
         r.register(Arc::new(GoalCommand));
+        r.register(Arc::new(GoalStartCommand));
         r.register(Arc::new(HubCommand));
         r.register(Arc::new(TriggersCommand));
         r.register(Arc::new(NewTriggerCommand));
@@ -933,6 +934,27 @@ impl SlashCommand for ThinkingCommand {
 
 struct GoalCommand;
 
+fn goal_start_prompt(argv: &[String]) -> String {
+    argv.join(" ").trim().to_string()
+}
+
+async fn run_goal_start(prompt: String, ctx: &CommandCtx<'_>) -> CommandOutcome {
+    if prompt.is_empty() {
+        return CommandOutcome::Error("usage: /goal-start <prompt>".into());
+    }
+    if let Err(e) = crate::goal::current(ctx.harness)
+        .await
+        .filter(|state| state.active())
+        .ok_or_else(|| "no active goal; set one with /goal <condition>".to_string())
+    {
+        return CommandOutcome::Error(e);
+    }
+    CommandOutcome::RunAgentPrompt {
+        prompt,
+        error_context: "goal start: ",
+    }
+}
+
 #[async_trait]
 impl SlashCommand for GoalCommand {
     fn name(&self) -> &'static str {
@@ -940,7 +962,7 @@ impl SlashCommand for GoalCommand {
     }
 
     fn description(&self) -> &'static str {
-        "set, start, view, pause, resume, or clear the session goal stop hook"
+        "set, view, pause, resume, or clear the session goal stop hook"
     }
 
     fn usage(&self) -> &'static str {
@@ -974,23 +996,7 @@ impl SlashCommand for GoalCommand {
                 }
                 Err(e) => CommandOutcome::Error(e),
             },
-            Some("start") => {
-                let prompt = argv[1..].join(" ").trim().to_string();
-                if prompt.is_empty() {
-                    return CommandOutcome::Error("usage: /goal start <prompt>".into());
-                }
-                if let Err(e) = crate::goal::current(ctx.harness)
-                    .await
-                    .filter(|state| state.active())
-                    .ok_or_else(|| "no active goal; set one with /goal <condition>".to_string())
-                {
-                    return CommandOutcome::Error(e);
-                }
-                CommandOutcome::RunAgentPrompt {
-                    prompt,
-                    error_context: "goal start: ",
-                }
-            }
+            Some("start") => run_goal_start(goal_start_prompt(&argv[1..]), ctx).await,
             Some(_) => {
                 let condition = argv.join(" ").trim().to_string();
                 if condition.is_empty() {
@@ -1002,13 +1008,34 @@ impl SlashCommand for GoalCommand {
                         cprintln!(
                             "goal will continue after each successful turn until transcript evidence satisfies the condition"
                         );
-                        cprintln!("start by sending a normal prompt, or run /goal start <prompt>");
+                        cprintln!("start by sending a normal prompt, or run /goal-start <prompt>");
                         CommandOutcome::Handled
                     }
                     Err(e) => CommandOutcome::Error(e),
                 }
             }
         }
+    }
+}
+
+struct GoalStartCommand;
+
+#[async_trait]
+impl SlashCommand for GoalStartCommand {
+    fn name(&self) -> &'static str {
+        "goal-start"
+    }
+
+    fn description(&self) -> &'static str {
+        "start working on the active session goal with a prompt"
+    }
+
+    fn usage(&self) -> &'static str {
+        "<prompt>"
+    }
+
+    async fn run(&self, argv: &[String], ctx: &CommandCtx<'_>) -> CommandOutcome {
+        run_goal_start(goal_start_prompt(argv), ctx).await
     }
 }
 
@@ -3472,6 +3499,13 @@ mod tests {
         let quit = help_text(&registry, Some("/quit"));
         assert!(quit.contains("/quit"), "{quit}");
         assert!(quit.contains("aliases: /exit, /q"), "{quit}");
+
+        let goal_start = help_text(&registry, Some("goal-start"));
+        assert!(goal_start.contains("/goal-start <prompt>"), "{goal_start}");
+        assert!(
+            goal_start.contains("start working on the active session goal"),
+            "{goal_start}"
+        );
     }
 
     #[test]

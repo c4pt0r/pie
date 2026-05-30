@@ -374,7 +374,7 @@ async fn dispatch_goal_sets_and_reports_session_goal() {
     let output = capture.text();
     assert!(output.contains("goal set: finish only after cargo test passes"));
     assert!(
-        output.contains("start by sending a normal prompt, or run /goal start <prompt>"),
+        output.contains("start by sending a normal prompt, or run /goal-start <prompt>"),
         "{output}"
     );
     assert!(output.contains("status: pursuing"), "{output}");
@@ -429,6 +429,42 @@ async fn dispatch_goal_start_runs_prompt_when_goal_active() {
 }
 
 #[tokio::test]
+async fn dispatch_goal_start_shortcut_runs_prompt_when_goal_active() {
+    let _guard = COMMAND_OUTPUT_LOCK.lock().unwrap();
+    let _capture = OutputCapture::install();
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage as Arc<dyn SessionStorage>);
+    let opts = AgentHarnessOptions::new(faux_model(), session.clone());
+    let harness = Arc::new(AgentHarness::new(opts));
+
+    goal::set(&harness, "finish only after cargo test passes".into())
+        .await
+        .unwrap();
+
+    let registry = commands::Registry::with_builtins();
+    let cwd = std::env::current_dir().unwrap();
+    let ctx = commands::CommandCtx {
+        harness: &harness,
+        session_id: "test",
+        log_path: None,
+        tool_count: 0,
+        cwd: &cwd,
+    };
+
+    let outcome = commands::dispatch("/goal-start run cargo test", &registry, &ctx).await;
+    match outcome {
+        commands::CommandOutcome::RunAgentPrompt {
+            prompt,
+            error_context,
+        } => {
+            assert_eq!(prompt, "run cargo test");
+            assert_eq!(error_context, "goal start: ");
+        }
+        other => panic!("expected RunAgentPrompt, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn dispatch_goal_start_requires_active_goal() {
     let _guard = COMMAND_OUTPUT_LOCK.lock().unwrap();
     let _capture = OutputCapture::install();
@@ -448,6 +484,15 @@ async fn dispatch_goal_start_requires_active_goal() {
     };
 
     let outcome = commands::dispatch("/goal start run cargo test", &registry, &ctx).await;
+    match outcome {
+        commands::CommandOutcome::Error(message) => {
+            assert!(message.contains("no active goal"), "{message}");
+            assert!(message.contains("/goal <condition>"), "{message}");
+        }
+        other => panic!("expected Error, got {other:?}"),
+    }
+
+    let outcome = commands::dispatch("/goal-start run cargo test", &registry, &ctx).await;
     match outcome {
         commands::CommandOutcome::Error(message) => {
             assert!(message.contains("no active goal"), "{message}");
