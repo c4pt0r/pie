@@ -2133,7 +2133,7 @@ async fn before_trigger_prompt_abort_cancels_in_flight_prompt_hook() {
                 let _ = tx.send(());
             }
             cancel.cancelled().await;
-            TriggerPromptDecision::Timeout
+            TriggerPromptDecision::Timeout { reason: None }
         })
     });
     opts.on_trigger_prompt = Some(trigger_prompt);
@@ -2184,6 +2184,7 @@ async fn before_trigger_prompt_abort_cancels_in_flight_prompt_hook() {
         })
         .expect("trigger_prompt audit entry");
     assert_eq!(prompt_audit["decision"].as_str(), Some("timeout"));
+    assert_eq!(prompt_audit["reason"].as_str(), None);
 }
 
 #[tokio::test]

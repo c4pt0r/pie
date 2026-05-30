@@ -40,6 +40,7 @@ mod skills;
 mod skills_state;
 mod templates;
 mod tools;
+mod trigger_prompt;
 mod triggers;
 mod ui;
 
@@ -435,6 +436,21 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
         ));
         None
     };
+    let trigger_prompt_rx = if interactive_tui {
+        let (hook, rx) = trigger_prompt::interactive_hook(session.clone());
+        opts.on_trigger_prompt = Some(hook);
+        Some(rx)
+    } else if cli.web {
+        opts.on_trigger_prompt = Some(trigger_prompt::deny_hook(
+            "hub first-contact prompts are not available in the Web UI yet; run pie in the terminal UI to review this notification",
+        ));
+        None
+    } else {
+        opts.on_trigger_prompt = Some(trigger_prompt::deny_hook(
+            "hub first-contact prompt requires an interactive terminal; run pie in a TTY to review this notification",
+        ));
+        None
+    };
     // Triggers from MCP servers configured with `inject_summary` / `inject_and_run` bypass
     // the sub-agent and inject their pushed summary into chat (the latter also runs one
     // model turn in the parent context); everything else falls through to the dynamic-rule
@@ -539,6 +555,7 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
         feed_rx,
         main_run_rx,
         control_plane_prompt_rx,
+        trigger_prompt_rx,
         panel_status: ui::PanelStatus {
             mcp_servers: mcp.client_count,
             mcp_tools: mcp_tool_count,
@@ -722,6 +739,7 @@ fn active_hook_registrations(lsp_lang_count: usize, cli_hooks_loaded: bool) -> V
     let mut points = vec![
         "before_tool_call".to_string(),
         "on_control_plane_prompt".to_string(),
+        "on_trigger_prompt".to_string(),
         "before_trigger_action".to_string(),
     ];
     if lsp_lang_count > 0 {

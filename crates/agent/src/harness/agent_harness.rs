@@ -295,7 +295,7 @@ pub struct TriggerPromptRequest {
 pub enum TriggerPromptDecision {
     Allow,
     Deny { reason: Option<String> },
-    Timeout,
+    Timeout { reason: Option<String> },
 }
 
 impl TriggerPromptDecision {
@@ -303,13 +303,16 @@ impl TriggerPromptDecision {
         match self {
             Self::Allow => "allow",
             Self::Deny { .. } => "deny",
-            Self::Timeout => "timeout",
+            Self::Timeout { .. } => "timeout",
         }
     }
 
     fn reason(&self) -> Option<String> {
         match self {
             Self::Deny { reason } => reason
+                .as_ref()
+                .map(|reason| cap_trigger_prompt_reason(reason)),
+            Self::Timeout { reason } => reason
                 .as_ref()
                 .map(|reason| cap_trigger_prompt_reason(reason)),
             _ => None,
@@ -1143,9 +1146,8 @@ impl AgentHarness {
                         let resolved = self.resolve_trigger_prompt(&trigger, reason).await;
                         let state = match resolved.decision {
                             TriggerPromptDecision::Allow => TriggerState::Accepted,
-                            TriggerPromptDecision::Deny { .. } | TriggerPromptDecision::Timeout => {
-                                TriggerState::NeedsApproval
-                            }
+                            TriggerPromptDecision::Deny { .. }
+                            | TriggerPromptDecision::Timeout { .. } => TriggerState::NeedsApproval,
                         };
                         (
                             state,
