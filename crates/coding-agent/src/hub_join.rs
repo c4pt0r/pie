@@ -15,7 +15,7 @@ use crate::hub_auth::{
     HubAuthStartResponse,
 };
 
-const CALLBACK_PATH: &str = "/hub/callback";
+const CALLBACK_PATH: &str = "/callback";
 const JOIN_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub struct JoinedHub {
@@ -42,11 +42,17 @@ pub async fn join_default_hub() -> Result<JoinedHub> {
     join_default_hub_with_options(HubJoinOptions::default()).await
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) async fn join_default_hub_for_test() -> Result<JoinedHub> {
+    join_default_hub().await
+}
+
 async fn join_default_hub_with_options(options: HubJoinOptions) -> Result<JoinedHub> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .context("bind local callback listener")?;
-    let redirect_uri = format!("http://{}/hub/callback", listener.local_addr()?);
+    let redirect_uri = format!("http://{}{}", listener.local_addr()?, CALLBACK_PATH);
     let state = opaque_nonce("state");
     let verifier = pkce_verifier();
     let challenge = pkce_challenge(&verifier);

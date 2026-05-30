@@ -1090,7 +1090,7 @@ async fn hub_join(argv: &[String]) -> CommandOutcome {
     match crate::hub_join::join_default_hub().await {
         Ok(joined) => {
             cprintln!("Joined hub as @{}@{}", joined.handle, joined.namespace);
-            cprintln!("restart pie to load the hub MCP transport, then run /hub status");
+            cprintln!("restart pie, then run /hub status");
             CommandOutcome::Handled
         }
         Err(e) => CommandOutcome::Error(format!(

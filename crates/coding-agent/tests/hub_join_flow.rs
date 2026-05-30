@@ -66,21 +66,11 @@ async fn hub_join_browser_loopback_stores_token_without_rendering_auth_secrets()
     let _pie_dir = EnvGuard::set("PIE_DIR", temp.path());
     auth::AuthStore::default().save().unwrap();
 
-    let state = Arc::new(Mutex::new(FauxAuthState::default()));
-    let app = Router::new()
-        .route("/auth/start", post(auth_start))
-        .route("/auth/exchange_code", post(auth_exchange))
-        .route("/login", get(login_page))
-        .with_state(state.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let origin = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
+    let server = FauxAuthServer::start().await;
 
     let (opened_tx, opened_rx) = oneshot::channel::<String>();
     let opened_tx = parking_lot::Mutex::new(Some(opened_tx));
-    let _guard = hub_join::install_test_join_runtime(origin, move |url| {
+    let _guard = hub_join::install_test_join_runtime(server.origin.clone(), move |url| {
         opened_tx
             .lock()
             .take()
@@ -92,28 +82,7 @@ async fn hub_join_browser_loopback_stores_token_without_rendering_auth_secrets()
 
     let join = tokio::spawn(async { hub_join::join_default_hub().await });
     let login_url = opened_rx.await.unwrap();
-    let callback_query = {
-        let state = state.lock().await;
-        let start = state.start.as_ref().expect("captured start request");
-        format!("code=hub_code_test_join_secret&state={}", start.state)
-    };
-    let login = reqwest::Url::parse(&login_url).unwrap();
-    let redirect_uri = login
-        .query_pairs()
-        .find_map(|(key, value)| (key == "redirect").then(|| value.into_owned()))
-        .expect("faux login URL includes redirect");
-    let mut callback = reqwest::Url::parse(&redirect_uri).unwrap();
-    callback.set_query(Some(&callback_query));
-    let callback_response = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .unwrap()
-        .get(callback.clone())
-        .send()
-        .await
-        .unwrap();
-    assert!(callback_response.status().is_success());
-    let callback_text = callback_response.text().await.unwrap();
+    let (_callback, callback_text) = drive_login_callback(&login_url, &server.state).await;
     assert!(
         callback_text.contains("Hub login complete"),
         "{callback_text}"
@@ -136,18 +105,23 @@ async fn hub_join_browser_loopback_stores_token_without_rendering_auth_secrets()
         other => panic!("unexpected credential kind: {other:?}"),
     }
 
-    let state = state.lock().await;
+    let state = server.state.lock().await;
     let start = state.start.as_ref().expect("captured start request");
     assert_eq!(start.client_kind, "pie-cli");
     assert_eq!(start.code_challenge_method, HUB_AUTH_CODE_CHALLENGE_METHOD);
     assert!(start.loopback_redirect_uri.starts_with("http://127.0.0.1:"));
+    assert!(
+        start.loopback_redirect_uri.ends_with("/callback"),
+        "{}",
+        start.loopback_redirect_uri
+    );
     let exchange = state.exchange.as_ref().expect("captured exchange request");
     assert_eq!(exchange.code, "hub_code_test_join_secret");
     assert_eq!(exchange.state, start.state);
     assert!(!exchange.code_verifier.is_empty());
 
     let visible = format!(
-        "Joined hub as @{}@{}; restart pie to load the hub MCP transport",
+        "Joined hub as @{}@{}; restart pie, then run /hub status",
         joined.handle, joined.namespace
     );
     let secrets = hub_auth::HubAuthSecretFragments {
@@ -161,20 +135,76 @@ async fn hub_join_browser_loopback_stores_token_without_rendering_auth_secrets()
     secrets.assert_absent_from("join visible output", &visible);
 }
 
+struct FauxAuthServer {
+    origin: String,
+    state: Arc<Mutex<FauxAuthState>>,
+}
+
+impl FauxAuthServer {
+    async fn start() -> Self {
+        let state = Arc::new(Mutex::new(FauxAuthState::default()));
+        let app = Router::new()
+            .route("/auth/start", post(auth_start))
+            .route("/auth/exchange_code", post(auth_exchange))
+            .route("/login", get(login_page))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        Self { origin, state }
+    }
+}
+
+async fn drive_login_callback(
+    login_url: &str,
+    state: &Arc<Mutex<FauxAuthState>>,
+) -> (reqwest::Url, String) {
+    let callback_query = {
+        let state = state.lock().await;
+        let start = state.start.as_ref().expect("captured start request");
+        format!("code=hub_code_test_join_secret&state={}", start.state)
+    };
+    let login = reqwest::Url::parse(login_url).unwrap();
+    let redirect_uri = login
+        .query_pairs()
+        .find_map(|(key, value)| (key == "redirect").then(|| value.into_owned()))
+        .expect("faux login URL includes redirect");
+    let mut callback = reqwest::Url::parse(&redirect_uri).unwrap();
+    callback.set_query(Some(&callback_query));
+    let callback_response = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap()
+        .get(callback.clone())
+        .send()
+        .await
+        .unwrap();
+    assert!(callback_response.status().is_success());
+    let callback_text = callback_response.text().await.unwrap();
+    (callback, callback_text)
+}
+
 async fn auth_start(
     State(state): State<Arc<Mutex<FauxAuthState>>>,
     axum::Json(request): axum::Json<HubAuthStartRequest>,
-) -> axum::Json<HubAuthStartResponse> {
+) -> Result<axum::Json<HubAuthStartResponse>, axum::http::StatusCode> {
+    let redirect = reqwest::Url::parse(&request.loopback_redirect_uri)
+        .map_err(|_| axum::http::StatusCode::BAD_REQUEST)?;
+    if redirect.path() != "/callback" {
+        return Err(axum::http::StatusCode::BAD_REQUEST);
+    }
     let callback = format!(
         "{}?code=hub_code_test_join_secret",
         request.loopback_redirect_uri
     );
     state.lock().await.start = Some(request);
-    axum::Json(HubAuthStartResponse {
+    Ok(axum::Json(HubAuthStartResponse {
         exchange_request_id: "exchange-request-1".into(),
         login_url: format!("http://127.0.0.1/login?redirect={callback}"),
         expires_in_seconds: 30,
-    })
+    }))
 }
 
 async fn auth_exchange(
