@@ -10,9 +10,13 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use pie_agent_core::AgentTool;
-use pie_mcp::{McpClient, StdioTransport};
+use pie_mcp::{
+    HttpMcpAuth, HttpMcpTransport, HttpMcpTransportOptions, McpClient, ReconnectPolicy,
+    StdioTransport,
+};
 use serde::Deserialize;
 
+use crate::auth::AuthStore;
 use crate::config::base_dir;
 use crate::tools::mcp_adapter::McpAgentTool;
 use crate::triggers::McpNotificationHook;
@@ -26,9 +30,17 @@ pub struct McpConfig {
 #[derive(Debug, Deserialize)]
 pub struct ServerConfig {
     pub name: String,
-    pub command: String,
+    #[serde(default)]
+    pub kind: ServerKind,
+    pub command: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
+    pub endpoint: Option<String>,
+    pub auth: Option<HttpAuthConfig>,
+    pub request_timeout_ms: Option<u64>,
+    pub sse_idle_timeout_ms: Option<u64>,
+    pub body_cap_bytes: Option<usize>,
+    pub reconnect: Option<ReconnectConfig>,
     /// Treat this server as a pure notification feed: its pushed `payload_summary` is
     /// injected straight into the parent chat (no sub-agent, no model call) instead of
     /// dispatching the dynamic-rule sub-agent. Off by default. See
@@ -41,6 +53,27 @@ pub struct ServerConfig {
     /// wake the main agent (with tools + history) — opt in per server only.
     #[serde(default)]
     pub inject_and_run: bool,
+}
+
+#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ServerKind {
+    #[default]
+    Stdio,
+    StreamableHttp,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HttpAuthConfig {
+    pub kind: String,
+    pub token_keychain_ref: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReconnectConfig {
+    pub initial_ms: Option<u64>,
+    pub max_ms: Option<u64>,
+    pub max_attempts: Option<usize>,
 }
 
 /// Output of loading. Holds tools (to register with the agent), diagnostics (startup
@@ -168,9 +201,10 @@ async fn read_config(path: &Path, diagnostics: &mut Vec<String>, label: &str) ->
 async fn connect_one(
     s: &ServerConfig,
 ) -> Result<(Vec<Arc<dyn AgentTool>>, Arc<McpNotificationHook>)> {
-    let args: Vec<&str> = s.args.iter().map(|x| x.as_str()).collect();
-    let transport = StdioTransport::spawn(&s.command, &args).await?;
-    let client = Arc::new(McpClient::new(Arc::new(transport)));
+    let client = match s.kind {
+        ServerKind::Stdio => connect_stdio(s).await?,
+        ServerKind::StreamableHttp => connect_streamable_http(s).await?,
+    };
     client.initialize("pie-coding-agent").await?;
     // Take the server-push notification receiver before any other consumer can claim it.
     // `take_notifications` returns `Some` exactly once per client; subsequent callers (and
@@ -192,6 +226,105 @@ async fn connect_one(
     Ok((out, hook))
 }
 
+async fn connect_stdio(s: &ServerConfig) -> Result<Arc<McpClient>> {
+    if s.endpoint.is_some() || s.auth.is_some() {
+        anyhow::bail!(
+            "stdio MCP server '{}' must not set endpoint or auth; remove streamable_http fields",
+            s.name
+        );
+    }
+    let command = s
+        .command
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("stdio MCP server '{}' missing command", s.name))?;
+    let args: Vec<&str> = s.args.iter().map(String::as_str).collect();
+    let transport = StdioTransport::spawn(command, &args).await?;
+    let client = Arc::new(McpClient::new(Arc::new(transport)));
+    Ok(client)
+}
+
+async fn connect_streamable_http(s: &ServerConfig) -> Result<Arc<McpClient>> {
+    if s.command.is_some() || !s.args.is_empty() {
+        anyhow::bail!(
+            "streamable_http MCP server '{}' must set endpoint, not command/args",
+            s.name
+        );
+    }
+    let endpoint = s
+        .endpoint
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("streamable_http MCP server '{}' missing endpoint", s.name))?
+        .clone();
+    let mut opts = HttpMcpTransportOptions::new(endpoint);
+    opts.auth = resolve_http_auth(s.auth.as_ref())?;
+    if let Some(ms) = s.request_timeout_ms {
+        if ms == 0 {
+            anyhow::bail!(
+                "streamable_http MCP server '{}' request_timeout_ms must be positive",
+                s.name
+            );
+        }
+        opts.request_timeout = std::time::Duration::from_millis(ms);
+    }
+    if let Some(ms) = s.sse_idle_timeout_ms {
+        if ms == 0 {
+            anyhow::bail!(
+                "streamable_http MCP server '{}' sse_idle_timeout_ms must be positive",
+                s.name
+            );
+        }
+        opts.sse_idle_timeout = std::time::Duration::from_millis(ms);
+    }
+    if let Some(cap) = s.body_cap_bytes {
+        if cap == 0 {
+            anyhow::bail!(
+                "streamable_http MCP server '{}' body_cap_bytes must be positive",
+                s.name
+            );
+        }
+        opts.body_cap_bytes = cap;
+    }
+    if let Some(reconnect) = &s.reconnect {
+        if reconnect.initial_ms == Some(0) || reconnect.max_ms == Some(0) {
+            anyhow::bail!(
+                "streamable_http MCP server '{}' reconnect delays must be positive",
+                s.name
+            );
+        }
+        opts.reconnect_policy = ReconnectPolicy {
+            initial_delay: std::time::Duration::from_millis(reconnect.initial_ms.unwrap_or(500)),
+            max_delay: std::time::Duration::from_millis(reconnect.max_ms.unwrap_or(30_000)),
+            max_attempts: reconnect.max_attempts,
+        };
+    }
+    let transport = HttpMcpTransport::connect(opts)?;
+    Ok(Arc::new(McpClient::new(Arc::new(transport))))
+}
+
+fn resolve_http_auth(auth: Option<&HttpAuthConfig>) -> Result<HttpMcpAuth> {
+    let Some(auth) = auth else {
+        return Ok(HttpMcpAuth::None);
+    };
+    if auth.kind != "bearer" {
+        anyhow::bail!("unsupported streamable_http auth kind; expected bearer");
+    }
+    let token_ref = auth
+        .token_keychain_ref
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("bearer auth requires token_keychain_ref"))?;
+    let store = AuthStore::load().map_err(|e| {
+        anyhow::anyhow!(
+            "failed to load local credential store: {e}; run /login <token-ref> to store the hub token"
+        )
+    })?;
+    let token = store.resolve_for_provider(token_ref).ok_or_else(|| {
+        anyhow::anyhow!(
+            "configured bearer credential was not found; run /login <configured-token-ref> to store the hub token"
+        )
+    })?;
+    Ok(HttpMcpAuth::Bearer { token })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,15 +337,29 @@ mod tests {
         let configs = vec![
             ServerConfig {
                 name: "broken-a".into(),
-                command: "/definitely/not/a/real/path/for/mcp/test-a".into(),
+                kind: ServerKind::Stdio,
+                command: Some("/definitely/not/a/real/path/for/mcp/test-a".into()),
                 args: vec![],
+                endpoint: None,
+                auth: None,
+                request_timeout_ms: None,
+                sse_idle_timeout_ms: None,
+                body_cap_bytes: None,
+                reconnect: None,
                 inject_summary: false,
                 inject_and_run: false,
             },
             ServerConfig {
                 name: "broken-b".into(),
-                command: "/definitely/not/a/real/path/for/mcp/test-b".into(),
+                kind: ServerKind::Stdio,
+                command: Some("/definitely/not/a/real/path/for/mcp/test-b".into()),
                 args: vec![],
+                endpoint: None,
+                auth: None,
+                request_timeout_ms: None,
+                sse_idle_timeout_ms: None,
+                body_cap_bytes: None,
+                reconnect: None,
                 inject_summary: false,
                 inject_and_run: false,
             },
@@ -248,5 +395,119 @@ mod tests {
         assert!(hooks.is_empty());
         assert!(diagnostics.is_empty());
         assert_eq!(client_count, 0);
+    }
+
+    #[test]
+    fn streamable_http_config_deserializes_with_bearer_ref() {
+        let cfg: McpConfig = toml::from_str(
+            r#"
+[[server]]
+name = "pie-hub"
+kind = "streamable_http"
+endpoint = "https://pie.0xfefe.me/mcp"
+auth = { kind = "bearer", token_keychain_ref = "pie-hub:default" }
+request_timeout_ms = 30000
+sse_idle_timeout_ms = 60000
+body_cap_bytes = 1048576
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.server.len(), 1);
+        let server = &cfg.server[0];
+        assert_eq!(server.name, "pie-hub");
+        assert_eq!(server.kind, ServerKind::StreamableHttp);
+        assert_eq!(
+            server.endpoint.as_deref(),
+            Some("https://pie.0xfefe.me/mcp")
+        );
+        assert_eq!(
+            server
+                .auth
+                .as_ref()
+                .and_then(|auth| auth.token_keychain_ref.as_deref()),
+            Some("pie-hub:default")
+        );
+    }
+
+    #[tokio::test]
+    async fn streamable_http_rejects_command_args() {
+        let server = ServerConfig {
+            name: "pie-hub".into(),
+            kind: ServerKind::StreamableHttp,
+            command: Some("node".into()),
+            args: vec!["server.js".into()],
+            endpoint: Some("https://pie.0xfefe.me/mcp".into()),
+            auth: None,
+            request_timeout_ms: None,
+            sse_idle_timeout_ms: None,
+            body_cap_bytes: None,
+            reconnect: None,
+            inject_summary: false,
+            inject_and_run: false,
+        };
+        let err = match connect_streamable_http(&server).await {
+            Ok(_) => panic!("streamable_http with command/args should fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("must set endpoint, not command/args"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn streamable_http_auth_resolves_from_auth_store_without_debug_leak() {
+        let _guard = crate::auth::ENV_LOCK.lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let original = std::env::var_os("PIE_DIR");
+        unsafe { std::env::set_var("PIE_DIR", dir.path()) };
+        let token = "hub_agent_should_not_leak";
+        let mut store = crate::auth::AuthStore::default();
+        store.set(
+            "pie-hub:default",
+            crate::auth::ProviderCredential::ApiKey {
+                value: token.into(),
+            },
+        );
+        store.save().unwrap();
+
+        let auth = resolve_http_auth(Some(&HttpAuthConfig {
+            kind: "bearer".into(),
+            token_keychain_ref: Some("pie-hub:default".into()),
+        }))
+        .unwrap();
+        let debug = format!("{auth:?}");
+        assert!(!debug.contains(token), "{debug}");
+        assert!(debug.contains("<redacted>"), "{debug}");
+
+        match original {
+            Some(value) => unsafe { std::env::set_var("PIE_DIR", value) },
+            None => unsafe { std::env::remove_var("PIE_DIR") },
+        }
+    }
+
+    #[test]
+    fn streamable_http_missing_auth_diagnostic_does_not_echo_token_ref() {
+        let _guard = crate::auth::ENV_LOCK.lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let original = std::env::var_os("PIE_DIR");
+        unsafe { std::env::set_var("PIE_DIR", dir.path()) };
+        crate::auth::AuthStore::default().save().unwrap();
+
+        let secret_like_ref = "hub_agent_should_not_leak";
+        let err = resolve_http_auth(Some(&HttpAuthConfig {
+            kind: "bearer".into(),
+            token_keychain_ref: Some(secret_like_ref.into()),
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(!err.contains(secret_like_ref), "{err}");
+        assert!(err.contains("<configured-token-ref>"), "{err}");
+
+        match original {
+            Some(value) => unsafe { std::env::set_var("PIE_DIR", value) },
+            None => unsafe { std::env::remove_var("PIE_DIR") },
+        }
     }
 }

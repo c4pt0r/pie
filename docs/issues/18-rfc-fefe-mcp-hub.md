@@ -1268,13 +1268,13 @@ No new file, no new top-level config section.
 
 ```toml
 # stdio entry (today; unchanged)
-[[mcp_server]]
+[[server]]
 name = "my-local-tool"
 command = "node"
 args = ["my-tool.js"]
 
 # hub entry (new; §6a.3)
-[[mcp_server]]
+[[server]]
 name = "pie-hub"             # canonical name; runtime trust + audit keys on this prefix (§5.2)
 kind = "streamable_http"     # new variant; default kind = "stdio" (back-compat)
 endpoint = "https://pie.0xfefe.me/mcp"

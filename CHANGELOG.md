@@ -145,6 +145,18 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
   fans out live receiver mailboxes. Worker CI runs hermetic npm tests only; real
   Cloudflare deploy remains isolated to the protected GitHub Actions lane using
   `CF_API_KEY`.
+- **#19 Phase A** `HttpMcpTransport` for Streamable HTTP MCP servers. `crates/mcp`
+  now adapts POST request/response bodies plus long-lived SSE pushes into the
+  existing line-oriented `Transport` queue, so `McpClient` can reuse the same
+  inflight, cancel, `tools/list`, `tools/call`, and notification pump logic as
+  stdio servers. `~/.pie/mcp.toml` entries can set `kind = "streamable_http"`,
+  `endpoint = "https://pie.0xfefe.me/mcp"`, and bearer auth via
+  `auth = { kind = "bearer", token_keychain_ref = "pie-hub:default" }`; the
+  token is resolved from the local auth store and injected only as
+  `Authorization: Bearer`, never into MCP JSON bodies or diagnostics. Hermetic
+  faux HTTP/SSE tests cover POST, SSE notification delivery, body-cap rejection,
+  bearer header injection, config parsing, and auth debug redaction. CLI/TUI
+  `/hub` UX remains a follow-up layer on top of this engine API.
 
 ### Added — Framework
 

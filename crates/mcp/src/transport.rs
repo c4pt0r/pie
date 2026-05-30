@@ -1,4 +1,4 @@
-//! Transport abstraction. v1 ships stdio; SSE/WebSocket plug in here.
+//! Transport abstraction. Stdio and Streamable HTTP both adapt to one JSON object per line.
 
 use async_trait::async_trait;
 

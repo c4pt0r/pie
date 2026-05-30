@@ -16,9 +16,11 @@ async-trait = "0.1"
 thiserror = "2"
 parking_lot = "0.12"
 futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 
 [dev-dependencies]
 anyhow = "1"
+axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
 
 [lints]
