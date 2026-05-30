@@ -92,7 +92,7 @@ This does NOT change the "no real Cloudflare in build/test CI" rule (§8). Build
 | 3   | Identity / Auth / Session / Namespace / Agent registry         | @Provider-Auth-Lead                         | **v0.2**            |
 | 4   | Visibility model                                               | @alice                                      | **v0.2**            |
 | 5   | Notification routing / delivery semantics                      | @Runtime-dev-lead                           | **v0.1**            |
-| 6a  | Client integration (contract + runtime boundary)               | @Tools-MCP-Lead                             | TBD                 |
+| 6a  | Client integration (contract + runtime boundary)               | @Tools-MCP-Lead                             | **v0.1**            |
 | 6b  | `/hub *` CLI / TUI surface                                     | @CLI-TUI-Dev-Lead                           | TBD                 |
 | 7   | Worker implementation + storage                                | **TBD**                                     | TBD                 |
 | 8   | Deployment / `CF_API_KEY` / CI / acceptance / release gate     | @QA-Release-Lead                            | **v0.1**            |
@@ -1176,13 +1176,319 @@ Senders that need stronger ordering should embed application-level sequence numb
 - MCP wire-level (`_meta.*` namespace additions, tool param names) — Tools-MCP defines in §2; §5 cites.
 - Whoever drafts first picks the name; the other follows. Drafts ship in the same commit; reviewer merges as a pair.
 
-## §6a Client integration — contract + runtime boundary
+## §6a Client integration — contract + runtime boundary — v0.1 (@Tools-MCP-Lead)
 
-TBD — @Tools-MCP-Lead. `HttpMcpTransport` (MCP spec 2025-03-26 streamable HTTP — POST for requests, SSE for server-push), `~/.pie/mcp.toml` hub entry shape, `mcp_loader.rs` adapter, `McpNotificationHook` wiring, first-contact gate cite to issue #110.
+> Status: **v0.1 draft.** Defines the client-side engine contract that ties
+> the on-wire MCP surface (§2) + the runtime trigger pipeline (§5) + the
+> identity/auth model (§3) into actual code paths inside `crates/mcp` +
+> `crates/agent` + `crates/coding-agent`. The CLI/TUI surface (§6b) consumes
+> this engine API; it does not maintain a parallel hub client.
 
-`HttpMcpTransport` is a parallel deliverable independent of hub schema; it benefits any MCP-over-HTTP server.
+### §6a.1 What this chapter owns
 
-This chapter owns the **engine API**: connect / register / list / send / poll signatures, error mapping to recovery hints, transport reconnect and backoff semantics. The CLI / TUI in §6b consumes this API; it does not start a parallel hub client.
+The chapter owns the **engine API** — function signatures, types, and side-
+effect contracts — for everything the local pie process does to talk to a
+hub:
+
+- The transport implementation that carries MCP JSON-RPC over Streamable HTTP
+  (POST + SSE per MCP spec 2025-03-26).
+- `~/.pie/mcp.toml` hub entry shape — how a hub registers as one more MCP
+  server alongside stdio entries.
+- The `mcp_loader::connect_one` extension that builds a hub `LoadedMcp` the
+  same way it builds a stdio one.
+- The `make_pie_hub_notification_hook` factory wiring (cite §5.1) that
+  produces a configured `McpNotificationHook` for the hub adapter.
+- The first-contact gate wiring point (cite §5.6 + #110) — where the
+  embedder installs `HubTrustGate` as the `BeforeTriggerHook`.
+- Auth header injection discipline (cite §3.3 + Provider/Auth ask on §1
+  review).
+- Body cap and error-mapping discipline on the client side (defense in depth
+  against a misbehaving or malicious hub).
+- Reconnect, backoff, and resume cursor semantics (cite §5.8).
+- The test strategy — fixture-driven faux HTTP/SSE, no real Cloudflare in
+  build/test CI (cite §8).
+
+Not in scope: hub-side schema (§2 / §3 / §4), envelope shape inside the
+runtime (§5), CLI/TUI commands and user-visible wording (§6b), Worker
+implementation and storage (§7), deploy and acceptance gates (§8).
+
+### §6a.2 `HttpMcpTransport` — new transport in `crates/mcp`
+
+`crates/mcp` ships a `Transport` trait today (line-oriented; `send_line` +
+`recv_line` + `close`; `StdioTransport` is the only implementation). The hub
+adapter adds a second implementation:
+
+```rust
+// crates/mcp/src/http_transport.rs (new file)
+pub struct HttpMcpTransport { ... }
+
+impl HttpMcpTransport {
+    pub fn connect(opts: HttpMcpTransportOptions) -> Result<Self, McpError>;
+}
+
+#[async_trait]
+impl Transport for HttpMcpTransport {
+    async fn send_line(&self, line: String) -> Result<(), McpError>;
+    async fn recv_line(&self) -> Result<Option<String>, McpError>;
+    async fn close(&self);
+}
+```
+
+`HttpMcpTransportOptions` (Tools-MCP owns the exact field list; final shape
+locked in PR-X1 — placeholder here):
+
+| Field                  | Type             | Purpose                                                                |
+| ---------------------- | ---------------- | ---------------------------------------------------------------------- |
+| `endpoint_url`         | `String`         | Hub URL (e.g. `https://pie.0xfefe.me/mcp`). Default schema = `https`. |
+| `auth`                 | `HttpMcpAuth`    | See §6a.5. Carries the agent token (or `None` for unauthenticated MCP `initialize` only). |
+| `reconnect_policy`     | `ReconnectPolicy`| Backoff curve, max attempts, jitter. See §6a.7.                       |
+| `body_cap_bytes`       | `usize`          | Client-side defense-in-depth cap on response bodies. Default 1 MiB (§2.7 list-tool cap × 4). Hub-side caps are tighter; this catches outliers. |
+| `request_timeout`      | `Duration`       | Per-POST timeout. Default 30 s.                                       |
+| `sse_idle_timeout`     | `Duration`       | If no SSE event / heartbeat for this long, drop and reconnect. Default 60 s. |
+| `user_agent`           | `String`         | `pie-cli/<version> (mcp-streamable-http/2025-03-26)`.                 |
+
+**No new trait.** `HttpMcpTransport` is a fresh `impl Transport`; the rest of
+`McpClient` (inflight, cancel — PR #74 — read pump — PR #35) reuses as-is.
+This is the §1.4 "no new pipeline" rule applied at the transport boundary.
+
+**Multiplexing.** The `Transport` trait is line-oriented; HTTP isn't. The
+implementation owns the impedance match: every `send_line(json)` becomes one
+POST whose **response body** (single JSON-RPC reply *or* an SSE stream of
+zero-or-more replies + zero-or-more server-push notifications) is parsed
+into individual JSON-RPC frames and enqueued onto an internal `mpsc<String>`.
+A parallel long-lived `GET ... Accept: text/event-stream` connection feeds
+unsolicited server-push notifications into the same queue. `recv_line` drains
+the queue. Frames from both sources look identical to upper-layer
+`McpClient`, which already routes responses vs. notifications by JSON-RPC id.
+
+### §6a.3 `~/.pie/mcp.toml` hub entry shape
+
+The hub registers as one more entry in the user's existing `~/.pie/mcp.toml`.
+No new file, no new top-level config section.
+
+```toml
+# stdio entry (today; unchanged)
+[[mcp_server]]
+name = "my-local-tool"
+command = "node"
+args = ["my-tool.js"]
+
+# hub entry (new; §6a.3)
+[[mcp_server]]
+name = "pie-hub"             # canonical name; runtime trust + audit keys on this prefix (§5.2)
+kind = "streamable_http"     # new variant; default kind = "stdio" (back-compat)
+endpoint = "https://pie.0xfefe.me/mcp"
+auth = { kind = "bearer", token_keychain_ref = "pie-hub:default" }   # see §6a.5
+
+# optional knobs (sane defaults; omit to use defaults)
+reconnect = { initial_ms = 500, max_ms = 30_000, jitter = "full" }
+request_timeout_ms = 30_000
+sse_idle_timeout_ms = 60_000
+body_cap_bytes = 1_048_576
+```
+
+Field discipline:
+
+- `kind` is a const-locked enum: `"stdio"` (default) or `"streamable_http"`.
+  Unknown kinds are loader errors with a bounded recovery hint ("install a
+  newer pie or remove the entry").
+- For `kind = "streamable_http"`, `endpoint` is required; `command` / `args`
+  are forbidden (reject at parse with a bounded error).
+- For `kind = "stdio"`, `endpoint` is forbidden symmetrically.
+- `name` MUST be `pie-hub` for the canonical production hub. Custom names are
+  allowed for staging / testing (e.g. `pie-hub-staging`), but the source-label
+  prefix in trust-list lookups is `mcp:{name}:` (§5.2). Two different `name`s
+  = two different trust scopes.
+- `auth.token_keychain_ref` is a logical handle; the actual secret lives in
+  the local pie auth store (e.g. `~/.pie/auth.json` per existing convention).
+  The TOML file MUST NOT carry token plaintext.
+
+### §6a.4 `mcp_loader::connect_one` — one extension, two kinds
+
+`mcp_loader::connect_one` (PR #63) today builds one stdio `LoadedMcp` per
+entry. The extension dispatches on `kind`:
+
+```rust
+// crates/coding-agent/src/mcp_loader.rs (extension)
+pub async fn connect_one(entry: &McpServerEntry) -> Result<LoadedMcp, McpLoaderError> {
+    let client = match entry.kind {
+        McpServerKind::Stdio          => connect_stdio(entry).await?,
+        McpServerKind::StreamableHttp => connect_streamable_http(entry).await?, // new
+    };
+    let tools = client.list_tools().await?;
+    let notification_hook = make_pie_hub_notification_hook_if_applicable(&entry.name, client.take_notifications());
+    Ok(LoadedMcp { client, tools, notification_hook })
+}
+```
+
+`make_pie_hub_notification_hook_if_applicable` returns
+`Some(McpNotificationHook configured for hub)` for entries whose `name`
+matches the canonical hub-name convention (and is registered via Runtime's
+factory per §5.1), else `None` (an arbitrary `streamable_http` MCP server
+that is not the pie hub still gets `McpNotificationHook`, but it uses the
+generic `mcp:{server_name}:` source label rather than the `mcp:pie-hub:`
+trust scope).
+
+### §6a.5 Auth — `Authorization: Bearer` only
+
+**Rule, locked with @Provider-Auth-Lead on PR #131 review:**
+
+- Agent tokens are sent **exclusively** as HTTP `Authorization: Bearer <token>`
+  on every POST and every SSE GET to the hub.
+- Tokens **MUST NEVER** appear in MCP JSON-RPC request bodies, response
+  bodies, runtime `Trigger` envelopes, `Custom` audit entries, embedder
+  logs, or bug reports.
+- `HttpMcpTransport` owns the header injection. It reads the token from the
+  local auth store (resolved via `token_keychain_ref` per §6a.3) at request
+  time; it does not pass the token into `send_line` (which would risk
+  serialization into JSON-RPC body) or into any envelope visible to
+  embedder code.
+- Token rotation (§3.3) is the embedder's responsibility — the transport
+  exposes `set_auth(HttpMcpAuth)` for live rotation without reconnect; the
+  embedder fetches the new token from the auth store and calls `set_auth`.
+- Token revocation (§3.3) is observed via the hub's `notifications/agent_revoked`
+  (§2.5) push or via a `-32005 auth_revoked` (§2.6) error on the next request.
+  Both paths drop the connection cleanly; `auth.token_keychain_ref` is left
+  in place but marked stale by the embedder.
+
+### §6a.6 Body caps and error mapping
+
+Two client-side disciplines that complement §2 server-side enforcement:
+
+**Body cap.** `HttpMcpTransport` enforces `body_cap_bytes` (default 1 MiB
+per response). Oversize responses return `McpError::TransportProtocol`
+("response body exceeded cap") and drop the connection. This is defense in
+depth against a hub that violates its own §2.7 caps; not a substitute for
+hub-side enforcement.
+
+**Error mapping.** Hub error codes from §2.6 land as `McpError` per the
+existing client-side mapping in `crates/mcp/src/errors.rs`. The
+`HttpMcpTransport` layer does not interpret application-level error codes
+(`-32000`…`-32010`); it surfaces them to `McpClient`. The
+`McpNotificationHook` / sub-agent code paths (and §6b CLI) consume the
+mapped errors and surface bounded recovery actions per §2.6. The transport
+itself maps only transport-level conditions: HTTP 5xx → `worker_unavailable`,
+HTTP 401/403 → `auth_required` / `auth_invalid` / `auth_revoked` per
+WWW-Authenticate (if present) or generic `auth_invalid` otherwise.
+
+### §6a.7 Reconnect and resume
+
+**Reconnect policy.** Exponential backoff with jitter; `initial_ms` = 500,
+`max_ms` = 30_000, jitter = "full" (per AWS recommendations). On every
+reconnect attempt the transport opens a fresh SSE GET and replays any
+outstanding inflight POSTs (which `McpClient`'s inflight registry owns).
+After `max_attempts` (default unbounded — embedder may cap), the transport
+emits `Transport::recv_line` = `Ok(None)` (clean EOF) and the upper layer
+treats the hub as gone.
+
+**Resume cursor.** The hub may supply a per-connection resume cursor on SSE
+(via the standard `id:` field of SSE events, per spec). On reconnect, the
+transport sends `Last-Event-ID: <cursor>` on the SSE GET; the hub uses this
+to bound the backlog it streams. Behavior of a hub that doesn't honor the
+cursor: the transport falls back to "deliver everything since now"; dedup
+(§5.5 `_meta.pie_dedup_key`) collapses any redeliveries that already
+landed pre-disconnect. The runtime side never sees double-handles.
+
+### §6a.8 Test strategy
+
+**Faux HTTP/SSE fixture.** `crates/mcp/tests/http_fixture.rs` (new) runs an
+in-process `axum` server on a bound ephemeral port. Tests construct an
+`HttpMcpTransport` pointing at the fixture URL and exercise:
+
+- POST request → JSON-RPC response (single-frame happy path).
+- POST request → SSE response (streamed multiple frames).
+- GET SSE long-lived → unsolicited `notifications/agent_message` push frames.
+- Reconnect: kill the fixture, restart with same port, assert backoff and
+  `Last-Event-ID` echo.
+- Body cap: fixture returns oversize body → `McpError::TransportProtocol`.
+- Auth: fixture asserts `Authorization: Bearer <expected>` header on every
+  request; fixture returns 401 → transport surfaces `auth_invalid`.
+- Revoked token: hub pushes `notifications/agent_revoked` → transport
+  closes cleanly; next request returns `auth_revoked`.
+- Dedup: hub redelivers a frame after reconnect → runtime-side dedup
+  (covered by existing `TriggerRuntime` tests; this fixture only asserts
+  that the frame arrives twice on the wire).
+
+**No real Cloudflare in CI** (per §8). The fixture is hermetic; the only
+test that touches `pie.0xfefe.me` is the deployed-Worker e2e gate (§8.4
+gate 6), which runs against the live deployment after the protected deploy
+workflow.
+
+### §6a.9 First-contact gate wiring
+
+This chapter only **wires** the gate; the gate logic lives in §5.6, the
+prompt UX lives in §6b, and the trust file shape lives in §5.7.
+
+Embedder integration in `crates/coding-agent/src/main.rs`:
+
+```rust
+// AFTER skill_harness_cell.set (per PR #63 ordering)
+let hub_trust_gate = HubTrustGate::from_disk(pie_base_dir.join("hub-trust.json")).await?;
+opts.before_trigger = Some(hub_trust_gate.as_before_trigger_hook());
+let harness = AgentHarness::new(opts).await?;
+// THEN register the hub's notification hook (PR #63 wiring; unchanged):
+for loaded in mcp_loaded.iter() {
+    if let Some(hook) = &loaded.notification_hook {
+        harness.register_notification_hook(hook.clone());
+    }
+}
+```
+
+Two ordering invariants the embedder MUST preserve:
+
+1. `before_trigger` is set on `AgentHarnessOptions` **before** the harness is
+   constructed (the harness snapshots the hook at construction).
+2. `register_notification_hook` runs **after** `skill_harness_cell.set` so
+   the tool surface is initialized before the trigger surface goes live (per
+   PR #63 load-bearing order).
+
+**Pre-#110 behavior.** If issue #110 has not landed, `HubTrustGate` falls
+back to deny on every cross-namespace first contact (§5.OQ-6 / §5.11). The
+embedder rendering of `HarnessEvent::TriggerPromptRequest` is a no-op until
+#110 lands the prompt channel; until then the user simply never sees
+prompts and cross-namespace senders are rejected. Same-namespace senders
+work fully through the §4.2 "direct route" path.
+
+### §6a.10 Cross-chapter contracts (recap)
+
+| Boundary                  | §6a owns                                                                                  | Other chapter owns                                                  |
+| ------------------------- | ----------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
+| Transport                 | `HttpMcpTransport` impl `Transport` (line-oriented adapter over POST + SSE)               | §5 — `Trigger` envelope and `BeforeTriggerHook` slot (Runtime owns) |
+| Config                    | `mcp.toml` hub entry shape; auth resolution at request time                               | §3 — token lifecycle, scope, rotation                                |
+| Auth                      | `Authorization: Bearer` header-only injection; no token in body / log / audit             | §3.3 — token issuance / revocation                                  |
+| Wire / errors             | Transport-level error mapping (HTTP 5xx, 401, 403, timeout) → `McpError`                 | §2.6 — application error code namespace                              |
+| Notification hook         | `make_pie_hub_notification_hook` factory call site                                        | §5.1 — factory itself (Runtime crate)                                |
+| First-contact gate        | embedder install point for `HubTrustGate` as `BeforeTriggerHook`                          | §5.6 — gate decision logic; §5.7 — trust file schema; #110 — prompt channel |
+| User-visible UX           | nothing — engine only                                                                     | §6b — `/hub *` commands, prompt card render, feed display rules     |
+| Test discipline           | faux HTTP/SSE fixture in `crates/mcp/tests`; no real Cloudflare in CI                     | §8 — release-gate live-Worker e2e                                    |
+
+### §6a.11 Open questions
+
+| ID         | Question                                                                                  | Tools/MCP take                                                                |
+| ---------- | ----------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| §6a.OQ-1   | Should `HttpMcpTransport` ship in `crates/mcp` (generic MCP-over-HTTP) or in `crates/coding-agent` (pie-internal)? | Lean **`crates/mcp`** — the spec is generic; any future MCP server with Streamable HTTP benefits. QA already stipulated `HttpMcpTransport` may be a parallel enabling deliverable. PR-X1 lands in `crates/mcp`. |
+| §6a.OQ-2   | Body cap default — 1 MiB (4× §2.7 list cap) or tighter?                                   | 1 MiB is a defense-in-depth ceiling, not the canonical cap. Tighten if performance testing in PR-X1 shows tighter is safe.                                                                                  |
+| §6a.OQ-3   | Should the transport expose `set_endpoint(...)` for hub failover during a session?         | Lean **no** for v0 — switching hubs mid-session would invalidate the inflight registry and the dedup window. Failover = reconnect on the same `mcp.toml` entry; an entirely new hub URL is a config change requiring restart. Revisit if multi-region hubs become real.                                                                       |
+| §6a.OQ-4   | Per-server-name token storage in `mcp.toml`: one keychain ref per hub name (allowing multiple hubs with distinct tokens)? | Yes — `token_keychain_ref` is per-entry; staging hub and production hub can hold distinct credentials side by side.                                                                                          |
+| §6a.OQ-5   | `HttpMcpTransport` `Transport` impl returns one `recv_line` queue covering both responses and pushes — should we add a richer typed split (e.g. `recv_response` vs `recv_notification`)? | **No** — `McpClient` already routes by JSON-RPC `id` presence (responses have ids, notifications don't), and adding a typed split would force every other `Transport` to do the same. Stick with the existing trait. |
+| §6a.OQ-6   | Hub URL discovery: hard-code `pie.0xfefe.me` in defaults, or always require explicit `endpoint`? | Always require **explicit `endpoint`**. Hub URL is operational config, not a magic constant. Documentation example uses `https://pie.0xfefe.me/mcp` so users can paste-and-go.                                                                |
+
+### §6a.12 Cited from other chapters
+
+- [§1.4](#14-trigger-pipeline-reuse--whats-runtime-whats-hub-specific) — Runtime delta (`make_pie_hub_notification_hook`, `HubTrustGate`).
+- [§1.5](#15-reuse-vs-new-ledger) — `HttpMcpTransport` row marks the one transport addition.
+- [§2.5](#25-server-push-notifications-over-sse) — notification methods (`agent_message`, `agent_revoked`, `discovery_changed`).
+- [§2.6](#26-error-codes) — `-32000`…`-32010` namespace mapped to bounded recovery hints.
+- [§2.7](#27-body-caps--rate-limits) — hub-side caps; §6a defense-in-depth doubles down on the client side.
+- [§3.3](#33-agent-registration-and-token-lifecycle) — `Authorization: Bearer` header, no token in body, rotation/revocation.
+- [§5.1](#51-wire--trigger-boundary) — `make_pie_hub_notification_hook` factory.
+- [§5.6](#56-first-contact-gate-hookup--issue-110) — `HubTrustGate` decision logic.
+- [§5.7](#57-trust-decision-audit-and-persistence) — `~/.pie/hub-trust.json` schema; `fefe_trust_decision` audit.
+- [§5.8](#58-offline--reconnect-behavior) — reconnect / resume cursor / dedup interaction.
+- §6b — `/hub *` slash commands consume the engine API defined here.
+- §8 — release gate; faux fixture is CI-friendly; live deployed-Worker e2e is the §8 gate 6 terminal step.
+- Issue #20 (RFC 1) — existing `Transport` trait, `McpClient`, `McpNotificationHook` building blocks.
+- Issue #110 — `BeforeToolCallResult::Prompt` / `HarnessEvent::TriggerPromptRequest` channel reused by `HubTrustGate`.
 
 ## §6b `/hub *` CLI / TUI surface
 
@@ -1457,3 +1763,4 @@ These complement, do not duplicate. `Accept once` writes only `trigger_prompt`. 
 | 2026-05-29 | @Runtime-dev-lead | §1.4 trigger pipeline reuse — Runtime side. Diagrams the pre-existing-on-`main` vs new-in-RFC #18 split on the runtime boundary; pins the "no new hook trait, no new pipeline, no new envelope, no new audit machinery" rule; lists the four Runtime-side new things (`make_pie_hub_notification_hook` factory, `HubTrustGate` impl, `~/.pie/hub-trust.json` schema, `fefe_trust_decision` Custom audit) and confirms the §1 → §1.5 → sub-PR sequencing fits ~400 LoC of `crates/agent` delta plus tests. §1 v0.1 chapter complete. |
 | 2026-05-29 | @alice | §4 v0.2: folded review feedback accumulated across §3 v0.1 (PR #125), §5 v0.1 (PR #127), §8 v0.1 (PR #126), §2 v0.1 (PR #128), and #110 design v0.2 (PR #130). §4.2 matrix "direct route" cells cite §3.4 per-call auth precondition (sender `notification:send`, receiver `notification:receive`). §4.3 expanded: names #110 v0.2 Artifact D specifically (`HarnessEvent::TriggerPromptRequest` / `resolve_trigger_prompt`), cites §5.7 as canonical location for `fefe_trust_decision` and `~/.pie/hub-trust.json` shape, documents the two complementary audit types (`trigger_prompt` runtime + `fefe_trust_decision` embedder), and projects §3.4's `AgentPrincipal` ↔ §5.3's `TriggerAuthority`. §4.4 splits the profile schema into list / detail / prompt-bounded subsets — the prompt-bounded subset `{display_name, description, capabilities}` is what `BeforeTriggerActionContext` carries to the first-contact UI (per §5.OQ-1). §4 × §5 contract section refreshed accordingly. Chapter map status normalized to single-form ("v0.1" / "v0.2" without "draft" suffix); §8 title's `~/cf_token` → `CF_API_KEY` typo fixed in chapter map. Added coordinator-maintained "Cross-chapter artifact pointers" sub-section so reviewers can find canonical schemas (audit types, hub-trust.json shape, prompt channel, permission strings, error namespace, dedup key) without grepping. Defaults table extended with §3.2 human session timeouts, §2.5/§5.10 cap layering, #110 prompt timeout. Promoted **RFC-OQ-10** (per-machine receiver binding for `~/.pie/hub-trust.json` to defeat dotfile-sync trust replay; from §5.OQ-3, surfaced by @Runtime-dev-lead + @Provider-Auth-Lead in cross-doc review on #130 v0.2). |
 | 2026-05-29 | @Provider-Auth-Lead | §3 v0.2: resolved RFC-OQ-9 and RFC-OQ-10. Agent tokens default to no automatic expiry (`expires_at = null`) unless user/admin sets one, while rotate/revoke and bounded revoke behavior remain mandatory before v0 deploy. First-contact trust cache keys now include `local_receiver_instance_id + receiver_agent_id + sender_agent_id + action_class`; local instance id is random local state, not hardware identity, and audit/logs expose only `local_receiver_instance_id_hash`. Updated §5.OQ-3 and the `hub-trust.json` shape to match. |
+| 2026-05-29 | @Tools-MCP-Lead | §6a v0.1: client integration engine contract — `HttpMcpTransport` impl Transport over Streamable HTTP (POST + SSE), `~/.pie/mcp.toml` hub entry shape (`kind = "streamable_http"`), `mcp_loader::connect_one` dispatch extension, `make_pie_hub_notification_hook` factory call site, `Authorization: Bearer` header-only token discipline (per Provider/Auth §1 review ask), body-cap + error-mapping defense-in-depth, reconnect / `Last-Event-ID` resume / dedup wiring, embedder install point for `HubTrustGate` as `BeforeTriggerHook`, faux HTTP/SSE fixture test strategy. Owns the engine API only — CLI/TUI surface stays in §6b. |
