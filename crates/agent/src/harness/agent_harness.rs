@@ -738,6 +738,13 @@ pub struct AgentHarnessOptions {
     /// Optional `after_tool_call` hook. Used by the LSP supervisor (issue #12) to attach
     /// diagnostics to write/edit tool results.
     pub after_tool_call: Option<AfterToolCallHook>,
+    /// Optional control-plane prompt resolution channel (issue #110 design v0.2 Artifact C).
+    /// Routes through the bare `Agent`'s `on_control_plane_prompt` slot. `None` is
+    /// fail-closed deny — any tool whose `permission_classification` returns `Prompt`
+    /// (and no user `before_tool_call` hook hard-blocks) will receive a synthesized deny
+    /// at runtime rather than executing. See `crates/agent/src/agent_loop.rs` for the
+    /// merge semantics.
+    pub on_control_plane_prompt: Option<crate::types::OnControlPlanePromptHook>,
     /// Per-session USD cap. When set, the harness refuses to start a new prompt once the
     /// running cost exceeds the cap. `None` disables the check.
     pub budget_cap_usd: Option<f64>,
@@ -790,6 +797,7 @@ impl AgentHarnessOptions {
             compaction: DEFAULT_COMPACTION_SETTINGS.clone(),
             before_tool_call: None,
             after_tool_call: None,
+            on_control_plane_prompt: None,
             budget_cap_usd: None,
             trigger_runtime: TriggerRuntimeConfig::default(),
             before_trigger: None,
@@ -902,6 +910,7 @@ impl AgentHarness {
             stream_fn: options.stream_fn.clone(),
             before_tool_call: options.before_tool_call.clone(),
             after_tool_call: options.after_tool_call.clone(),
+            on_control_plane_prompt: options.on_control_plane_prompt.clone(),
             ..Default::default()
         });
 
@@ -2002,14 +2011,68 @@ fn make_session_listener(
         let session = session.clone();
         let listener_errors = listener_errors.clone();
         Box::pin(async move {
-            if let AgentEvent::MessageEnd { message } = event {
-                if let Err(e) = session.append_message(message).await {
-                    listener_errors.lock().push(e);
+            match event {
+                AgentEvent::MessageEnd { message } => {
+                    if let Err(e) = session.append_message(message).await {
+                        listener_errors.lock().push(e);
+                    }
                 }
+                AgentEvent::ControlPlanePromptResolved {
+                    tool_call_id,
+                    tool_name,
+                    args_hash,
+                    label,
+                    decision,
+                    reason,
+                } => {
+                    // Issue #110 design v0.2 Artifact E: write a `control_plane_prompt`
+                    // Custom audit per resolution. Label is capped at 200 chars
+                    // (cap-inclusive on char boundary) so a hook-supplied unbounded
+                    // string cannot grow the audit / `--resume` body without limit
+                    // — per @QA-Release-Lead non-blocking note on PR #135.
+                    let data = serde_json::json!({
+                        "schema_version": 1,
+                        "tool_call_id": tool_call_id,
+                        "tool_name": tool_name,
+                        "args_hash": args_hash,
+                        "label": cap_control_plane_audit_label(&label),
+                        "decision": decision,
+                        "reason": reason,
+                        "at": chrono::Utc::now().to_rfc3339(),
+                    });
+                    if let Err(e) = session
+                        .append_custom("control_plane_prompt", Some(data))
+                        .await
+                    {
+                        listener_errors.lock().push(e);
+                    }
+                }
+                _ => {}
             }
         })
     });
     (listener, errors)
+}
+
+/// Cap rule for `control_plane_prompt.data.label`. Hook-supplied labels MUST be
+/// bounded before persistence to prevent an embedder hook from inflating audit /
+/// `--resume` body size. Per @QA-Release-Lead non-blocking note on PR #135.
+///
+/// Caps at 200 chars, cap-inclusive on char boundary (same shape as RFC 1 sub-PR 5a's
+/// 4 KiB summary cap — character-walked, not byte-walked, so multi-byte chars don't
+/// land mid-rune).
+const CONTROL_PLANE_PROMPT_LABEL_CAP_CHARS: usize = 200;
+
+fn cap_control_plane_audit_label(label: &str) -> String {
+    if label.chars().count() <= CONTROL_PLANE_PROMPT_LABEL_CAP_CHARS {
+        return label.to_string();
+    }
+    let mut out: String = label
+        .chars()
+        .take(CONTROL_PLANE_PROMPT_LABEL_CAP_CHARS.saturating_sub(1))
+        .collect();
+    out.push('…');
+    out
 }
 
 fn finish_persisted_run(
