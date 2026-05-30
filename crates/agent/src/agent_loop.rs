@@ -421,30 +421,37 @@ async fn execute_tools(
             continue;
         }
 
-        // before_tool_call hook can veto OR override the synthesized prompt request from
-        // the classifier. The hook sees the prepared args on BOTH `ctx.args` and
-        // `ctx.tool_call.arguments` — there is no reason to expose two shapes of the same
-        // call (a hook reading `tool_call.arguments` would otherwise miss any normalization
-        // the tool's `prepare_arguments` applied). If the tool's `prepare_arguments` returns
-        // a non-Object shape (Null, Array, scalar), we cannot represent it inside the
-        // `pie_ai::ToolCall.arguments` map; we clear the map to empty so the hook author
-        // has only one truthy source (`ctx.args`) and cannot read a stale raw map.
-        let mut hook_result = match &classification {
-            PermissionClassification::Prompt { reason } => BeforeToolCallResult {
-                block: false,
-                reason: None,
-                prompt: Some(ControlPlanePromptRequest {
-                    tool_call_id: tool_id.clone(),
-                    tool_name: tool_name.clone(),
-                    args_hash: compute_args_hash(&args),
-                    label: format!("Control-plane write: {tool_name}"),
-                    payload: default_prompt_payload(&tool_name, &args),
-                    reason: reason.clone(),
-                }),
-            },
-            PermissionClassification::Allow => BeforeToolCallResult::default(),
+        // The classifier's `Prompt` is the authoritative source: a user-configured
+        // `before_tool_call` hook MUST NOT silently erase a control-plane prompt requirement
+        // by returning `BeforeToolCallResult::default()`. We preserve the synthesized prompt
+        // unless the hook either explicitly hard-blocks (`block=true` wins, classifier
+        // intent honored — Block-stronger-than-Prompt) or supplies its own richer
+        // `BeforeToolCallResult::prompt` payload (which the runtime then re-binds to the
+        // authoritative `tool_call_id` / `tool_name` / `args_hash` below — the hook may
+        // only enrich `label` and `payload`, never spoof binding fields).
+        //
+        // The hook still sees the prepared args on BOTH `ctx.args` and
+        // `ctx.tool_call.arguments` (matched semantics from the legacy code path). If the
+        // tool's `prepare_arguments` returns a non-Object shape we clear the map so the
+        // hook author has only one truthy source.
+        let synthesized_prompt: Option<ControlPlanePromptRequest> = match &classification {
+            PermissionClassification::Prompt { reason } => Some(ControlPlanePromptRequest {
+                tool_call_id: tool_id.clone(),
+                tool_name: tool_name.clone(),
+                args_hash: compute_args_hash(&args),
+                label: format!("Control-plane write: {tool_name}"),
+                payload: default_prompt_payload(&tool_name, &args),
+                reason: reason.clone(),
+            }),
+            PermissionClassification::Allow => None,
             // Block already handled by the early-return above; kept for exhaustiveness.
             PermissionClassification::Block { .. } => unreachable!(),
+        };
+
+        let mut hook_result = BeforeToolCallResult {
+            block: false,
+            reason: None,
+            prompt: synthesized_prompt.clone(),
         };
         if let Some(hook) = inner.options.before_tool_call.clone() {
             let mut hook_tc = (*tc).clone();
@@ -477,9 +484,43 @@ async fn execute_tools(
             });
             continue;
         }
+        // Merge: if the classifier requested a Prompt, ensure the runtime still routes
+        // through the prompt channel even if the hook returned `prompt = None`. If the hook
+        // supplied its own prompt, accept it as the embedder's richer card BUT re-bind
+        // `tool_call_id` / `tool_name` / `args_hash` to the runtime-authoritative values so
+        // a hook cannot lie about binding fields (forgery resistance).
+        let effective_prompt: Option<ControlPlanePromptRequest> =
+            match (synthesized_prompt, hook_result.prompt.take()) {
+                // Classifier said Prompt, hook didn't supply one → keep the classifier's.
+                (Some(synth), None) => Some(synth),
+                // Classifier said Allow but hook supplied a prompt → accept it (hook is
+                // raising the bar). Runtime still owns binding fields.
+                (None, Some(hook_supplied)) => Some(ControlPlanePromptRequest {
+                    tool_call_id: tool_id.clone(),
+                    tool_name: tool_name.clone(),
+                    args_hash: compute_args_hash(&args),
+                    label: hook_supplied.label,
+                    payload: hook_supplied.payload,
+                    reason: hook_supplied.reason,
+                }),
+                // Classifier said Prompt AND hook supplied a custom payload → use hook's
+                // label/payload (richer card) BUT re-bind authoritative fields. Hook cannot
+                // override the classifier's `reason` (it's the reason the gate exists), but
+                // can supply additional context via `payload`.
+                (Some(synth), Some(hook_supplied)) => Some(ControlPlanePromptRequest {
+                    tool_call_id: synth.tool_call_id,
+                    tool_name: synth.tool_name,
+                    args_hash: synth.args_hash,
+                    label: hook_supplied.label,
+                    payload: hook_supplied.payload,
+                    reason: synth.reason,
+                }),
+                // Neither classifier nor hook required a prompt → no gate.
+                (None, None) => None,
+            };
         // Prompt path: ask the embedder, map decision to allow/block. Fail-closed when no
         // prompt channel is configured.
-        if let Some(prompt_req) = hook_result.prompt.take() {
+        if let Some(prompt_req) = effective_prompt {
             let decision = match inner.options.on_control_plane_prompt.clone() {
                 Some(prompt_hook) => prompt_hook(prompt_req.clone(), cancel.clone()).await,
                 None => ControlPlanePromptDecision::Deny {
@@ -862,26 +903,51 @@ fn canonicalize(value: &serde_json::Value) -> serde_json::Value {
     }
 }
 
-/// Default bounded prompt-payload synthesized from the classifier outcome. Used when the
-/// classifier returns `Prompt` and no `before_tool_call` hook supplies a richer payload.
-/// Embedder always sees something useful even for tools that haven't been individually
-/// tuned. Tools that want a richer card should override via `before_tool_call`.
+/// Default **redaction-safe by construction** prompt payload synthesized from the
+/// classifier outcome. Per @Provider-Auth-Lead + @CLI-TUI-Dev-Lead on PR #135 review:
+/// the runtime must NEVER emit raw prepared args in the default payload — control-plane
+/// tools often carry URLs with tokens, secret-bearing values, or large blobs whose raw
+/// rendering would defeat the entire prompt-card audit story.
 ///
-/// Bounded: caps `args_preview` at 512 chars to keep prompt frames small. No raw secret
-/// detection — the tool's classifier is responsible for not requesting a prompt for ops
-/// whose args carry secrets the user shouldn't see in the card.
+/// Default payload contains only:
+/// - `tool_name` — display label only.
+/// - `args_keys` — the top-level argument key names (sorted, ≤ 32 keys, each ≤ 64 chars).
+///   Reveals what *categories* of input the tool received without revealing the values.
+/// - `args_hash` — the same SHA-256 the runtime uses for anti-replay binding. Lets the
+///   prompt UI render a stable per-call identifier (e.g. for "this is the same write
+///   you approved 10 seconds ago" UX).
+///
+/// Tools that want a *richer* card (preview of the install source URL with token
+/// stripped, diff of a config edit, etc.) override via `before_tool_call` returning
+/// their own `BeforeToolCallResult.prompt` with a hand-redacted `payload`. Runtime
+/// re-binds the authoritative `tool_call_id` / `tool_name` / `args_hash` fields after
+/// the override, so the hook cannot accidentally weaken the binding.
 fn default_prompt_payload(tool_name: &str, args: &serde_json::Value) -> serde_json::Value {
-    const ARGS_PREVIEW_CAP: usize = 512;
-    let raw = serde_json::to_string(args).unwrap_or_default();
-    let truncated: String = if raw.chars().count() <= ARGS_PREVIEW_CAP {
-        raw
-    } else {
-        let mut out: String = raw.chars().take(ARGS_PREVIEW_CAP).collect();
-        out.push('…');
-        out
+    const MAX_KEYS: usize = 32;
+    const MAX_KEY_LEN: usize = 64;
+    let keys: Vec<String> = match args {
+        serde_json::Value::Object(map) => {
+            let mut ks: Vec<String> = map
+                .keys()
+                .take(MAX_KEYS)
+                .map(|k| {
+                    if k.chars().count() <= MAX_KEY_LEN {
+                        k.clone()
+                    } else {
+                        let mut t: String = k.chars().take(MAX_KEY_LEN).collect();
+                        t.push('…');
+                        t
+                    }
+                })
+                .collect();
+            ks.sort();
+            ks
+        }
+        _ => Vec::new(),
     };
     serde_json::json!({
         "tool_name": tool_name,
-        "args_preview": truncated,
+        "args_keys": keys,
+        "args_hash": compute_args_hash(args),
     })
 }
