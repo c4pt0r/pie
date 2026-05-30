@@ -342,6 +342,7 @@ async fn harness_event_bus_delivers_session_and_branch() {
             HarnessEvent::Branch { .. } => "Branch",
             HarnessEvent::TriggerHandlingStart { .. } => "TriggerHandlingStart",
             HarnessEvent::TriggerHandled { .. } => "TriggerHandled",
+            HarnessEvent::TriggerPromptRequest { .. } => "TriggerPromptRequest",
             HarnessEvent::PersistenceError { .. } => "PersistenceError",
             HarnessEvent::TriggerExecutionStarted { .. } => "TriggerExecutionStarted",
             HarnessEvent::TriggerCompleted { .. } => "TriggerCompleted",
@@ -1811,6 +1812,157 @@ async fn before_trigger_prompt_records_needs_approval_state_and_reason() {
     assert_eq!(
         decision["reason"].as_str(),
         Some("Cloudflare hub trigger from new principal")
+    );
+
+    let prompt_event = evs
+        .iter()
+        .find_map(|e| match e {
+            HarnessEvent::TriggerPromptRequest { request } => Some(request.clone()),
+            _ => None,
+        })
+        .expect("Prompt decision must emit a trigger prompt request");
+    assert_eq!(prompt_event.trace_id, "trace-prompt");
+    assert_eq!(prompt_event.sender_agent_id, "mcp:github");
+    assert_eq!(prompt_event.action_class, "pr merged");
+    assert!(
+        prompt_event.payload.get("payload").is_none(),
+        "prompt preview must not include raw trigger payload"
+    );
+
+    let prompt_audit = entries
+        .iter()
+        .find_map(|e| match e {
+            SessionTreeEntry::Custom {
+                custom_type, data, ..
+            } if custom_type == "trigger_prompt" => data.clone(),
+            _ => None,
+        })
+        .expect("trigger_prompt audit entry must be written");
+    assert_eq!(prompt_audit["decision"].as_str(), Some("deny"));
+    assert_eq!(
+        prompt_audit["reason"].as_str(),
+        Some(
+            "trigger prompt required but no on_trigger_prompt hook configured \
+             (fail-closed deny — see issue #110 design v0.2)"
+        )
+    );
+    assert_eq!(
+        prompt_audit["trigger_prompt_id"].as_str(),
+        Some(prompt_event.trigger_prompt_id.as_str())
+    );
+}
+
+#[tokio::test]
+async fn before_trigger_prompt_allow_admits_trigger_and_binds_hub_identity() {
+    use pie_agent_core::{
+        BeforeTriggerContext, BeforeTriggerDecision, BeforeTriggerHook, OnTriggerPromptHook,
+        TriggerPromptDecision,
+    };
+
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage.clone() as Arc<dyn SessionStorage>);
+    let mut opts = AgentHarnessOptions::new(faux_model(), session.clone());
+
+    let prompt_hook: BeforeTriggerHook = Arc::new(|_ctx: BeforeTriggerContext, _cancel| {
+        Box::pin(async move {
+            BeforeTriggerDecision::Prompt {
+                reason: "new hub sender requires first-contact approval".into(),
+            }
+        })
+    });
+    opts.before_trigger = Some(prompt_hook);
+
+    let seen_request = Arc::new(std::sync::Mutex::new(None));
+    let seen_request_sink = seen_request.clone();
+    let trigger_prompt: OnTriggerPromptHook = Arc::new(move |request, _cancel| {
+        *seen_request_sink.lock().unwrap() = Some(request);
+        Box::pin(async move { TriggerPromptDecision::Allow })
+    });
+    opts.on_trigger_prompt = Some(trigger_prompt);
+    let harness = AgentHarness::new(opts);
+
+    let mut trigger = sample_trigger("prompt-allow", "trace-prompt-allow");
+    trigger.source_kind = pie_agent_core::SourceKind::Hub;
+    trigger.source_label = "fefe hub".into();
+    trigger.event_label = "notification".into();
+    trigger.payload_visibility = pie_agent_core::PayloadVisibility::Shared;
+    trigger.payload_summary = Some("alice sent a notification".into());
+    trigger.payload = Some(serde_json::json!({
+        "_meta": {
+            "receiver_agent_id": "receiver-agent-1",
+            "sender_agent_id": "sender-agent-2",
+            "action_class": "hub.notification"
+        },
+        "secret_body": "this raw payload must stay out of prompt preview"
+    }));
+    trigger.authority.principal_id = "sender-agent-2".into();
+
+    let outcome = harness.handle_trigger(trigger).await;
+    assert!(matches!(outcome, pie_agent_core::EvaluationOutcome::Accept));
+
+    let request = seen_request
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("on_trigger_prompt hook must receive request");
+    assert_eq!(
+        request.receiver_agent_id.as_deref(),
+        Some("receiver-agent-1")
+    );
+    assert_eq!(request.sender_agent_id, "sender-agent-2");
+    assert_eq!(request.action_class, "hub.notification");
+    assert_eq!(
+        request.reason,
+        "new hub sender requires first-contact approval"
+    );
+    assert!(
+        !request.payload.to_string().contains("secret_body"),
+        "prompt preview must never carry raw trigger payload"
+    );
+
+    let entries = session.entries().await.unwrap();
+    let trigger_record = entries
+        .iter()
+        .find_map(|e| match e {
+            SessionTreeEntry::Custom {
+                custom_type, data, ..
+            } if custom_type == pie_agent_core::TriggerRecord::CUSTOM_TYPE => {
+                let r: pie_agent_core::TriggerRecord =
+                    serde_json::from_value(data.as_ref().unwrap().clone()).unwrap();
+                Some(r)
+            }
+            _ => None,
+        })
+        .expect("trigger audit entry");
+    assert_eq!(trigger_record.state, pie_agent_core::TriggerState::Accepted);
+    let decision = trigger_record
+        .evaluator_decision
+        .as_ref()
+        .expect("evaluator decision");
+    assert_eq!(decision["permission"].as_str(), Some("prompt"));
+    assert_eq!(decision["prompt_decision"].as_str(), Some("allow"));
+    assert_eq!(
+        decision["trigger_prompt_id"].as_str(),
+        Some(request.trigger_prompt_id.as_str())
+    );
+
+    let prompt_audit = entries
+        .iter()
+        .find_map(|e| match e {
+            SessionTreeEntry::Custom {
+                custom_type, data, ..
+            } if custom_type == "trigger_prompt" => data.clone(),
+            _ => None,
+        })
+        .expect("trigger_prompt audit entry");
+    assert_eq!(prompt_audit["decision"].as_str(), Some("allow"));
+    assert_eq!(
+        prompt_audit["trigger_prompt_id"].as_str(),
+        Some(request.trigger_prompt_id.as_str())
+    );
+    assert_eq!(
+        prompt_audit["receiver_agent_id"].as_str(),
+        Some("receiver-agent-1")
     );
 }
 

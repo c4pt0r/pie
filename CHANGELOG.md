@@ -331,6 +331,17 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
   4 new integration tests pin default-Allow, Deny→PermissionDenied (asserting both the
   audit record AND the event carry the reason), Prompt→NeedsApproval (same dual
   assertion), and that the hook is bypassed on the Deduped path.
+- **#110 / fefe trigger prompt channel.** `BeforeTriggerDecision::Prompt` now routes
+  through a trigger-specific confirmation channel instead of remaining a passive
+  `NeedsApproval` marker. New `AgentHarnessOptions::on_trigger_prompt:
+  Option<OnTriggerPromptHook>` emits `HarnessEvent::TriggerPromptRequest`, awaits an
+  embedder decision, writes a bounded `trigger_prompt` Custom audit entry, and admits the
+  trigger only on `TriggerPromptDecision::Allow`. Missing hooks fail closed to
+  `NeedsApproval`. `TriggerPromptRequest` carries a deterministic `trigger_prompt_id`
+  bound to the trigger envelope plus receiver/sender/action-class identity when present in
+  hub `_meta`; the preview payload is built only from bounded envelope fields and never
+  includes raw `Trigger.payload`. 2 integration tests pin fail-closed audit/event behavior
+  and the hub identity binding path.
 - **#20 (sub-agent execution, no promotion yet)** Accepted triggers now spawn a detached
   sub-agent that runs the trigger's action prompt without blocking the `handle_trigger`
   caller or the `register_notification_hook` pump (RFC 1 §5.A). New

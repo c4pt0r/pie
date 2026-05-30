@@ -88,6 +88,14 @@ pub enum HarnessEvent {
         audit_entry_id: Option<String>,
         evaluator_decision: Option<serde_json::Value>,
     },
+    /// A trigger admitted by the dedup / cycle evaluator reached
+    /// [`BeforeTriggerDecision::Prompt`] and is awaiting an embedder-owned user decision.
+    ///
+    /// This is the trigger-shaped half of issue #110. The prompt is bound by
+    /// `trigger_prompt_id`, not by a tool-call id / args hash, so a decision cannot be
+    /// replayed onto a different trigger envelope. The runtime also writes a
+    /// `trigger_prompt` Custom audit entry when the prompt resolves.
+    TriggerPromptRequest { request: TriggerPromptRequest },
     /// Best-effort persistence error reflux. Currently fires only when the trigger audit
     /// `Custom` entry write failed in `handle_trigger`. The trigger itself still produced
     /// a `TriggerHandled` event with `audit_entry_id = None`; this event explains why so
@@ -254,6 +262,68 @@ pub enum BeforeTriggerDecision {
         reason: String,
     },
 }
+
+/// Bounded, preview-safe trigger prompt request emitted when
+/// [`BeforeTriggerDecision::Prompt`] asks the embedder to admit or deny a trigger.
+///
+/// Runtime owns only exact per-trigger resolution. "Always" / "Block future sender" trust
+/// caches are embedder-owned (for fefe, `~/.pie/hub-trust.json`) and should be audited
+/// separately via a domain-specific Custom entry such as `fefe_trust_decision`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TriggerPromptRequest {
+    /// SHA-256 over the canonical binding tuple. This is the stable token the embedder
+    /// echoes back through [`OnTriggerPromptHook`]'s decision path.
+    pub trigger_prompt_id: String,
+    pub trace_id: String,
+    pub source_label: String,
+    /// Receiver id is optional at the generic runtime layer because non-hub trigger
+    /// sources may not have a receiver principal. Hub adapters should populate it in
+    /// `_meta.receiver_agent_id` or `receiver_agent_id` so fefe first-contact prompts bind
+    /// to the full `{receiver_agent_id, sender_agent_id, action_class}` scope.
+    pub receiver_agent_id: Option<String>,
+    pub sender_agent_id: String,
+    pub action_class: String,
+    pub trigger_summary: Option<String>,
+    /// Embedder-rendered preview payload. Runtime constructs this from bounded envelope
+    /// fields only and never includes raw `Trigger.payload`.
+    pub payload: serde_json::Value,
+    pub reason: String,
+}
+
+/// Decision returned by [`OnTriggerPromptHook`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TriggerPromptDecision {
+    Allow,
+    Deny { reason: Option<String> },
+    Timeout,
+}
+
+impl TriggerPromptDecision {
+    pub fn as_audit_str(&self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny { .. } => "deny",
+            Self::Timeout => "timeout",
+        }
+    }
+
+    fn reason(&self) -> Option<String> {
+        match self {
+            Self::Deny { reason } => reason.clone(),
+            _ => None,
+        }
+    }
+}
+
+pub type OnTriggerPromptHook = Arc<
+    dyn Fn(
+            TriggerPromptRequest,
+            tokio_util::sync::CancellationToken,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = TriggerPromptDecision> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// Snapshot passed into [`BeforeTriggerHook`]. Owned so the hook future can be `'static`.
 /// The hook sees the full trigger (including authority + payload summary) plus a
@@ -755,6 +825,12 @@ pub struct AgentHarnessOptions {
     /// `None` is equivalent to a hook that always returns
     /// [`BeforeTriggerDecision::Allow`]. See [`BeforeTriggerHook`].
     pub before_trigger: Option<BeforeTriggerHook>,
+    /// Optional trigger prompt resolution channel (issue #110 Artifact D). When
+    /// [`BeforeTriggerHook`] returns [`BeforeTriggerDecision::Prompt`], the harness emits a
+    /// [`HarnessEvent::TriggerPromptRequest`], awaits this hook, writes `trigger_prompt`
+    /// audit, then either admits (`Allow`) or leaves the trigger in `NeedsApproval`
+    /// (`Deny` / `Timeout`). `None` is fail-closed deny.
+    pub on_trigger_prompt: Option<OnTriggerPromptHook>,
     /// Optional action hook resolving accepted triggers to a [`TriggerAction`]. `None`
     /// falls back to [`TriggerAction::default_for`] (the stable `format!("{source_label}
     /// fired: {event_label}")` mapping).
@@ -801,6 +877,7 @@ impl AgentHarnessOptions {
             budget_cap_usd: None,
             trigger_runtime: TriggerRuntimeConfig::default(),
             before_trigger: None,
+            on_trigger_prompt: None,
             before_trigger_action: None,
             reload_skills_fn: None,
             on_turn_end: None,
@@ -863,6 +940,8 @@ pub struct AgentHarness {
     /// Optional permission hook applied to accepted triggers before they advance to a
     /// terminal state. `None` defaults to [`BeforeTriggerDecision::Allow`].
     before_trigger: Option<BeforeTriggerHook>,
+    /// Optional trigger prompt decision hook. See [`AgentHarnessOptions::on_trigger_prompt`].
+    on_trigger_prompt: Option<OnTriggerPromptHook>,
     /// Optional action hook resolving accepted triggers to a `TriggerAction`. `None` falls
     /// back to [`TriggerAction::default_for`].
     before_trigger_action: Option<BeforeTriggerActionHook>,
@@ -895,6 +974,11 @@ pub struct AgentHarness {
 struct RunningTriggerHandle {
     state: RunningTriggerState,
     cancel: tokio_util::sync::CancellationToken,
+}
+
+struct ResolvedTriggerPrompt {
+    request: TriggerPromptRequest,
+    decision: TriggerPromptDecision,
 }
 
 impl AgentHarness {
@@ -935,6 +1019,7 @@ impl AgentHarness {
             trigger_runtime: TriggerRuntime::with_config(options.trigger_runtime),
             notification_hooks: Arc::new(Mutex::new(Vec::new())),
             before_trigger: options.before_trigger,
+            on_trigger_prompt: options.on_trigger_prompt,
             before_trigger_action: options.before_trigger_action,
             before_tool_call: options.before_tool_call,
             after_tool_call: options.after_tool_call,
@@ -1052,14 +1137,26 @@ impl AgentHarness {
                             "reason": reason,
                         })),
                     ),
-                    BeforeTriggerDecision::Prompt { reason } => (
-                        TriggerState::NeedsApproval,
-                        Some(serde_json::json!({
-                            "outcome": "accept",
-                            "permission": "prompt",
-                            "reason": reason,
-                        })),
-                    ),
+                    BeforeTriggerDecision::Prompt { reason } => {
+                        let resolved = self.resolve_trigger_prompt(&trigger, reason).await;
+                        let state = match resolved.decision {
+                            TriggerPromptDecision::Allow => TriggerState::Accepted,
+                            TriggerPromptDecision::Deny { .. } | TriggerPromptDecision::Timeout => {
+                                TriggerState::NeedsApproval
+                            }
+                        };
+                        (
+                            state,
+                            Some(serde_json::json!({
+                                "outcome": "accept",
+                                "permission": "prompt",
+                                "trigger_prompt_id": resolved.request.trigger_prompt_id,
+                                "prompt_decision": resolved.decision.as_audit_str(),
+                                "reason": resolved.request.reason,
+                                "decision_reason": resolved.decision.reason(),
+                            })),
+                        )
+                    }
                 }
             }
             EvaluationOutcome::Deduped {
@@ -1213,6 +1310,62 @@ impl AgentHarness {
             runtime: self.trigger_runtime.snapshot(),
         };
         hook(ctx, tokio_util::sync::CancellationToken::new()).await
+    }
+
+    async fn resolve_trigger_prompt(
+        &self,
+        trigger: &Trigger,
+        reason: String,
+    ) -> ResolvedTriggerPrompt {
+        let request = build_trigger_prompt_request(trigger, reason);
+
+        self.emit_harness_event(HarnessEvent::TriggerPromptRequest {
+            request: request.clone(),
+        });
+
+        let decision = match self.on_trigger_prompt.clone() {
+            Some(hook) => hook(request.clone(), tokio_util::sync::CancellationToken::new()).await,
+            None => TriggerPromptDecision::Deny {
+                reason: Some(
+                    "trigger prompt required but no on_trigger_prompt hook configured \
+                     (fail-closed deny — see issue #110 design v0.2)"
+                        .to_string(),
+                ),
+            },
+        };
+
+        self.write_trigger_prompt_audit(&request, &decision).await;
+        ResolvedTriggerPrompt { request, decision }
+    }
+
+    async fn write_trigger_prompt_audit(
+        &self,
+        request: &TriggerPromptRequest,
+        decision: &TriggerPromptDecision,
+    ) {
+        let data = serde_json::json!({
+            "schema_version": 1,
+            "trigger_prompt_id": request.trigger_prompt_id,
+            "trace_id": request.trace_id,
+            "source_label": cap_control_plane_audit_label(&request.source_label),
+            "receiver_agent_id": request.receiver_agent_id,
+            "sender_agent_id": request.sender_agent_id,
+            "action_class": request.action_class,
+            "decision": decision.as_audit_str(),
+            "reason": decision.reason(),
+            "at": chrono::Utc::now().to_rfc3339(),
+        });
+
+        if let Err(e) = self
+            .session
+            .append_custom("trigger_prompt", Some(data))
+            .await
+        {
+            self.emit_harness_event(HarnessEvent::PersistenceError {
+                context: "trigger_prompt".into(),
+                message: format!("trigger prompt audit append failed: {:?}", e.code),
+            });
+        }
     }
 
     /// Point-in-time view of the harness's notification surface — the
@@ -2073,6 +2226,66 @@ fn cap_control_plane_audit_label(label: &str) -> String {
         .collect();
     out.push('…');
     out
+}
+
+fn build_trigger_prompt_request(trigger: &Trigger, reason: String) -> TriggerPromptRequest {
+    let receiver_agent_id = trigger_json_string(trigger, &["receiver_agent_id"])
+        .or_else(|| trigger_json_string(trigger, &["_meta", "receiver_agent_id"]));
+    let sender_agent_id = trigger_json_string(trigger, &["sender_agent_id"])
+        .or_else(|| trigger_json_string(trigger, &["_meta", "sender_agent_id"]))
+        .or_else(|| trigger_json_string(trigger, &["agent_id"]))
+        .unwrap_or_else(|| trigger.authority.principal_id.clone());
+    let action_class = trigger_json_string(trigger, &["action_class"])
+        .or_else(|| trigger_json_string(trigger, &["_meta", "action_class"]))
+        .unwrap_or_else(|| trigger.event_label.clone());
+    let trigger_summary = trigger
+        .payload_summary
+        .clone()
+        .map(|summary| truncate_on_char_boundary(summary, PROMOTION_BODY_CAP_BYTES).0);
+    let payload = serde_json::json!({
+        "source_kind": trigger.source_kind,
+        "source_label": cap_control_plane_audit_label(&trigger.source_label),
+        "event_label": cap_control_plane_audit_label(&trigger.event_label),
+        "payload_visibility": trigger.payload_visibility,
+        "payload_summary": trigger_summary,
+        "authority": {
+            "principal_id": trigger.authority.principal_id.clone(),
+            "principal_label": cap_control_plane_audit_label(&trigger.authority.principal_label),
+            "credential_scope": trigger.authority.credential_scope,
+            "allowed_source_actions": trigger.authority.allowed_source_actions.clone(),
+        }
+    });
+    let binding = serde_json::json!([
+        "trigger_prompt:v1",
+        trigger.idempotency_key.clone(),
+        trigger.trace_id.clone(),
+        trigger.source_kind,
+        trigger.source_label.clone(),
+        trigger.event_label.clone(),
+        receiver_agent_id.clone(),
+        sender_agent_id.clone(),
+        action_class.clone(),
+    ]);
+    let trigger_prompt_id = sha256_hex(&binding.to_string());
+    TriggerPromptRequest {
+        trigger_prompt_id,
+        trace_id: trigger.trace_id.clone(),
+        source_label: trigger.source_label.clone(),
+        receiver_agent_id,
+        sender_agent_id,
+        action_class,
+        trigger_summary,
+        payload,
+        reason,
+    }
+}
+
+fn trigger_json_string(trigger: &Trigger, path: &[&str]) -> Option<String> {
+    let mut value = trigger.payload.as_ref()?;
+    for key in path {
+        value = value.get(*key)?;
+    }
+    value.as_str().map(str::to_string)
 }
 
 fn finish_persisted_run(
