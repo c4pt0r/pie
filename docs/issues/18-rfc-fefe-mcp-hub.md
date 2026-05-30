@@ -440,7 +440,7 @@ The `fefe_trust_decision` Custom audit `data` shape (definition; cited by §4 an
 - `CF_API_KEY` (the deploy secret — never enters the runtime at all).
 - Provider credentials, OAuth tokens.
 
-QA owns the redaction acceptance test for this entry in [§8](#8-deployment--cf_token--ci--acceptance--release-gate).
+QA owns the redaction acceptance test for this entry in [§8](#8-deployment--cf_api_key--ci--acceptance--release-gate).
 
 ### §5.8 Offline / reconnect behavior
 
@@ -509,7 +509,7 @@ Senders that need stronger ordering should embed application-level sequence numb
 - [§4.4](#44-sender-profile-is-product-copy-not-decoration) — sender profile listing fields (cited for prompt UI bounded subset per §5.OQ-1).
 - [§6a](#6a-client-integration--contract--runtime-boundary) — `HttpMcpTransport`, SSE reconnect, resume cursor.
 - [§7](#7-worker-implementation--storage-model) — hub-side dedup key uniqueness, backlog bounds, durable queue.
-- [§8](#8-deployment--cf_token--ci--acceptance--release-gate) — `fefe_trust_decision` redaction acceptance test; runtime smoke matrix.
+- [§8](#8-deployment--cf_api_key--ci--acceptance--release-gate) — `fefe_trust_decision` redaction acceptance test; runtime smoke matrix.
 - Issue #110 — `PermissionCategory::ControlPlaneWrite` user-Prompt category.
 - RFC 1 (issue #20) — trigger pipeline, `TriggerAuthority`, `NotificationHook`, `BeforeTriggerHook`, `Custom` audit entries, `Session::append_custom`.
 
