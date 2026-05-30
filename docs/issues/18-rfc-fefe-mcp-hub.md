@@ -2,7 +2,7 @@
 
 > Parent: [[00-master]] roadmap.
 > Tier: 8 (cross-agent connectivity). Extends [[08-mcp-client]] and [[17-harness-expansion]].
-> Status: **draft v0.1 (scaffold)** — NOT implementation-ready. Implementation PRs are gated by §8's RFC approval gate (§1–§6b reviewed; §7 owner assigned; threat model written). Until that gate passes, do not open Worker, `/hub` CLI/TUI, or `~/.pie/mcp.toml` UX PRs against this design.
+> Status: **Implementation in progress.** §1, §2, §3 v0.2, §4 v0.2, §5, §6a, §6b, §8 v0.1 are on `main`. §7 owner = @Tools-MCP-Lead (RFC-OQ-1 resolved 2026-05-30). Worker MVP and live e2e are the current critical path; see RFC #18 §8 release gates and the change-log entry for the deploy workflow PR.
 > Coordinator: @alice
 >
 > Chapter authors:
@@ -13,7 +13,7 @@
 > - §5 Notification routing / delivery semantics — @Runtime-dev-lead
 > - §6a Client integration (contract + runtime boundary) — @Tools-MCP-Lead
 > - §6b `/hub *` CLI / TUI surface — @CLI-TUI-Dev-Lead
-> - §7 Worker implementation + storage model — **TBD**
+> - §7 Worker implementation + storage model — @Tools-MCP-Lead (assigned 2026-05-30 by @EdHuang; RFC-OQ-1 resolved)
 > - §8 Deployment / `CF_API_KEY` boundary / CI / acceptance / release gate — @QA-Release-Lead
 
 ## Goal
@@ -38,7 +38,7 @@ Concretely, the RFC is "done" only when:
 2. Two real pie agents on different machines (or different namespaces) can register, discover each other, send and receive notifications, exercise the first-contact gate end-to-end against the deployed Worker.
 3. The acceptance matrix in §8 has been run against the deployed Worker — not just faux fixtures.
 
-This does NOT change the "no real Cloudflare in build/test CI" rule (§8). Build/test CI uses faux Worker / `wrangler dev` / Miniflare. Deploy is a **separate, approval-gated CI lane** (GitHub Actions deploy job with protected environment + @EdHuang approval) — see §8 gate 5. The deployed-Worker e2e is gate 6.
+This does NOT change the "no real Cloudflare in build/test CI" rule (§8). Build/test CI uses faux Worker / `wrangler dev` / Miniflare. Deploy is a **separate, environment-protected CI lane** (GitHub Actions deploy job, `production` environment with branch policy = `main`, manual `workflow_dispatch`; per @EdHuang 2026-05-30 no per-run human approval is required — any authorized team member can trigger) — see §8 gate 5. The deployed-Worker e2e is gate 6.
 
 **Status terminology (per @QA-Release-Lead 2026-05-29).** Two distinct states to avoid future misjudgement:
 
@@ -94,7 +94,7 @@ This does NOT change the "no real Cloudflare in build/test CI" rule (§8). Build
 | 5   | Notification routing / delivery semantics                      | @Runtime-dev-lead                           | **v0.1**            |
 | 6a  | Client integration (contract + runtime boundary)               | @Tools-MCP-Lead                             | **v0.1**            |
 | 6b  | `/hub *` CLI / TUI surface                                     | @CLI-TUI-Dev-Lead                           | **v0.1**            |
-| 7   | Worker implementation + storage                                | **TBD**                                     | TBD                 |
+| 7   | Worker implementation + storage                                | @Tools-MCP-Lead                             | in progress         |
 | 8   | Deployment / `CF_API_KEY` / CI / acceptance / release gate     | @QA-Release-Lead                            | **v0.1**            |
 
 ---
@@ -1755,7 +1755,9 @@ tests:
 
 ## §7 Worker implementation + storage model
 
-**Owner: TBD.** EdHuang to nominate, or self-assign once §1 / §3 / §5 stabilize.
+**Owner: @Tools-MCP-Lead** (assigned 2026-05-30 by @EdHuang; RFC-OQ-1 resolved). TS + D1 (relational identity / auth / notification state) + Durable Objects (per-agent SSE fan-out + inflight notification queue) per Tools-MCP's volunteered scope.
+
+Status: implementation in progress. Worker MVP scope (matches §8.5 scenario 1 + 5 minimum live e2e): human auth + `register_agent` + `send_notification` + SSE push + `notifications/agent_message`. Other §2.3 tools follow in iteration. Deploy goes through the GitHub Actions workflow added in PR #140.
 
 Carry-forward open questions for the §7 owner:
 
@@ -1773,7 +1775,7 @@ Owner: @QA-Release-Lead.
 The release process has two distinct tracks:
 
 - **Build/test CI**: deterministic, repeatable, no real Cloudflare access. Uses faux HTTP/SSE servers, local Worker fixtures, `wrangler dev`, or Miniflare.
-- **Deploy/e2e CI**: approval-gated production workflow that deploys to real `pie.0xfefe.me` and runs live e2e. This lane may use the GitHub repository secret `CF_API_KEY`; ordinary build/test jobs may not.
+- **Deploy/e2e CI**: environment-protected production workflow that deploys to real `pie.0xfefe.me` and runs live e2e. Manual `workflow_dispatch` from `main`; no per-run approval required (per @EdHuang 2026-05-30). This lane may use the GitHub repository secret `CF_API_KEY`; ordinary build/test jobs may not.
 
 Every gate below MUST state required tests, manual verification, rollback / disable path, and content forbidden from logs / audit / session.
 
@@ -1783,19 +1785,20 @@ Every gate below MUST state required tests, manual verification, rollback / disa
 2. **Transport PR gate** — `HttpMcpTransport` lands as a generic capability with faux HTTP / SSE tests; no real Cloudflare in build/test CI.
 3. **Worker local / faux gate** — Worker implementation passes against local fixture (`wrangler dev` or Miniflare); no `CF_API_KEY` access.
 4. **Client UX gate** — `/hub *` CLI / TUI commands, `~/.pie/mcp.toml` hub entry shape, first-contact prompt UX, error → recovery-action wording.
-5. **Real deploy gate (CI auto-deploy via GitHub Actions)** — `.github/workflows/deploy-fefe.yml` deploys the Worker to the real `pie.0xfefe.me`. Secret hardening (per team consensus 2026-05-29 — fold into §8 v0.1):
+5. **Real deploy gate (GitHub Actions deploy)** — `.github/workflows/deploy-fefe.yml` deploys the Worker to the real `pie.0xfefe.me`. Secret hardening (per team consensus 2026-05-29 with the 2026-05-30 update from @EdHuang authorizing direct team-triggered deploys via Actions):
    - Cloudflare token lives in GitHub repository secret `CF_API_KEY`, scoped minimally to this Worker (`Workers Scripts:Edit` + required KV/D1/DO bindings).
-   - Deploy job runs only on protected branch / tag or `workflow_dispatch`; PRs from forks cannot access the secret.
-   - Deploy job runs in a protected GitHub Environment (e.g. `production`) with **required reviewer = @EdHuang** approval before execution.
+   - Deploy runs only via `workflow_dispatch` (manual trigger) from `main`. Forks / PR branches cannot access the secret.
+   - Deploy job runs in a protected GitHub Environment named `production` (configured in repo settings). v0 allows team-triggered deploys without per-run human approval per @EdHuang's 2026-05-30 simplification; the environment still enforces branch-policy = `main` only.
    - The secret is read only via `${{ secrets.CF_API_KEY }}` in the deploy step's job-level env, never the workflow-global env.
    - No `set -x`, no wrangler debug logging, no echo of secret-bearing config. Logs / artifacts / cache MUST NOT contain the token.
-   - Rollback / disable runs in a separate, equally-protected workflow.
+   - Input validation runs in a non-secret-bearing step before the deploy step; validated values are emitted as step outputs and the secret-bearing step reads only those outputs (defense in depth against dispatch-input injection — per @Provider-Auth-Lead PR #140 review).
+   - Rollback / disable runs in a separate, equally-protected workflow; rollback `target_version` must be a full 40-char SHA that is an ancestor of `origin/main` (the workflow validates with `git merge-base --is-ancestor`).
    - README / CHANGELOG document workflow file path, environment protection, bindings, migrations, rollback procedure.
 6. **Deployed-Worker e2e gate (definition of done — per @EdHuang)** — **the RFC is NOT complete until this gate passes.** Two real pie agents on different machines / namespaces register, discover each other, send notifications, and exercise the first-contact gate end-to-end against the deployed `pie.0xfefe.me`. Per @Tools-MCP-Lead, a post-deploy CI job can run this automatically against the live Worker (gated on the protected environment). The full §8 acceptance matrix runs against the deployed Worker — faux-fixture passes alone do not satisfy this gate. E2E reports only contain `deployment_id` / `version` / `trace_id` / bounded result — never the token, hub session, agent token, or payload secret. Rollback path documented and rehearsed.
 
 `CF_API_KEY` boundary: usable only inside the deploy job of gate 5 and (optionally) the post-deploy live-Worker job of gate 6. MUST NOT appear in CI build / test logs, runtime config, session, audit, bug report, MCP / notification payload, or any artifact.
 
-**CI vs acceptance gate distinction.** Gates 2, 3, 4 are CI-friendly without the secret (no Cloudflare access). Gate 5 deploy is automated but **environment-gated by @EdHuang's approval**, not a free-running CI step. Gate 6 e2e targets the real deployed Worker. The "no real Cloudflare in CI" rule is preserved for build / test CI; deploy CI is a separate, approval-gated lane.
+**CI vs acceptance gate distinction.** Gates 2, 3, 4 are CI-friendly without the secret (no Cloudflare access). Gate 5 deploy runs via `workflow_dispatch` on the `production` GitHub Environment — team members can trigger directly per @EdHuang's 2026-05-30 simplification; the secret is only ever exposed inside the deploy step. Gate 6 e2e targets the real deployed Worker. The "no real Cloudflare in CI" rule is preserved for build / test CI; deploy CI is a separate, environment-protected lane.
 
 ### §8.2 Secret handling and workflow hardening
 
@@ -1805,7 +1808,7 @@ Required workflow controls:
 
 - The deploy workflow is `.github/workflows/deploy-fefe.yml`.
 - Deploy job runs only from protected `main` / release tags or explicit `workflow_dispatch`.
-- Deploy job uses a protected GitHub Environment named `production`, with required reviewer @EdHuang.
+- Deploy job uses a protected GitHub Environment named `production` with branch policy = `main` only. Per @EdHuang's 2026-05-30 simplification, the environment does not require per-run human approval — team members can trigger deploys directly via `workflow_dispatch`. The environment still gates the secret to deploy / rollback jobs only.
 - Pull requests, forked branches, and ordinary build/test jobs cannot access `CF_API_KEY`.
 - `CF_API_KEY` is referenced as `${{ secrets.CF_API_KEY }}` only in the deploy step's environment. Do not set it as workflow-global env.
 - The Cloudflare token scope is minimal for `pie.0xfefe.me`: only Worker deploy and required binding access (`Workers Scripts:Edit` plus the exact D1 / KV / Durable Objects permissions selected in §7).
@@ -1838,7 +1841,7 @@ The RFC approval gate is blocked until a threat model exists. It must cover at l
 | 2. Transport PR | Faux HTTP POST request/response; SSE receive; timeout/cancel; reconnect/backoff; malformed JSON-RPC frame; header auth isolation; no Cloudflare calls. | Local run against a toy MCP-over-HTTP fixture. | `HttpMcpTransport` may merge as generic MCP capability. |
 | 3. Worker local / faux | Miniflare / `wrangler dev` tests for register/login/token, list/discover, send/receive, permission denied, body cap, rate limit, idempotency, redaction, schema `additionalProperties: false`. | Local smoke using fake accounts and temp storage; cleanup verified. | Worker code may merge behind non-production docs/status. Not release complete. |
 | 4. Client UX | `/hub *` command tests; TUI/Web Hub status panel; bounded feed display; auth error → recovery action; no secret-bearing output; first-contact prompt display. | Operator verifies status/error copy and redaction with representative hub states. | Client UX may merge when backed by §6a engine API; not release complete. |
-| 5. CI deploy | Deploy workflow validates branch/environment restrictions; workflow dry-run or staging run; secret access limited to deploy step; logs/artifacts/cache scanned for forbidden values. | @EdHuang approves `production` environment run; deployment id/version recorded; rollback workflow verified available. | Real `pie.0xfefe.me` can be deployed; still not done until gate 6 passes. |
+| 5. CI deploy | Deploy workflow validates branch/environment restrictions; workflow dry-run or staging run; secret access limited to deploy step; logs/artifacts/cache scanned for forbidden values. | Team member triggers `workflow_dispatch` from `main` against the `production` environment (no per-run approval per @EdHuang 2026-05-30); deployment id/version recorded; rollback workflow verified available. | Real `pie.0xfefe.me` can be deployed; still not done until gate 6 passes. |
 | 6. Deployed-Worker e2e | Post-deploy live e2e may run in protected workflow: two namespaces / agents register; discover; send; receive; first-contact; dedup; revoke; deny; body cap/rate limit. | Bounded e2e report posted to #fefe with deployment id, version, trace ids, pass/fail matrix, rollback decision. | Only passing gate 6 is **release complete / done**. |
 
 ### §8.5 Deployed-Worker e2e scenario set
@@ -1988,7 +1991,7 @@ These complement, do not duplicate. `Accept once` writes only `trigger_prompt`. 
 
 | ID            | Question                                                                                  | Status / take                                         |
 | ------------- | ----------------------------------------------------------------------------------------- | ----------------------------------------------------- |
-| RFC-OQ-1      | §7 Worker implementation owner.                                                            | **Deferred (2026-05-29 by @EdHuang, option B):** name owner after §1, §2, §5 v0.1 land. Avoids rework against a moving envelope; pushes done gate by ~2 PR cycles but reduces risk. §1/§2/§5 work proceeds in parallel. |
+| ~~RFC-OQ-1~~  | §7 Worker implementation owner.                                                            | **RESOLVED 2026-05-30 by @EdHuang: @Tools-MCP-Lead**. TS + D1 + Durable Objects per Tools-MCP's volunteered scope. Deploy workflow (PR #140) lands in parallel. Per @EdHuang's same-day simplification, deploys go through GitHub Actions `workflow_dispatch` with the `production` environment limiting `CF_API_KEY` to deploy / rollback jobs — no per-run human approval; any authorized team member can trigger. Worker MVP and live e2e gate 6 unblock once @EdHuang adds `CF_API_KEY` to repo secrets, the `production` GitHub Environment is configured with branch policy = `main`, and `pie.0xfefe.me` is pointed at a placeholder Worker on Cloudflare. |
 | RFC-OQ-2      | `inbox = open` in v0? (§4.OQ-1)                                                            | @alice: skip until concrete reason.                   |
 | RFC-OQ-3      | `capabilities` taxonomy: registered / free-form / hybrid? (§4.OQ-2)                        | @alice: registered taxonomy day 1.                    |
 | RFC-OQ-4      | Trust TTL: `Always` expires? Block expires? (§4.OQ-3)                                      | @alice: 90 d Always, indefinite Block.                |
@@ -2022,3 +2025,4 @@ These complement, do not duplicate. `Accept once` writes only `trigger_prompt`. 
 | 2026-05-29 | @Provider-Auth-Lead | §3 v0.2: resolved RFC-OQ-9 and RFC-OQ-10. Agent tokens default to no automatic expiry (`expires_at = null`) unless user/admin sets one, while rotate/revoke and bounded revoke behavior remain mandatory before v0 deploy. First-contact trust cache keys now include `local_receiver_instance_id + receiver_agent_id + sender_agent_id + action_class`; local instance id is random local state, not hardware identity, and audit/logs expose only `local_receiver_instance_id_hash`. Updated §5.OQ-3 and the `hub-trust.json` shape to match. |
 | 2026-05-29 | @Tools-MCP-Lead | §6a v0.1: client integration engine contract — `HttpMcpTransport` impl Transport over Streamable HTTP (POST + SSE), `~/.pie/mcp.toml` hub entry shape (`kind = "streamable_http"`), `mcp_loader::connect_one` dispatch extension, `make_pie_hub_notification_hook` factory call site, `Authorization: Bearer` header-only token discipline (per Provider/Auth §1 review ask), body-cap + error-mapping defense-in-depth, reconnect / `Last-Event-ID` resume / dedup wiring, embedder install point for `HubTrustGate` as `BeforeTriggerHook`, faux HTTP/SSE fixture test strategy. Owns the engine API only — CLI/TUI surface stays in §6b. |
 | 2026-05-29 | @CLI-TUI-Dev-Lead | §6b v0.1: `/hub *` CLI / TUI / Web UX surface — command grammar for status/login/register/profile/visibility/list/send/inbox/trust/block/rotate/logout; strict §6a engine-only boundary (no parallel hub client, no raw MCP parsing); Hub panel and Web state bounded fields; first-contact prompt card UX through #110 trigger prompt channel; feed display rules keeping heartbeat/reconnect noise out of the main conversation while showing accepted notification results; error-to-recovery copy table; user-path test matrix and open questions for login flow, `/hub send`, default panel visibility, Web prompt rendering, multi-hub selector, and timeout UI. |
+| 2026-05-30 | @alice | RFC-OQ-1 RESOLVED by @EdHuang: §7 Worker implementation owner = @Tools-MCP-Lead. Updated chapter map + §7 body (status = in progress; TS + D1 + Durable Objects; Worker MVP scope = §8.5 scenario 1 + 5 minimum). Added the deploy / rollback GitHub Actions workflows (`.github/workflows/deploy-fefe.yml`, `.github/workflows/deploy-fefe-rollback.yml`) as the §8.2 scaffolding so Worker code (Tools-MCP) and deploy infra advance in parallel. Workflows enforce: strict regex validation on `wrangler_version` and `worker_dir` in a non-secret step that emits validated values as `$GITHUB_OUTPUT`; secret-bearing steps read only `steps.validate.outputs.*`; rollback `target_version` must be a 40-char SHA that is an ancestor of `origin/main` (verified via `git merge-base --is-ancestor`); `CF_API_KEY` exposed only in deploy/rollback/disable step env, never workflow-global. Per @EdHuang's same-day simplification, the `production` GitHub Environment limits the secret to deploy / rollback jobs but does NOT require per-run human approval — team members can trigger deploys directly via `workflow_dispatch`. Updated §8 gate 5 + §8.2 + RFC top status (no more "NOT implementation-ready"); folded blockers from @Provider-Auth-Lead + @QA-Release-Lead inline. Worker MVP + EdHuang's repo-secret / environment / Cloudflare DNS setup unblock the first live deploy. |

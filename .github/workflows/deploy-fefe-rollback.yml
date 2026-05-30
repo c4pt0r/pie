@@ -1,0 +1,217 @@
+name: deploy-fefe-rollback
+
+# Rollback or disable the pie.0xfefe.me Cloudflare Worker.
+#
+# Security model (RFC #18 §8.2):
+#   - Same protected `production` environment as the forward deploy (branch
+#     policy = `main` only; per @EdHuang 2026-05-30 no per-run human approval).
+#     Rollback is a control-plane operation; same secret scoping applies.
+#   - CF_API_KEY is exposed only to the wrangler step. No `set -x`, no debug.
+#   - Inputs (`mode`, `target_version`, `worker_dir`, `wrangler_version`) are
+#     validated in a non-secret step and emitted as step outputs. The
+#     secret-bearing rollback / disable steps read only
+#     `steps.validate.outputs.*` — defense in depth against dispatch-input
+#     injection (per @Provider-Auth-Lead PR #140 review).
+#   - `target_version` is restricted to a full 40-char SHA that is provably an
+#     ancestor of `origin/main`. Branches, tags, short SHAs, and unreachable
+#     commits are all rejected. This prevents an approver from accidentally
+#     deploying untrusted history with the production secret.
+#   - `wrangler_version` is strict semver-prefix validated before any step
+#     with the secret runs, so the input cannot inject shell metacharacters.
+#
+# Modes
+#   - rollback: provide a `target_version` (full 40-char git sha that is an
+#     ancestor of origin/main). The workflow validates ancestry, checks out
+#     that SHA, and re-runs `wrangler deploy`. Effective version = the SHA.
+#   - disable: no input. The workflow runs `wrangler delete` against the
+#     `pie-hub` worker. Domain remains in Cloudflare but unbound to a Worker;
+#     the next forward deploy rebinds it.
+#
+# Tracking: RFC #18 §8 (gate 5/6 rollback / disable rehearsal).
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "rollback or disable"
+        required: true
+        type: choice
+        options:
+          - rollback
+          - disable
+      target_version:
+        description: "For rollback: full 40-char git SHA that is an ancestor of origin/main. Tags/branches/short SHAs rejected. Ignored for disable."
+        required: false
+        default: ""
+      worker_dir:
+        description: "Worker source directory (default: worker/)"
+        required: false
+        default: "worker/"
+      wrangler_version:
+        description: "Pinned wrangler version. Strict semver prefix ('3', '3.93', '3.93.0')."
+        required: false
+        default: "3"
+
+# Workflow-level concurrency: rollback / disable cannot race with each other
+# or with a forward deploy.
+concurrency:
+  group: deploy-fefe-production
+  cancel-in-progress: true
+
+jobs:
+  rollback:
+    name: rollback pie.0xfefe.me
+    runs-on: ubuntu-latest
+
+    environment:
+      name: production
+      url: https://pie.0xfefe.me
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: validate inputs
+        id: validate
+        env:
+          MODE: ${{ inputs.mode }}
+          TARGET_VERSION: ${{ inputs.target_version }}
+          WORKER_DIR: ${{ inputs.worker_dir }}
+          WRANGLER_VERSION: ${{ inputs.wrangler_version }}
+        run: |
+          # All input validation BEFORE any step that exposes CF_API_KEY.
+          # No secret use here. Validated values are written as step outputs;
+          # downstream secret-bearing steps consume the outputs, not the raw
+          # dispatch inputs (per @Provider-Auth-Lead review on PR #140).
+          set -eu
+          # mode
+          case "$MODE" in
+            rollback|disable) ;;
+            *) echo "::error::mode must be 'rollback' or 'disable'"; exit 1 ;;
+          esac
+          # worker_dir
+          case "$WORKER_DIR" in
+            /*|*..*) echo "::error::worker_dir must be a relative path inside the repo"; exit 1 ;;
+          esac
+          # wrangler_version: strict numeric semver-prefix pattern.
+          if ! printf '%s' "$WRANGLER_VERSION" | grep -Eq '^[0-9]+(\.[0-9]+){0,2}$'; then
+            echo "::error::wrangler_version '$WRANGLER_VERSION' is not a strict semver prefix (allowed: '3', '3.93', '3.93.0')"
+            exit 1
+          fi
+          # target_version (rollback only): must be a full 40-char hex SHA.
+          # Ancestor-of-main check happens in the next step (needs git history).
+          if [ "$MODE" = "rollback" ]; then
+            if [ -z "$TARGET_VERSION" ]; then
+              echo "::error::rollback requires target_version (full 40-char git SHA that is an ancestor of origin/main)"
+              exit 1
+            fi
+            if ! printf '%s' "$TARGET_VERSION" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "::error::target_version '$TARGET_VERSION' is not a full 40-char hex SHA. Tags, branches, and short SHAs are not allowed."
+              exit 1
+            fi
+          fi
+          # Emit validated values as step outputs. All steps that expose
+          # CLOUDFLARE_API_TOKEN MUST read from `steps.validate.outputs.*`
+          # rather than `inputs.*` so the secret-bearing steps are bound to
+          # the validated values.
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "target_version=$TARGET_VERSION" >> "$GITHUB_OUTPUT"
+          echo "worker_dir=$WORKER_DIR" >> "$GITHUB_OUTPUT"
+          echo "wrangler_version=$WRANGLER_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: checkout main for ancestor verification (rollback only)
+        if: ${{ steps.validate.outputs.mode == 'rollback' }}
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: verify target_version is ancestor of origin/main (rollback only)
+        if: ${{ steps.validate.outputs.mode == 'rollback' }}
+        env:
+          TARGET_VERSION: ${{ steps.validate.outputs.target_version }}
+        run: |
+          # Defense in depth on top of the 40-char SHA regex: refuse to deploy
+          # any commit that is not reachable from `origin/main`. This blocks
+          # an attacker (or honest mistake) from deploying a feature branch,
+          # PR head, or fork tip with the production secret.
+          # No secret use here.
+          set -eu
+          if ! git merge-base --is-ancestor "$TARGET_VERSION" origin/main; then
+            echo "::error::target_version '$TARGET_VERSION' is not an ancestor of origin/main (refusing to deploy untrusted history)"
+            exit 1
+          fi
+
+      - name: checkout target_version (rollback only)
+        if: ${{ steps.validate.outputs.mode == 'rollback' }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.validate.outputs.target_version }}
+          fetch-depth: 1
+
+      - name: setup node
+        if: ${{ steps.validate.outputs.mode == 'rollback' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: install dependencies (rollback only)
+        if: ${{ steps.validate.outputs.mode == 'rollback' }}
+        working-directory: ${{ steps.validate.outputs.worker_dir }}
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: re-deploy known-good version (rollback)
+        id: rollback
+        if: ${{ steps.validate.outputs.mode == 'rollback' }}
+        working-directory: ${{ steps.validate.outputs.worker_dir }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_KEY }}
+          WRANGLER_VERSION: ${{ steps.validate.outputs.wrangler_version }}
+        run: |
+          npx --yes "wrangler@${WRANGLER_VERSION}" deploy \
+            --name pie-hub \
+            --keep-vars \
+            --outdir ./dist
+          echo "rolled_back_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: disable live deployment (disable)
+        id: disable
+        if: ${{ steps.validate.outputs.mode == 'disable' }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_KEY }}
+          WRANGLER_VERSION: ${{ steps.validate.outputs.wrangler_version }}
+        run: |
+          # `wrangler delete --name pie-hub` removes the live deployment.
+          # Domain stays in Cloudflare; the next forward deploy rebinds it.
+          npx --yes "wrangler@${WRANGLER_VERSION}" delete \
+            --name pie-hub \
+            --force
+          echo "disabled_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: record rollback metadata (bounded)
+        env:
+          MODE: ${{ steps.validate.outputs.mode }}
+          TARGET_VERSION: ${{ steps.validate.outputs.target_version }}
+          ROLLED_BACK_AT: ${{ steps.rollback.outputs.rolled_back_at }}
+          DISABLED_AT: ${{ steps.disable.outputs.disabled_at }}
+        run: |
+          {
+            echo "## fefe rollback report (bounded)"
+            echo ""
+            echo "- worker: pie-hub"
+            echo "- domain: pie.0xfefe.me"
+            echo "- mode: $MODE"
+            if [ "$MODE" = "rollback" ]; then
+              echo "- target_version: $TARGET_VERSION"
+              echo "- rolled_back_at: $ROLLED_BACK_AT"
+            else
+              echo "- disabled_at: $DISABLED_AT"
+            fi
+            echo ""
+            echo "Forbidden values per RFC #18 §8.6 are not emitted."
+          } >> "$GITHUB_STEP_SUMMARY"
