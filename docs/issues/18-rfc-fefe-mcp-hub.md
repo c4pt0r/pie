@@ -258,14 +258,260 @@ Choice:  Accept once    Always (notification-only)    Block
 
 ---
 
-## §5 Notification routing / delivery semantics
+## §5 Notification routing / delivery semantics — v0.1 (@Runtime-dev-lead)
 
-TBD — @Runtime-dev-lead. Scope per 2026-05-29 commitment:
+Owns the *how* on the **client side**: from the moment a hub-pushed MCP notification arrives over the [§6a `HttpMcpTransport`](#6a-client-integration--contract--runtime-boundary) into the moment the user's main agent has either run, deferred, dropped, or prompted on it. Specifically:
 
-- Client side: hub MCP server pushes `notifications/...` → `McpNotificationHook` → `Trigger` envelope → existing `register_notification_hook` supervisor. No new hook trait.
-- `TriggerAuthority` fields: `principal_id = agent_id` (UUID), `principal_label = @handle@namespace` (display only).
-- Envelope: source label `mcp:pie-hub:...`, ack / dedup via `pie_dedup_key`, default `payload_visibility = Local`, redelivery / idempotency semantics, offline + reconnect backlog bounds, ordering not guaranteed.
-- Hub-side fan-out / inbox delivery semantics live in §6 / §7; §5 covers the boundary from client receive to `Trigger` conversion.
+- The mapping from the on-wire `notifications/agent_message` (per §2) into the in-process [`Trigger`][trigger-rs] envelope.
+- Reuse of the RFC 1 trigger pipeline (`McpNotificationHook` → `register_notification_hook` supervisor → `handle_trigger` → `BeforeTriggerHook::Prompt`). **No new hook trait, no new pipeline.**
+- Source-label namespacing, dedup, payload visibility, ordering, offline / reconnect semantics, audit shape for trust decisions.
+- The receiver-side first-contact prompt hook-up to issue #110, including the `~/.pie/hub-trust.json` shape.
+
+Out of scope (other chapters):
+
+- The hub's *server-side* fan-out, inbox storage, durable queue, namespace isolation, rate limit — [§7](#7-worker-implementation--storage-model).
+- The wire-level MCP tool / resource / notification *schemas* — [§2](#2-hub-mcp-protocol-surface). §5 cites §2 for wire fields, never redefines them.
+- The `~/.pie/mcp.toml` hub entry shape and `HttpMcpTransport` itself — [§6a](#6a-client-integration--contract--runtime-boundary).
+- Trust-list product semantics (`Always` vs `Accept once` vs `Block`) — [§4.3](#43-first-contact-gate--reuse-issue-110-user-prompt-mechanism). §5 owns the *persistence* and *audit* of those decisions.
+
+[trigger-rs]: ../../crates/agent/src/harness/trigger.rs
+
+### §5.1 Wire → Trigger boundary
+
+The hub pushes an MCP notification (method name and full payload shape defined in [§2.5](#2-hub-mcp-protocol-surface)). On client receive, the existing `McpNotificationHook` (`crates/agent/src/harness/notification_hook.rs`, landed in PR #56) turns it into a `Trigger` envelope on the runtime side. **No new code path** — the same hook that already maps any MCP server's `notifications/...` to a Trigger is used for hub-pushed notifications. The hub adapter is just a configured `McpNotificationHook` instance with a hub-specific `source_kind_prefix` ([§5.2](#52-source-label-namespacing)).
+
+```
+                        wire (§2 + §6a)             runtime (§5)
+                       ┌──────────────────┐       ┌────────────────────────┐
+                       │ notifications/   │       │ McpNotificationHook    │
+   hub  ── SSE push ───┤ agent_message    │ ────► │  (existing, PR #56)    │
+                       │ params: { _meta, │       │       │                │
+                       │           ... }  │       │       ▼                │
+                       └──────────────────┘       │   Trigger envelope     │
+                                                  │  (this chapter, §5.4)  │
+                                                  └────────────┬───────────┘
+                                                               │
+                                                  ┌────────────▼───────────┐
+                                                  │ register_notification_ │
+                                                  │ hook supervisor (RFC 1)│
+                                                  │  ─►  handle_trigger    │
+                                                  │       ├─ dedup         │
+                                                  │       ├─ cycle suppr.  │
+                                                  │       └─ BeforeTrigger │
+                                                  │           Hook::Prompt │
+                                                  │            (issue #110)│
+                                                  └────────────────────────┘
+```
+
+Implementation tasks Runtime owns once §1/§2/§5 are reviewed:
+
+1. A `make_pie_hub_notification_hook(source_kind_prefix: "pie-hub") -> DynNotificationHook` factory in `crates/agent/src/harness/notification_hook.rs`. **Pure configuration** of the existing `McpNotificationHook`; no new trait, no new struct.
+2. A `BeforeTriggerHook` adapter that consults `~/.pie/hub-trust.json` ([§5.7](#57-trust-decision-audit-and-persistence)) before allowing a hub-originated trigger through.
+3. `Custom { custom_type: "fefe_trust_decision" }` audit-entry schema ([§5.7](#57-trust-decision-audit-and-persistence)).
+
+Code path 2 hard-depends on issue #110 (`ControlPlaneWrite` `PermissionDecision::Prompt` wired through `before_tool_call`). Per [Definition of done](#definition-of-done) #110 is P0 alongside §5 implementation.
+
+### §5.2 Source-label namespacing
+
+The hub adapter's `Trigger.source.source_label` follows the existing `mcp:{server_name}:custom:{notification_method_tail}:{event_id}` convention from `McpNotificationHook` (PR #56). For the hub adapter:
+
+```
+mcp:pie-hub:custom:agent_message:<msg_id>
+```
+
+- `pie-hub` is reserved as the canonical hub `source_name`. Per-deployment overrides (e.g. staging at `pie-hub-staging`) are allowed via `mcp.toml`'s server name, but the prefix `mcp:pie-hub` stays the runtime-visible identity for `BeforeTriggerHook` policies and trust keys.
+- `agent_message` is the **stable** notification-method tail. Cited from §2.5, not redefined here. Future hub-pushed methods (e.g. `agent_revoked`, `discovery_changed`) follow the same pattern and get their own per-method tails.
+- `<msg_id>` is the hub-issued message identifier from §2's `_meta.pie_dedup_key` ([§5.5](#55-idempotency--dedup)).
+
+**Why a stable prefix matters.** Trust-list keying ([§5.7](#57-trust-decision-audit-and-persistence)) and `BeforeTriggerHook` allowlists ([§5.6](#56-first-contact-gate-hookup--issue-110)) reference `source_kind_prefix = "mcp:pie-hub:"` as their match shape. If a user reconfigures `mcp.toml` to point at a different hub URL but keeps `server_name = pie-hub`, the same trust list applies — that's the intended semantics. If they want a separate trust scope (e.g. testing against staging), they pick a different `server_name`.
+
+### §5.3 `TriggerAuthority` mapping
+
+| Field on `TriggerAuthority` | Hub-derived value                           | Source                                          |
+| --------------------------- | ------------------------------------------- | ----------------------------------------------- |
+| `principal_id`              | sender `agent_id` (UUID)                    | §2 wire field, cited                            |
+| `principal_label`           | `@handle@namespace`                         | §2 wire field, cited (display only — never an authorization input per §4.1) |
+| `credential_scope`          | `Scoped("mcp:pie-hub", read=true, write=false)` | Runtime-defined; matches the existing trigger pipeline scope shape for MCP-originated triggers |
+| `allowed_source_actions`    | `[ "notification" ]`                        | Runtime-defined; tracks the `action_class` from §4.3 |
+| `expires_at`                | `now + <BeforeTriggerHook ttl, default 10m>` | Runtime-defined; covers `handle_trigger` admission until the supervisor either accepts, dedups, or expires the envelope |
+
+`principal_id` is the immutable UUID. Every downstream gate (trust key, audit join, dedup tier) **keys on `principal_id`**, never `principal_label`. This is the §4.1 contract: handles are display, UUIDs are identity. The `BeforeTriggerHook::Prompt` UI is allowed to render `principal_label`, but the persisted trust decision binds to `principal_id` ([§5.7](#57-trust-decision-audit-and-persistence)).
+
+### §5.4 Envelope shape (runtime side)
+
+The on-wire MCP payload (§2.5) populates a runtime `Trigger`:
+
+```rust
+Trigger {
+    idempotency_key: <_meta.pie_dedup_key>,                  // §5.5
+    source: TriggerSource::Mcp {
+        server_name: "pie-hub",
+        method: "agent_message",
+        event_id: <_meta.pie_dedup_key>,
+    },
+    source_label: "mcp:pie-hub:custom:agent_message:<id>",   // §5.2
+    event_label: <bounded sender + intent summary>,          // §5.10
+    authority: TriggerAuthority { ... },                     // §5.3
+    payload_visibility: PayloadVisibility::Local,            // §5.6
+    payload_summary: <_meta.pie_summary (capped, redacted)>, // §5.5
+    payload: None,                                           // §5.6
+    ...
+}
+```
+
+The `payload` field is intentionally `None` after the wire-to-Trigger transform. The raw notification body is **discarded** at the boundary — only `_meta.pie_summary` (already bounded and sanitized by §2) survives into the runtime. This matches RFC 1's payload-visibility=Local default and prevents arbitrary hub payload from leaking into audit, prompts, or LLM context. Tools-MCP defines the full set of allowed `_meta.*` keys for `agent_message` in §2.5.
+
+### §5.5 Idempotency / dedup
+
+- `_meta.pie_dedup_key` (per §2.5) is the **sole** identifier the runtime uses for `TriggerRuntime` dedup. The hub MUST guarantee it is unique per logical message at the hub layer (per §7); the runtime treats it as opaque.
+- The runtime applies its standard dedup window (`TriggerRuntimeConfig::dedup_window`, default 5 minutes per RFC 1) against `idempotency_key`. A redelivered SSE message (e.g. after reconnect, [§5.8](#58-offline--reconnect-behavior)) hits the dedup tier and is recorded as `TriggerState::Deduped` with the original trace id — no double-handling on the receiver side.
+- The dedup key is intentionally **not** prefixed with `mcp:pie-hub:` in `idempotency_key`. Source-label namespacing ([§5.2](#52-source-label-namespacing)) provides cross-source disambiguation; the `idempotency_key` is hub-scope already because the dedup key comes from the hub.
+
+### §5.6 First-contact gate hookup — issue #110
+
+The receiver-side prompt path is the `BeforeTriggerHook` slot already in `AgentHarnessOptions` (RFC 1 sub-PR 4). The hub adapter wires:
+
+```rust
+opts.before_trigger = Some(
+    HubTrustGate::new(hub_trust_store).as_before_trigger_hook()
+);
+```
+
+Decision flow inside the hook, evaluated only for triggers whose `source_label` starts with `mcp:pie-hub:`:
+
+1. Read `(receiver_agent_id, sender_agent_id, action_class)` from the trigger.
+2. Look up `~/.pie/hub-trust.json` ([§5.7](#57-trust-decision-audit-and-persistence)).
+3. Decision:
+   - Found entry `Always` and not expired (per RFC-OQ-4 §4.OQ-3: 90-day TTL) → `BeforeTriggerDecision::Allow`.
+   - Found entry `Block` → `BeforeTriggerDecision::Deny { reason: "blocked by user trust list" }`.
+   - No entry, sender is same-namespace → fall through to next stage (`inbox` enforcement per §4.2; if hub already rejected non-matching `inbox` at send time, this is a defensive belt).
+   - No entry, sender is cross-namespace → `BeforeTriggerDecision::Prompt { reason: <bounded sender summary> }`.
+4. The runtime emits `HarnessEvent::TriggerHandled { state: NeedsApproval, ... }`. The embedder consumes this through the issue #110 `ControlPlaneWrite` prompt channel — the same UX surface that gates `InstallSkill`, `NewTrigger`, etc.
+5. User's three-way decision (`Accept once` / `Always` / `Block` per §4.3) becomes a `fefe_trust_decision` audit entry ([§5.7](#57-trust-decision-audit-and-persistence)).
+
+**Hard dependency on issue #110.** Without the `PermissionDecision::Prompt` channel wired through `before_tool_call`, the `NeedsApproval` state has no embedder-side rendering and the trigger is effectively dropped silently. Issue #110 is P0 alongside this chapter; both must land before the first-contact gate ships.
+
+### §5.7 Trust decision audit and persistence
+
+Two distinct artifacts:
+
+1. **Runtime-emitted audit entry** — `SessionTreeEntry::Custom { custom_type: "fefe_trust_decision", data: {...} }`. Written by the runtime via existing `Session::append_custom`. One entry per user decision (`Accept once` writes one entry without modifying the trust list; `Always` and `Block` write the entry AND persist to disk).
+
+2. **Embedder-owned trust list** — `~/.pie/hub-trust.json`. Read every time `HubTrustGate` evaluates; written when the user picks `Always` or `Block`. Shape:
+
+   ```json
+   {
+     "version": 1,
+     "entries": [
+       {
+         "key": {
+           "receiver_agent_id": "<UUID>",
+           "sender_agent_id":   "<UUID>",
+           "action_class":      "notification"
+         },
+         "decision": "always" | "block",
+         "scope":    { "action_class": "notification" },
+         "granted_at": "<RFC3339>",
+         "expires_at": "<RFC3339 | null>"
+       }
+     ]
+   }
+   ```
+
+The `fefe_trust_decision` Custom audit `data` shape (definition; cited by §4 and §8):
+
+```json
+{
+  "schema_version":   1,
+  "trace_id":         "<UUID>",
+  "receiver_agent_id":"<UUID>",
+  "sender_agent_id":  "<UUID>",
+  "sender_handle":    "@handle@namespace",
+  "decision":         "accept_once" | "always" | "block",
+  "scope":            { "action_class": "notification" },
+  "trigger_source_label": "mcp:pie-hub:custom:agent_message:<id>",
+  "at":               "<RFC3339>"
+}
+```
+
+**Forbidden** from this entry, in audit logs, in bug reports, in `--resume` replays:
+- Raw notification payload, raw `_meta` body.
+- `agent_token` (the hub-issued credential — never leaves the auth store).
+- `CF_API_KEY` (the deploy secret — never enters the runtime at all).
+- Provider credentials, OAuth tokens.
+
+QA owns the redaction acceptance test for this entry in [§8](#8-deployment--cf_token--ci--acceptance--release-gate).
+
+### §5.8 Offline / reconnect behavior
+
+- The hub's SSE channel is the canonical push surface (per §2.5 / §6a). When the SSE stream drops (network blip, laptop sleep, hub redeploy), `HttpMcpTransport` (§6a) reconnects with backoff; on reconnect it sends a resume cursor (specific cursor mechanism defined in §6a).
+- Hub-side backlog bounds (how many missed messages a reconnecting agent can claim) live in §7 (storage + Worker capacity decisions).
+- Runtime side: a backlog burst delivered after reconnect goes through the same `McpNotificationHook` → `Trigger` → `handle_trigger` path. Each carries its original `_meta.pie_dedup_key`, so dedup ([§5.5](#55-idempotency--dedup)) collapses any messages already handled in the pre-disconnect session. Runtime does **not** persist a separate "last seen" cursor — the hub's resume cursor + the runtime's dedup window are the joint truth.
+- Backlog drained at reconnect competes with normal user-driven turns through the existing single turn slot (the harness already serializes triggers vs user prompts vs `OnTurnEndHook` continuations). No new scheduling work.
+
+### §5.9 Ordering
+
+Best-effort, **not guaranteed**. Two concrete relaxations:
+
+1. **Cross-sender ordering**: never guaranteed. A notification from sender A at hub-time `t1` may arrive at the receiver after a notification from sender B at hub-time `t2 > t1`. The trust gate and `handle_trigger` evaluate each notification independently.
+2. **Within-sender ordering**: best-effort. SSE preserves order within a single TCP connection; reconnect re-orders against pre-disconnect messages only by the hub's storage cursor (§7). Runtime makes no guarantees beyond what the hub provides.
+
+Senders that need stronger ordering should embed application-level sequence numbers in `_meta.pie_summary` (the runtime treats this as opaque text — no parsing, no enforcement).
+
+### §5.10 Event label and summary
+
+- `Trigger.event_label`: short, bounded (≤ 80 chars), preview-safe, used for status banners and `/triggers` listings. Format: `notification from @handle@namespace`.
+- `Trigger.payload_summary`: the value of `_meta.pie_summary` from the wire payload (per §2.5), truncated cap-inclusive on char boundary to 4 KiB (matching `trigger_result.summary` cap from RFC 1 sub-PR 5a). The hub is expected to populate `pie_summary` with a human-readable line; if it's missing, runtime falls back to `event_label`.
+
+`payload_summary` is the **only** sender-controlled content that surfaces into the receiver's audit / prompt / Feed. The raw hub payload is discarded ([§5.4](#54-envelope-shape-runtime-side)).
+
+### §5.11 Failure modes and observability
+
+| Failure                                                        | Runtime behavior                                                                                          | Observable                                                                                          |
+| -------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| Malformed notification (missing `_meta.pie_dedup_key`)         | Drop at `McpNotificationHook`; no `Trigger` created                                                       | `tracing::warn!` + bounded `HarnessEvent::PersistenceError { context: "mcp_notification_decode" }` |
+| Duplicate within dedup window                                  | `TriggerState::Deduped`, replacement policy per RFC 1 sub-PR 1                                            | `trigger_audit` Custom entry + `HarnessEvent::TriggerHandled { state: Deduped }`                    |
+| Cross-namespace, no trust entry                                | `BeforeTriggerDecision::Prompt`; trigger admitted as `NeedsApproval`                                      | `HarnessEvent::TriggerHandled { state: NeedsApproval, reason: <bounded> }` + `fefe_trust_decision` audit after user resolves |
+| Blocked sender                                                 | `BeforeTriggerDecision::Deny`; `TriggerState::PermissionDenied`                                           | `trigger_audit` Custom entry; no `handle_trigger` advance                                            |
+| Hub credential revoked mid-session                             | Transport-level error from `HttpMcpTransport` (§6a) — runtime sees connection drop, reconnect backoff   | Surfaced through `NotificationHookStatus.state = Disconnected` in `notification_status_snapshot`     |
+| `~/.pie/hub-trust.json` read/write failure                     | Fail-closed: treat missing/corrupt entry as no-record → cross-namespace senders prompt                    | `tracing::warn!`; runtime never auto-trusts on missing-file path                                      |
+| Issue #110 not landed yet                                      | `BeforeTriggerHook::Prompt` returns Deny (fail-closed) because there's no embedder Prompt channel to render | All cross-namespace first-contacts denied until #110 lands                                            |
+
+### §5.12 §5 × other-chapter contracts (recap)
+
+| Boundary               | §5 owns                                                                                  | Other chapter owns                                       |
+| ---------------------- | ---------------------------------------------------------------------------------------- | -------------------------------------------------------- |
+| Wire ↔ Trigger         | `Trigger` envelope shape, source-label namespacing, dedup tier wiring, audit shape       | §2 — MCP notification method names + `_meta` field names |
+| Trust gate UX          | `BeforeTriggerHook` decision logic, audit emission, `~/.pie/hub-trust.json` shape        | §4.3 — trust-list product semantics; #110 — prompt UI    |
+| Authority              | `TriggerAuthority` shape and field mapping                                               | §3 — `agent_id` / handle / token issuance / token revoke |
+| Transport              | None — Runtime sees `notifications/...` at the runtime-API boundary only                 | §6a — `HttpMcpTransport`, SSE reconnect, resume cursor    |
+| Hub-side fan-out       | None                                                                                     | §7 — Worker storage, durable queue, backlog bounds        |
+| Acceptance gates       | None — Runtime smoke tests are a §8 deliverable owned by QA                              | §8 — acceptance matrix + release gate                     |
+
+### §5.13 Open questions
+
+| ID         | Question                                                                                                   | @Runtime-dev-lead take                                                                |
+| ---------- | ---------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| §5.OQ-1    | Should `BeforeTriggerHook::Prompt` for hub triggers carry the sender's bounded profile (description + capabilities) so the prompt UI can render context without a second hub roundtrip? | Yes — fold the bounded profile (`display_name`, `description`, `capabilities[]` from §4.4 listing schema) into `BeforeTriggerActionContext`. Adds one field, avoids the second hit. |
+| §5.OQ-2    | Trust TTL refresh on use: does an `Always` entry's `expires_at` slide forward each time it permits a notification? | No, default to fixed TTL from grant time (per §4.OQ-3 = 90 days). Sliding TTLs hide silent over-trust. Revisit if users complain about re-prompt fatigue. |
+| §5.OQ-3    | When `~/.pie/hub-trust.json` is shared across pie machines (e.g. via dotfile sync), receiver_agent_id may differ per machine. Does the entry key on `local_machine_id + receiver_agent_id` for safety? | Lean YES — bind to per-machine receiver. Cross-machine trust replay is a real attack surface if a laptop is lost. Open question for @Provider-Auth-Lead. |
+| §5.OQ-4    | Should hub-originated triggers be allowed to cause cycle suppression with non-hub triggers? (i.e. is a hub notification "the same cycle hop" as a local MCP trigger?) | Yes — `cycle_id` is per-thread, not per-source. Hub notifications counted against the same cycle budget. Prevents trivial cross-source cycles. |
+| §5.OQ-5    | Audit redaction: hub `agent_id` is a UUID; should `fefe_trust_decision` audit also include a stable short hash of the sender's `agent_id` for human-readable correlation, or only the full UUID? | Both fields — full UUID for system join, 8-char prefix for human eyeballs. Already what `trigger_audit` does for trace ids. |
+| §5.OQ-6    | Issue #110 timing: do we hold §5 implementation merge until #110 lands, or merge §5 stub and have the trust gate fall through to deny-cross-namespace until #110 lands? | Land §5 plumbing + `make_pie_hub_notification_hook` factory first; trust gate stub fails closed (deny cross-namespace) until #110 ships. Lets §6a / Worker integration test against the runtime API without waiting on #110.
+
+### §5.14 Cited from other chapters
+
+- [§2.5](#2-hub-mcp-protocol-surface) — `notifications/agent_message` shape and `_meta.*` field names.
+- [§3](#3-identity--auth--session--namespace--agent-registry) — `agent_id` UUID issuance, handle resolution, token lifecycle.
+- [§4.1](#41-identity-uuid-is-the-address-handle-is-the-language) — UUID-as-identity, handle-as-language.
+- [§4.2](#42-two-axis-visibility--do-not-ship-public--private-as-one-switch) — `inbox` decision matrix (`open` / `invited` / `namespace` / `closed`).
+- [§4.3](#43-first-contact-gate--reuse-issue-110-user-prompt-mechanism) — trust-list product semantics; `Accept once` / `Always` / `Block`.
+- [§4.4](#44-sender-profile-is-product-copy-not-decoration) — sender profile listing fields (cited for prompt UI bounded subset per §5.OQ-1).
+- [§6a](#6a-client-integration--contract--runtime-boundary) — `HttpMcpTransport`, SSE reconnect, resume cursor.
+- [§7](#7-worker-implementation--storage-model) — hub-side dedup key uniqueness, backlog bounds, durable queue.
+- [§8](#8-deployment--cf_token--ci--acceptance--release-gate) — `fefe_trust_decision` redaction acceptance test; runtime smoke matrix.
+- Issue #110 — `PermissionCategory::ControlPlaneWrite` user-Prompt category.
+- RFC 1 (issue #20) — trigger pipeline, `TriggerAuthority`, `NotificationHook`, `BeforeTriggerHook`, `Custom` audit entries, `Session::append_custom`.
 
 **§2 × §5 coordination protocol (per Runtime + Tools-MCP 2026-05-29).** §2 (MCP surface) and §5 (envelope) are two views of the same wire bytes; both reference, not redefine. Existing `_meta.pie_dedup_key` / `_meta.pie_summary` from PR #56 (`McpNotificationHook`) is the source of truth and is cited from both chapters. New fields divide by layer:
 - Envelope-internal (`TriggerAuthority`, `payload_visibility`, etc.) — Runtime defines in §5; §2 cites.
