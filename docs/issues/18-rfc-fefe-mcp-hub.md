@@ -1696,7 +1696,7 @@ hub error payloads unless the recovery action requires the literal user input.
 | `permission_denied` | "This sender is not allowed by the receiver's inbox policy. Check `/hub status` or ask the receiver to change inbox policy." |
 | `not_found` | "Agent not found. Run `/hub list --public` or verify the full `agent_id`." |
 | `rate_limited` | "Hub rate limit reached. Wait and retry." If §2 supplies `retry_after_ms`, render the bounded wait. |
-| `payload_too_large` | "Notification is too large. Shorten the message or send a bounded summary." |
+| `body_too_large` | "Notification is too large. Shorten the message or send a bounded summary." |
 | `worker_unavailable` / transport offline | "Hub is temporarily unavailable. Pie will reconnect; run `/hub status` for details." |
 | trust file unreadable | "Local hub trust file is unreadable. First-contact will ask again; fix file permissions or remove the corrupt file." |
 
@@ -1705,8 +1705,13 @@ hub error payloads unless the recovery action requires the literal user input.
 Implementation PRs for §6b must include user-path tests, not just helper unit
 tests:
 
-- Slash dispatch tests for `/hub status`, `/hub register`, `/hub list`,
-  `/hub trust`, `/hub block`, `/hub rotate`, and error mapping.
+- Slash dispatch tests for every shipped `/hub` subcommand. A partial
+  implementation may merge only if it explicitly marks unshipped subcommands
+  as unsupported with recovery text; the full v0 surface requires dispatch
+  coverage for `/hub status`, `/hub login`, `/hub register`, `/hub profile`,
+  `/hub visibility`, `/hub list`, `/hub send`, `/hub inbox`,
+  `/hub trust list`, `/hub trust revoke`, `/hub block`, `/hub unblock`,
+  `/hub rotate`, `/hub logout`, and error mapping.
 - Redaction tests proving token-like strings, `CF_API_KEY`, session cookies,
   raw payloads, and raw trust-file contents never appear in command output,
   TUI snapshots, Web `/state`, or feed lines.
@@ -1736,9 +1741,9 @@ tests:
 - [§2.6](#26-error-codes) — error code namespace and recovery hints.
 - [§3.3](#33-agent-registration-and-token-lifecycle) — token rotation,
   revocation, and agent registration semantics.
-- [§4.2](#42-visibility-and-inbox-matrix) — `discoverable` / `inbox`
+- [§4.2](#42-two-axis-visibility--do-not-ship-public--private-as-one-switch) — `discoverable` / `inbox`
   defaults and authorization model.
-- [§4.4](#44-agent-profile-schema) — list / detail / prompt-bounded profile
+- [§4.4](#44-sender-profile-is-product-copy-not-decoration) — list / detail / prompt-bounded profile
   field subsets.
 - [§5.6](#56-first-contact-gate-hookup--issue-110) — `HubTrustGate` and the
   first-contact trigger prompt.
