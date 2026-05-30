@@ -769,28 +769,29 @@ impl AgentTool for NewTriggerTool {
 
     /// Issue #110 sub-PR 3 classifier — every new dynamic trigger is a persistent
     /// agent-self-modification: the model attaches a recurring action to a future external
-    /// event. Always Prompt. The bounded reason names the trigger's `condition` and `action`
-    /// in summary form (callers may pass either a structured rule via `condition` + `action`
-    /// or a free-form `spec` string; the reason takes whichever is present, truncated).
+    /// event. Always Prompt. The reason is **value-free by construction** (names the input
+    /// fields the model supplied, NOT their content) so a tokenized URL or other
+    /// secret-bearing payload smuggled into `condition` / `action` / `spec` cannot leak
+    /// through `Prompt.reason` into the audit / UI surface. The full bounded args still flow
+    /// through the runtime default `prompt_payload` (`{tool_name, args_keys, args_hash}`)
+    /// for the embedder's prompt card.
     fn permission_classification(&self, prepared_args: &Value) -> PermissionClassification {
-        // Keep the reason short and free of raw payload — the embedder prompt card carries
-        // the full args separately. 80-char cap matches §5.10 `event_label` discipline.
-        fn brief(v: Option<&Value>) -> Option<String> {
-            v.and_then(|x| x.as_str()).map(|s| {
-                let mut out = s.trim().chars().take(80).collect::<String>();
-                if s.chars().count() > 80 {
-                    out.push('…');
-                }
-                out
-            })
-        }
-        let condition = brief(prepared_args.get("condition"));
-        let action = brief(prepared_args.get("action"));
-        let spec = brief(prepared_args.get("spec"));
-        let reason = match (condition, action, spec) {
-            (Some(c), Some(a), _) => format!("create trigger: when `{c}` then `{a}`"),
-            (_, _, Some(s)) => format!("create trigger from spec: `{s}`"),
-            _ => "create dynamic trigger".to_string(),
+        let has_condition = prepared_args
+            .get("condition")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.trim().is_empty());
+        let has_action = prepared_args
+            .get("action")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.trim().is_empty());
+        let has_spec = prepared_args
+            .get("spec")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.trim().is_empty());
+        let reason = match (has_condition && has_action, has_spec) {
+            (true, _) => "create dynamic trigger from `condition` + `action` fields".to_string(),
+            (false, true) => "create dynamic trigger from `spec` field".to_string(),
+            (false, false) => "create dynamic trigger".to_string(),
         };
         PermissionClassification::Prompt { reason }
     }
@@ -1202,6 +1203,43 @@ mod tests {
         CredentialScope, PayloadVisibility, ReplacementPolicy, SourceKind, TriggerAuthority,
         TriggerRuntimeSnapshot, TriggerSource,
     };
+
+    #[test]
+    fn new_trigger_permission_reason_is_value_free() {
+        // Provider/Auth gate on PR #139: a tokenized URL or other secret-bearing string
+        // smuggled into `condition` / `action` / `spec` must NOT appear in the runtime
+        // prompt reason (which lands in audit + UI). The reason names the field shape only;
+        // the full bounded args flow through the runtime default `prompt_payload`
+        // (`{tool_name, args_keys, args_hash}`) for the embedder card.
+        let token_like =
+            "https://hub.example/api?token=ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890_super_secret";
+
+        let cases = [
+            serde_json::json!({ "condition": token_like, "action": "echo ok" }),
+            serde_json::json!({ "condition": "always", "action": token_like }),
+            serde_json::json!({ "spec": token_like }),
+            serde_json::json!({}),
+        ];
+
+        for args in cases {
+            let cls = NewTriggerTool.permission_classification(&args);
+            let PermissionClassification::Prompt { reason } = cls else {
+                panic!("NewTrigger must always Prompt, got {cls:?} for args {args}");
+            };
+            assert!(
+                !reason.contains("token=ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+                "reason must not echo token-like value substrings; got: {reason}"
+            );
+            assert!(
+                !reason.contains("https://hub.example/api"),
+                "reason must not echo URL substrings; got: {reason}"
+            );
+            assert!(
+                !reason.contains("super_secret"),
+                "reason must not echo secret substrings; got: {reason}"
+            );
+        }
+    }
 
     #[test]
     fn parses_chinese_trigger_rule() {

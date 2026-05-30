@@ -294,14 +294,15 @@ fn enabled_word(enabled: bool) -> &'static str {
 
 static DEFINITION: Lazy<Tool> = Lazy::new(|| Tool {
     name: "SetSkillState".into(),
-    description: "Disable a loaded skill at runtime without editing its SKILL.md. The choice is \
-         recorded in a local overlay (~/.pie/skills-state.json) keyed by source+name and \
-         survives restarts. Works for any source — a builtin or project skill that can't be \
-         removed can still be disabled. Two-phase: first call previews (current vs target \
-         state); call again with `confirm: true` to apply. Disabling prevents the model from \
-         auto-invoking the skill via the Skill tool; the skill still appears in the catalog. \
-         Note: this tool can only DISABLE (set `enabled: false`). Re-enabling a skill is a \
-         user action — the user runs `/skills enable <name>` in the terminal."
+    description: "Enable or disable a loaded skill at runtime without editing its SKILL.md. \
+         The choice is recorded in a local overlay (~/.pie/skills-state.json) keyed by \
+         source+name and survives restarts. Works for any source — a builtin or project skill \
+         that can't be removed can still be disabled. Two-phase: first call previews (current \
+         vs target state); call again with `confirm: true` to apply. Disabling prevents the \
+         model from auto-invoking the skill via the Skill tool; the skill still appears in \
+         the catalog. Re-enabling a previously-disabled skill is a privileged control-plane \
+         write and requires explicit user confirmation through the runtime prompt card before \
+         it takes effect (issue #110); disabling does not prompt."
         .into(),
     parameters: json!({
         "type": "object",
@@ -317,7 +318,7 @@ static DEFINITION: Lazy<Tool> = Lazy::new(|| Tool {
             },
             "enabled": {
                 "type": "boolean",
-                "description": "Target state. This tool only supports `false` (disable); `true` (re-enable) is rejected and must be done by the user via `/skills enable <name>`."
+                "description": "Target state. `false` disables (no user prompt). `true` re-enables and triggers a user confirmation prompt before the change applies."
             },
             "confirm": {
                 "type": "boolean",
