@@ -21,6 +21,7 @@ mod history;
 mod hooks;
 #[allow(dead_code)]
 mod hub_auth;
+mod hub_join;
 mod images;
 mod local_models;
 mod logging;
