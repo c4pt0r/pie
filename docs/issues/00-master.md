@@ -67,7 +67,8 @@ Every sub-issue below MUST address the same five axes in its design write-up bef
 
 ### Tier 8 — cross-agent connectivity (RFC)
 
-- [ ] **#18 — RFC: `pie.0xfefe.me` public MCP hub** (RFC / not implementation-ready; see [[18-rfc-fefe-mcp-hub]])
+- [x] **#18 — `pie.0xfefe.me` public MCP hub** — Worker/API v0 live (RFC + Worker MVP + deploy workflow merged; gate 6 live e2e passed 2026-05-30). See [[18-rfc-fefe-mcp-hub]].
+- [ ] **#19 — pie client onboard for the fefe hub** — happy path, auth wire contract, Defer semantics, acceptance gates. See [[19-fefe-client-onboard]].
 
 ## Non-goals (explicit)
 
