@@ -246,7 +246,7 @@ fn render_prompt(req: ControlPlanePromptRequest) -> ControlPlanePromptDecision {
 
 Key properties of this pattern:
 
-- Cache key is **tool-defined**, not generic `{tool_name, args_hash}`. fefe trust uses `{sender_agent_id, action_class}`; `SetSkillState(enable)` uses `{skill_source, skill_handle, enable_state}`. No tool can accidentally use too broad a scope because each tool's key shape is explicit in the embedder hook.
+- Cache key is **tool-defined**, not generic `{tool_name, args_hash}`. fefe trust uses `{receiver_agent_id, sender_agent_id, action_class}` per RFC #18 §5.7 — the receiver id is mandatory so a shared `~/.pie/hub-trust.json` (e.g. dotfile-synced across machines) cannot authorize the same sender for a different local receiver. RFC #18 §5.OQ-3 tracks the pending decision on whether to also bind to a per-machine receiver identity for extra safety against dotfile-sync replay. `SetSkillState(enable)` uses `{skill_source, skill_handle, enable_state}`. No tool can accidentally use too broad a scope because each tool's key shape is explicit in the embedder hook.
 - Runtime is unchanged across all of this. The `control_plane_prompt` audit records the single approval; the embedder's cache and its own audit entry record the policy decision separately.
 - "Always" semantics are entirely up to the embedder. CLI/TUI may render the option; Web UI may choose not to. Headless mode can skip the option entirely (the cache key being `Some` is necessary but not sufficient).
 
