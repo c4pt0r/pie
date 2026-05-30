@@ -309,7 +309,9 @@ impl TriggerPromptDecision {
 
     fn reason(&self) -> Option<String> {
         match self {
-            Self::Deny { reason } => reason.clone(),
+            Self::Deny { reason } => reason
+                .as_ref()
+                .map(|reason| cap_trigger_prompt_reason(reason)),
             _ => None,
         }
     }
@@ -1324,7 +1326,13 @@ impl AgentHarness {
         });
 
         let decision = match self.on_trigger_prompt.clone() {
-            Some(hook) => hook(request.clone(), tokio_util::sync::CancellationToken::new()).await,
+            Some(hook) => {
+                let cancel = tokio_util::sync::CancellationToken::new();
+                *self.active_hook_cancel.lock() = Some(cancel.clone());
+                let decision = hook(request.clone(), cancel).await;
+                *self.active_hook_cancel.lock() = None;
+                decision
+            }
             None => TriggerPromptDecision::Deny {
                 reason: Some(
                     "trigger prompt required but no on_trigger_prompt hook configured \
@@ -2229,15 +2237,15 @@ fn cap_control_plane_audit_label(label: &str) -> String {
 }
 
 fn build_trigger_prompt_request(trigger: &Trigger, reason: String) -> TriggerPromptRequest {
-    let receiver_agent_id = trigger_json_string(trigger, &["receiver_agent_id"])
-        .or_else(|| trigger_json_string(trigger, &["_meta", "receiver_agent_id"]));
-    let sender_agent_id = trigger_json_string(trigger, &["sender_agent_id"])
-        .or_else(|| trigger_json_string(trigger, &["_meta", "sender_agent_id"]))
-        .or_else(|| trigger_json_string(trigger, &["agent_id"]))
-        .unwrap_or_else(|| trigger.authority.principal_id.clone());
-    let action_class = trigger_json_string(trigger, &["action_class"])
-        .or_else(|| trigger_json_string(trigger, &["_meta", "action_class"]))
-        .unwrap_or_else(|| trigger.event_label.clone());
+    let receiver_agent_id = validated_payload_agent_id(trigger, &["receiver_agent_id"])
+        .or_else(|| validated_payload_agent_id(trigger, &["_meta", "receiver_agent_id"]));
+    let sender_agent_id = validated_payload_agent_id(trigger, &["sender_agent_id"])
+        .or_else(|| validated_payload_agent_id(trigger, &["_meta", "sender_agent_id"]))
+        .or_else(|| validated_payload_agent_id(trigger, &["agent_id"]))
+        .unwrap_or_else(|| cap_control_plane_audit_label(&trigger.authority.principal_id));
+    let action_class = validated_payload_action_class(trigger, &["action_class"])
+        .or_else(|| validated_payload_action_class(trigger, &["_meta", "action_class"]))
+        .unwrap_or_else(|| cap_control_plane_audit_label(&trigger.event_label));
     let trigger_summary = trigger
         .payload_summary
         .clone()
@@ -2270,14 +2278,25 @@ fn build_trigger_prompt_request(trigger: &Trigger, reason: String) -> TriggerPro
     TriggerPromptRequest {
         trigger_prompt_id,
         trace_id: trigger.trace_id.clone(),
-        source_label: trigger.source_label.clone(),
+        source_label: cap_control_plane_audit_label(&trigger.source_label),
         receiver_agent_id,
         sender_agent_id,
         action_class,
         trigger_summary,
         payload,
-        reason,
+        reason: cap_trigger_prompt_reason(&reason),
     }
+}
+
+fn validated_payload_agent_id(trigger: &Trigger, path: &[&str]) -> Option<String> {
+    let value = trigger_json_string(trigger, path)?;
+    uuid::Uuid::parse_str(&value).ok()?;
+    Some(value)
+}
+
+fn validated_payload_action_class(trigger: &Trigger, path: &[&str]) -> Option<String> {
+    let value = trigger_json_string(trigger, path)?;
+    is_valid_action_class(&value).then_some(value)
 }
 
 fn trigger_json_string(trigger: &Trigger, path: &[&str]) -> Option<String> {
@@ -2286,6 +2305,36 @@ fn trigger_json_string(trigger: &Trigger, path: &[&str]) -> Option<String> {
         value = value.get(*key)?;
     }
     value.as_str().map(str::to_string)
+}
+
+fn is_valid_action_class(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    let lower = value.to_ascii_lowercase();
+    if lower.starts_with("sk-") || lower.contains("bearer") || lower.contains("token") {
+        return false;
+    }
+    value.len() <= 64
+        && first.is_ascii_lowercase()
+        && chars.all(|ch| {
+            ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '_' | '-' | '.' | ':')
+        })
+}
+
+const TRIGGER_PROMPT_REASON_CAP_CHARS: usize = 512;
+
+fn cap_trigger_prompt_reason(reason: &str) -> String {
+    if reason.chars().count() <= TRIGGER_PROMPT_REASON_CAP_CHARS {
+        return reason.to_string();
+    }
+    let mut out: String = reason
+        .chars()
+        .take(TRIGGER_PROMPT_REASON_CAP_CHARS.saturating_sub(1))
+        .collect();
+    out.push('…');
+    out
 }
 
 fn finish_persisted_run(
