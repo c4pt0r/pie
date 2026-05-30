@@ -32,6 +32,24 @@ user in **under 30 seconds** of foreground work, with **zero exposure** to:
 The user types `/hub join`, the browser handles login, and pie negotiates
 everything else.
 
+## Hub configuration model
+
+`pie.0xfefe.me` is the **default built-in hub**. A clean install requires no
+`~/.pie/mcp.toml` entry to use it:
+
+- `/hub join`, `/hub status`, `/hub send`, and the receiver-side prompt card
+  all work against the built-in hub immediately after install.
+- The official hub appears in runtime/audit surfaces under the canonical
+  source label `mcp:pie-hub:`. Trust scope, dedup, audit, and first-contact
+  trust decisions key off this label.
+- `/hub connect --endpoint <url>` is the advanced override for staging or a
+  custom self-hosted hub. Custom servers MUST be wired under an independent
+  source label and trust scope; they cannot reuse `mcp:pie-hub:`, otherwise a
+  custom server could replay trust decisions made against the official hub.
+- Users never have to read or edit `mcp.toml` to onboard. `mcp.toml` retains
+  its role for additional / custom MCP servers, not for joining the official
+  hub.
+
 ## Happy path — five screens
 
 ### Screen 1 — first launch (no hub configured)
@@ -105,12 +123,15 @@ API. Online indicators come from SSE; "active 5m" from hub-side `last_seen_at`.
 
 Fields shown:
 
-- Sender handle and namespace.
+- Sender `handle@namespace`.
 - Sender profile **prompt-bounded subset** from §4.4 only:
   `display_name`, `description`, `capabilities[]`.
-- `summary` from `_meta.pie_summary`, bounded by the hub to 240 chars (§2.5).
+- Bounded `trigger_summary` derived from `_meta.pie_summary` (hub bound: 240
+  chars per §2.5), **further capped at 120 chars for the prompt card**. The
+  card never shows raw message body or raw `_meta` content.
 - `trace 8a4b3` is the 8-char prefix of the trigger trace id for support; no
-  internal symbol like `#110`, `mcp:pie-hub:`, or `prompt_id` appears here.
+  internal symbol like `#110`, `mcp:pie-hub:`, `prompt_id`, sender IP, or raw
+  `agent_id` UUID appears here.
 
 The full prompt UI key map (Accept once / Always / Block / Deny / Defer) maps
 onto runtime semantics in [Defer semantics](#defer-semantics).
@@ -323,9 +344,10 @@ Client work is **not done** until all of the following pass:
 - No part of the user-visible surface — status, feed, prompt card, error
   recovery, `/hub inbox` — contains: `hub_token`, `token_keychain_ref`,
   `Authorization`, full `loopback_redirect_uri`, `login_url`, `code`,
-  `code_verifier`, raw MCP JSON-RPC frames, raw `_meta.*` bodies, raw
-  `local_receiver_instance_id`, `~/.pie/auth.json` contents, or any field on
-  the forbidden lists in §3.7 / §5.7 / §8.6.
+  `code_verifier`, bare PKCE `state`, raw MCP JSON-RPC frames, raw `_meta.*`
+  bodies, raw `local_receiver_instance_id`, raw `agent_id` UUID, sender IP,
+  `~/.pie/auth.json` contents, or any field on the forbidden lists in
+  §3.7 / §5.7 / §8.6.
 - The §8.6 release report format applies to TUI smoke output: only
   `deployment_id`, `version`, `trace_id`, and bounded result.
 
@@ -397,7 +419,9 @@ Owner: @CLI-TUI-Dev-Lead (UX layer) joint with @Runtime-dev-lead (runtime
 hookup).
 
 Renders the `TriggerPromptRequest` event (from #110 sub-PR 4 / PR #142) as
-the trigger prompt card with the layout in Screen 4. Defer maps to
+the trigger prompt card with the layout in Screen 4. The card preview field
+is the bounded `trigger_summary` (UI cap 120 chars) — never the raw Local
+payload, raw `_meta`, sender IP, or raw `agent_id` UUID. Defer maps to
 `TriggerPromptDecision::Timeout` with the `deferred_by_user` reason. Accept
 once / Always / Block / Deny map to their respective trust/audit semantics
 from §5.7.
@@ -434,3 +458,4 @@ Two real pie clients exercise the full happy path against
 | Date       | By     | Change                                                                                       |
 | ---------- | ------ | -------------------------------------------------------------------------------------------- |
 | 2026-05-30 | @alice | v0.1 draft: happy path sketch, auth wire contract (preflight + exchange + PKCE), Defer semantics over Timeout, acceptance gates, six implementation phases. |
+| 2026-05-30 | @alice | v0.2: locked-defaults follow-up — built-in default hub configuration model (no `mcp.toml` required, canonical `mcp:pie-hub:` source label, custom servers get independent trust scope); first-contact card preview is bounded `trigger_summary` capped at 120 chars (UI cap on top of hub's 240-char `_meta.pie_summary` bound), not raw Local payload; explicit redaction additions for bare PKCE `state`, raw `agent_id` UUID, sender IP. |
