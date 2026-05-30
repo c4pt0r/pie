@@ -152,40 +152,42 @@ returns bounded errors with **recovery actions only**, no internal
 vocabulary (`re-login`, `re-register agent`, `token revoked`, etc.) — see
 §2.6.
 
+The `§3 permission` column cites the permission strings owned by §3.3 (Provider/Auth). `n/a (human session)` means the tool is gated by the human session itself (not by an agent-token permission). Human-session tools require human login; no agent-token permission can substitute. Permission names lock against the §3 v0.1 minimum set (`agent:read_self`, `agent:update_self_profile`, `agent:list_namespace`, `agent:discover_public`, `agent:delete_self`, `notification:send`, `notification:receive`, `token:rotate_self`, `trust:list`, `trust:revoke`, `trust:block`, `trust:unblock`) — see §3 for the canonical list.
+
 #### Control-plane (agent registry)
 
-| Tool                    | Auth            | Purpose                                                                                                  |
-| ----------------------- | --------------- | -------------------------------------------------------------------------------------------------------- |
-| `register_agent`        | human-session   | Register a new agent under the caller's namespace. Returns `{agent_id, handle, hub_token}` once.         |
-| `update_agent_profile`  | agent-self      | Update `handle`, `display_name`, `description`, `capabilities[]`, `discoverable`, `inbox`. §4 owns shape. |
-| `rotate_agent_token`    | agent-self      | Mint a new `hub_token`, invalidate the old one. Old token usable for a short grace period (§3).           |
-| `revoke_agent_token`    | agent-self      | Invalidate the current `hub_token` immediately. Hub emits `notifications/agent_revoked` on the SSE.      |
-| `delete_agent`          | agent-self      | Remove the agent. Forgets the trust / block entries the agent owns. Other agents' trust entries pointing at this `agent_id` go stale (handled per §5). |
+| Tool                    | Auth            | §3 permission                | Purpose                                                                                                  |
+| ----------------------- | --------------- | ---------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `register_agent`        | human-session   | n/a (human session)          | Register a new agent under the caller's namespace. Returns `{agent_id, handle, hub_token}` once.         |
+| `update_agent_profile`  | agent-self      | `agent:update_self_profile`  | Update `handle`, `display_name`, `description`, `capabilities[]`, `discoverable`, `inbox`. §4 owns shape. |
+| `rotate_agent_token`    | agent-self      | `token:rotate_self`          | Mint a new `hub_token`, invalidate the old one. Old token usable for a short grace period (§3).           |
+| `revoke_agent_token`    | agent-self      | `token:rotate_self`          | Invalidate the current `hub_token` immediately. Hub emits `notifications/agent_revoked` on the SSE. Same permission as rotate — invalidate is the privileged half of rotate. |
+| `delete_agent`          | agent-self      | `agent:delete_self`          | Remove the agent. Forgets the trust / block entries the agent owns. Other agents' trust entries pointing at this `agent_id` go stale (handled per §5). |
 
 #### Discovery (no write side-effect)
 
-| Tool                       | Auth            | Purpose                                                                                              |
-| -------------------------- | --------------- | ---------------------------------------------------------------------------------------------------- |
-| `list_my_agents`           | human-session   | List agents in the caller's namespace, with full profile detail.                                     |
-| `discover_public_agents`   | agent-token     | Cross-namespace listing of agents with `discoverable = public`. Returns the **list-profile** subset of §4. |
-| `get_agent_profile`        | agent-token     | Fetch the full **detail-profile** subset for one `agent_id`. Bounded; respects `discoverable`.        |
+| Tool                       | Auth            | §3 permission                | Purpose                                                                                              |
+| -------------------------- | --------------- | ---------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `list_my_agents`           | human-session   | `agent:list_namespace`       | List agents in the caller's namespace, with full profile detail. Permission column also applies when an agent-token bearing `agent:list_namespace` is used in lieu of human session. |
+| `discover_public_agents`   | agent-token     | `agent:discover_public`      | Cross-namespace listing of agents with `discoverable = public`. Returns the **list-profile** subset of §4. |
+| `get_agent_profile`        | agent-token     | `agent:read_self` (self) or `agent:discover_public` (other) | Fetch the full **detail-profile** subset for one `agent_id`. Bounded; respects `discoverable`. Permission resolved per-call against the requested `agent_id`. |
 
 #### Messaging
 
-| Tool                    | Auth            | Purpose                                                                                                  |
-| ----------------------- | --------------- | -------------------------------------------------------------------------------------------------------- |
-| `send_notification`     | agent-token     | Send a notification to a target `agent_id`. Result depends on receiver's `inbox` + trust state per §4.2. Wire shape of the resulting server-push (`notifications/agent_message`) is cited from §5. |
-| `list_my_inbox`         | agent-self      | Fallback poll: list pending undelivered notifications for an agent that just reconnected after SSE drop. Idempotent with the SSE channel — see §5 redelivery rules. |
-| `ack_notification`      | agent-self      | Acknowledge receipt of one or many delivered notifications by id. Drives hub-side dedup. Envelope id shape comes from §5. |
+| Tool                    | Auth            | §3 permission                | Purpose                                                                                                  |
+| ----------------------- | --------------- | ---------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `send_notification`     | agent-token     | `notification:send`          | Send a notification to a target `agent_id`. Result depends on receiver's `inbox` + trust state per §4.2. Wire shape of the resulting server-push (`notifications/agent_message`) is cited from §5. |
+| `list_my_inbox`         | agent-self      | `notification:receive`       | Fallback poll: list pending undelivered notifications for an agent that just reconnected after SSE drop. Idempotent with the SSE channel — see §5 redelivery rules. |
+| `ack_notification`      | agent-self      | `notification:receive`       | Acknowledge receipt of one or many delivered notifications by id. Drives hub-side dedup. Envelope id shape comes from §5. |
 
 #### Trust / block (receiver-owned lists)
 
-| Tool                    | Auth            | Purpose                                                                                                  |
-| ----------------------- | --------------- | -------------------------------------------------------------------------------------------------------- |
-| `list_trust`            | agent-self      | List the receiver's trust grants `{sender_agent_id, action_class, granted_at, expires_at}`. Bounded.    |
-| `revoke_trust`          | agent-self      | Remove a `{sender_agent_id, action_class}` trust grant.                                                  |
-| `block_sender`          | agent-self      | Add `{sender_agent_id}` to the block list.                                                                |
-| `unblock_sender`        | agent-self      | Remove from block list.                                                                                   |
+| Tool                    | Auth            | §3 permission                | Purpose                                                                                                  |
+| ----------------------- | --------------- | ---------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `list_trust`            | agent-self      | `trust:list`                 | List the receiver's trust grants `{sender_agent_id, action_class, granted_at, expires_at}`. Bounded.    |
+| `revoke_trust`          | agent-self      | `trust:revoke`               | Remove a `{sender_agent_id, action_class}` trust grant.                                                  |
+| `block_sender`          | agent-self      | `trust:block`                | Add `{sender_agent_id}` to the block list.                                                                |
+| `unblock_sender`        | agent-self      | `trust:unblock`              | Remove from block list.                                                                                   |
 
 > Trust **creation** is not a tool call — it is the outcome of the user's `Always` choice on the first-contact prompt (issue #110, see §4.3 + §5). Tools only let receivers *audit and revoke* existing grants. This is the same principle as the disable-only `SetSkillState` tool: escalating writes require user mediation.
 
@@ -221,8 +223,12 @@ This chapter only enumerates the methods the hub emits.
 
 `pie_summary` content for `notifications/agent_message` is defined as
 sender-controlled bounded text — same rule as the existing MCP-server
-convention (PR #56). The hub MUST enforce a 240-char cap server-side; clients
-additionally truncate per §6b display rules.
+convention (PR #56). The hub MUST enforce a 240-char cap server-side. The
+runtime side additionally applies a 4 KiB defense-in-depth ceiling at the
+wire-to-`Trigger` boundary (per §5.10 — matches `trigger_result.summary` from
+RFC 1 sub-PR 5a). The two caps are layered, not competing: 240 chars is the
+canonical hub send-side limit; 4 KiB is the runtime's guard against malformed
+or relay-mutated inputs. Clients additionally truncate per §6b display rules.
 
 ### §2.6 Error codes
 
@@ -230,18 +236,24 @@ JSON-RPC error namespace. Each code carries a bounded `message` (recovery
 action only — no internal vocabulary, no token / handle / server-internal id
 echo) and may carry a bounded `data` object with structured recovery hints.
 
-| Code     | Name                  | Recovery action surfaced to user                                          |
-| -------- | --------------------- | ------------------------------------------------------------------------- |
-| `-32000` | `invalid_session`     | "Hub session expired. Run `/hub login` to re-authenticate."                |
-| `-32001` | `permission_denied`   | "Operation not permitted by the target's `inbox` policy." See §4.2 matrix. |
-| `-32002` | `rate_limited`        | "Hub is throttling this call. Try again in N seconds." `data.retry_after_secs`. |
-| `-32003` | `unknown_agent`       | "No agent with that id is reachable. Check `discover_public_agents`."     |
-| `-32004` | `body_too_large`      | "Notification body exceeds the hub cap." `data.cap_bytes`.                |
-| `-32005` | `token_revoked`       | "Agent token revoked. Run `/hub rotate` or `/hub register`."              |
-| `-32006` | `trust_required`      | "First-contact gate — receiver must accept this sender before delivery." See §4.3 + #110. |
-| `-32007` | `schema_invalid`      | "Tool arguments did not validate against the hub schema." `data.violations[]` is short, pointing at field paths only. |
-| `-32008` | `worker_unavailable`  | "Hub is temporarily unavailable. Retry with backoff." Transport-level only. |
-| `-32603` | (MCP internal)        | Reserved by MCP. Hub falls back to this only when no specific code fits.  |
+Names align with §3.5's recovery vocabulary so a reader sees both the JSON-RPC code plane (this table) and the §3 recovery-action plane on a single name.
+
+| Code     | Name                  | §3.5 anchor                              | Recovery action surfaced to user                                                          |
+| -------- | --------------------- | ---------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `-32000` | `session_expired`     | "Expired human session"                  | "Hub session expired. Run `/hub login` to re-authenticate."                                |
+| `-32001` | `permission_denied`   | "Permission missing"                     | "Operation not permitted by the target's `inbox` policy." See §4.2 matrix.                 |
+| `-32002` | `rate_limited`        | "Rate limited"                           | "Hub is throttling this call. Retry after `data.retry_after_ms` milliseconds."             |
+| `-32003` | `not_found`           | "Unknown `agent_id`"                     | "No agent with that id is reachable. Check `discover_public_agents`."                      |
+| `-32004` | `body_too_large`      | (§2.7 cap)                               | "Notification body exceeds the hub cap." `data.cap_bytes`.                                 |
+| `-32005` | `auth_revoked`        | "Revoked token"                          | "Agent token revoked. Run `/hub rotate` or `/hub register`."                               |
+| `-32006` | `trust_required`      | (§4.3 first-contact gate)                | "First-contact gate — receiver must accept this sender before delivery." See §4.3 + #110. |
+| `-32007` | `schema_invalid`      | (§2.3 schema discipline)                 | "Tool arguments did not validate against the hub schema." `data.violations[]` is short, pointing at field paths only. |
+| `-32008` | `worker_unavailable`  | (transport-level)                        | "Hub is temporarily unavailable. Retry with backoff." Transport-level only.                |
+| `-32009` | `auth_required`       | "Missing `Authorization`"                | "Hub call requires an `Authorization: Bearer <token>` header. Run `/hub login` or supply an agent token." |
+| `-32010` | `auth_invalid`        | "Invalid / malformed token"              | "Hub credential is malformed. Re-register the agent or rotate the hub token via `/hub rotate`." |
+| `-32603` | (MCP internal)        | (MCP spec)                               | Reserved by MCP. Hub falls back to this only when no specific code fits.                   |
+
+`-32009 auth_required` (no `Authorization` header) and `-32010 auth_invalid` (malformed bearer) are kept distinct from `-32000 session_expired` (human session timed out) and `-32005 auth_revoked` (credential previously valid, now revoked) because each has a different recovery action and the §3.5 redaction rule forbids collapsing them into a single ambiguous error.
 
 Error messages never include: hub-side internal identifiers, GitHub Actions
 secret names, deployment ids, Cloudflare account/zone ids, agent tokens,
@@ -262,7 +274,8 @@ Rate limits are placeholders for §7 Worker owner to finalize. Defaults to
 write to RFC at v0.1: at most 60 `send_notification`/min per agent_id; at
 most 600 read-style calls/min per agent_id; at most 10
 `register_agent`/hour per human session. All limits return `-32002
-rate_limited` with `data.retry_after_secs`.
+rate_limited` with `data.retry_after_ms` (milliseconds — matches §3.5 unit
+convention and avoids fractional rounding in JSON-RPC `error.data`).
 
 ### §2.8 §2 × §5 cross-cite (envelope handoff)
 
@@ -275,14 +288,21 @@ the same canonical fields defined as follows:
   reconnect dedup. Both chapters cite, neither redefines.
 - `_meta.pie_summary` — **canonical, defined in PR #56.** Bounded 240 chars,
   user-visible text. Both chapters cite.
-- Sender identity — `principal_id` (UUID, immutable, the only thing trust /
-  audit key on) + `principal_label` (`@handle@namespace`, display only).
-  Field names and types **defined in §5**; §2 cites them inside
-  `notifications/agent_message.params`.
-- `payload_visibility` — **canonical, defined in RFC 1 §4.2.1.** Both
-  chapters cite. Hub MUST set `Local` by default; sender opts into `Shared`
-  by including the field; `Redacted` is hub-internal-only and never reaches
-  the client.
+- Sender identity — two planes: the **wire** plane (this chapter) and the
+  **runtime struct** plane (§5).
+  - Wire fields are `agent_id` (UUID, immutable, the only thing trust /
+    audit key on) plus sender `handle` + `namespace` rendered as
+    `@handle@namespace`. §2 owns the wire field names; §5 cites.
+  - Runtime struct fields are `TriggerAuthority.principal_id` (mapped from
+    wire `agent_id`) and `TriggerAuthority.principal_label` (mapped from
+    `@handle@namespace`). §5 owns the struct field names; §2 cites.
+  - Authorization, audit, trust, block, and dedup decisions key on the UUID
+    only — the `principal_label` / `@handle@namespace` is display.
+- `payload_visibility` — **canonical, defined by RFC 1 (issue #20) Trigger
+  envelope types** in `crates/agent/src/harness/trigger.rs`; §5.4 cites the
+  runtime-side use. Both chapters cite. Hub MUST set `Local` by default;
+  sender opts into `Shared` by including the field; `Redacted` is hub-
+  internal-only and never reaches the client.
 - `idempotency_key` and redelivery semantics — **defined in §5.** §2 only
   guarantees that the hub assigns one and writes it to the SSE frame.
 
@@ -949,3 +969,5 @@ Owned by @QA-Release-Lead in §8. Required contents:
 | 2026-05-29 | @alice | Ordering note (per @Runtime-dev-lead + @Tools-MCP-Lead): §2 (MCP surface) and §5 (notification envelope) are two views of the same wire bytes. Recommended sequence after scaffold merge: §2 + §5 parallel drafts → cross-cite + co-review → §1 architecture stitch → §3 + §6a + §6b → Worker PR. §7 Worker implementation owner can be named after §1/§2/§5 stabilize, reducing rework risk. Captured in §1 placeholder note (no chapter content change). |
 | 2026-05-29 | @alice | @EdHuang chose **option B**: §7 Worker implementation owner deferred until §1/§2/§5 v0.1 land. RFC-OQ-1 row updated to record the deferral and rationale. §1/§2/§5 work proceeds in parallel; no chapter content change. |
 | 2026-05-29 | @QA-Release-Lead | §8 v0.1: expanded phased release gates, `CF_API_KEY` GitHub Actions hardening, threat model minimums, per-phase acceptance matrix, deployed-Worker e2e scenarios, and bounded release report format. |
+| 2026-05-29 | @Tools-MCP-Lead | §2 v0.1: Hub MCP protocol surface — overview, versioning, tools (control-plane / discovery / messaging / trust-block), resources, server-push notifications, error codes, body caps + rate limits, §2 × §5 cross-cite, open questions. |
+| 2026-05-29 | @Tools-MCP-Lead | §2 v0.1 follow-up (per @Provider-Auth-Lead direction on §3 ↔ §2 alignment): added `§3 permission` column to §2.3 tool tables citing `agent:*` / `notification:*` / `token:*` / `trust:*` names; added `-32009 auth_required` and `-32010 auth_invalid` to §2.6; renamed `-32000 invalid_session` → `session_expired` and `-32005 token_revoked` → `auth_revoked` and `-32003 unknown_agent` → `not_found` to match §3.5 vocabulary; changed `retry_after_secs` → `retry_after_ms` in §2.6/§2.7; added 240-char vs 4 KiB cap-layering clarification on `pie_summary` (§2.5); refined `principal_id` / `principal_label` wire-vs-runtime framing in §2.8 (per Runtime cross-cite review on PR #127). |
