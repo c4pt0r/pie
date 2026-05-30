@@ -87,15 +87,15 @@ This does NOT change the "no real Cloudflare in build/test CI" rule (§8). Build
 
 | §   | Title                                                          | Owner                                       | Status              |
 | --- | -------------------------------------------------------------- | ------------------------------------------- | ------------------- |
-| 1   | Architecture overview                                          | @Tools-MCP-Lead + @Runtime-dev-lead         | **v0.1 draft**      |
-| 2   | Hub MCP protocol surface                                       | @Tools-MCP-Lead                             | **v0.1 draft**      |
-| 3   | Identity / Auth / Session / Namespace / Agent registry         | @Provider-Auth-Lead                         | **draft v0.1**      |
-| 4   | Visibility model                                               | @alice                                      | **seed draft below** |
-| 5   | Notification routing / delivery semantics                      | @Runtime-dev-lead                           | **v0.1 draft**      |
+| 1   | Architecture overview                                          | @Tools-MCP-Lead + @Runtime-dev-lead         | **v0.1**            |
+| 2   | Hub MCP protocol surface                                       | @Tools-MCP-Lead                             | **v0.1**            |
+| 3   | Identity / Auth / Session / Namespace / Agent registry         | @Provider-Auth-Lead                         | **v0.1**            |
+| 4   | Visibility model                                               | @alice                                      | **v0.2**            |
+| 5   | Notification routing / delivery semantics                      | @Runtime-dev-lead                           | **v0.1**            |
 | 6a  | Client integration (contract + runtime boundary)               | @Tools-MCP-Lead                             | TBD                 |
 | 6b  | `/hub *` CLI / TUI surface                                     | @CLI-TUI-Dev-Lead                           | TBD                 |
 | 7   | Worker implementation + storage                                | **TBD**                                     | TBD                 |
-| 8   | Deployment / `CF_API_KEY` / CI / acceptance / release gate     | @QA-Release-Lead                            | **v0.1 draft**      |
+| 8   | Deployment / `CF_API_KEY` / CI / acceptance / release gate     | @QA-Release-Lead                            | **v0.1**            |
 
 ---
 
@@ -747,7 +747,7 @@ The implementation and §8 acceptance matrix must cover these auth-specific thre
 | §3.OQ-3 | Should same-namespace sends bypass first-contact permanently? | Yes for v0, but still require `notification:send` / `notification:receive` permissions and audit. |
 | §3.OQ-4 | Can external non-pie MCP clients register agents? | Yes if they use the same human session / agent token model; no provider credentials accepted. |
 
-## §4 Visibility model — seed draft (@alice)
+## §4 Visibility model — v0.2 (@alice)
 
 Owns the *what* (identity, visibility, trust semantics, profile shape). The *how* (envelope, transport, hooks) lives in §5.
 
@@ -796,15 +796,15 @@ Owns the *what* (identity, visibility, trust semantics, profile shape). The *how
 
 Notes:
 
-- "direct route" = `NotificationHook → Trigger → handle_trigger` per §5; no user prompt.
-- "first-contact prompt" = `BeforeTriggerHook::Prompt` via the issue #110 gate per §4.3.
+- "direct route" = `NotificationHook → Trigger → handle_trigger` per §5; no user prompt. **Still subject to §3.4 per-call authorization**: the sender's token MUST carry `notification:send`, the receiver MUST have `notification:receive` active, and the hub re-authorizes every send against current `inbox` / trust / block state (per §3.4 "Every `send_notification` call rechecks…"). `discoverable` is never an authorization input.
+- "first-contact prompt" = `BeforeTriggerHook::Prompt` → Artifact D `resolve_trigger_prompt` per §4.3 / §5.6 / #110.
 - "hub denies" = `send_notification` returns a bounded `permission_denied` recovery hint to the sender (per @Provider-Auth-Lead's redaction rule). No prompt fires on the receiver side.
 - "silent drop" = receiver-side block list match; sender sees a non-distinguishing delivery result (sender can't probe the block list).
-- Open question §4.OQ-6 (new): `open` and `invited` are functionally identical in this matrix; do we collapse them in v0 or keep both for operator signal?
+- Open question §4.OQ-6: `open` and `invited` are functionally identical in this matrix; do we collapse them in v0 or keep both for operator signal?
 
 ### §4.3 First-contact gate — reuse issue #110 user-prompt mechanism
 
-**Rule.** A notification from a sender `agent_id` that is (a) not in the receiver's trust list and (b) originates outside the receiver's namespace does **not** enter `NotificationHook → Trigger` directly. The receiver-side pie client surfaces a user prompt via the issue #110 `ControlPlaneWrite` gate:
+**Rule.** A notification from a sender `agent_id` that is (a) not in the receiver's trust list and (b) originates outside the receiver's namespace does **not** enter `NotificationHook → Trigger` directly. The receiver-side pie client surfaces a user prompt via the **trigger-channel half of issue #110** — specifically `HarnessEvent::TriggerPromptRequest` / `resolve_trigger_prompt` (#110 v0.2 Artifact D). The hub-pushed `Trigger` envelope (see §5.4 for envelope shape, §5.6 for the gate hookup) yields a bounded prompt card:
 
 ```
 @bar@cloudflare-bot wants to send a notification to @alice@dongxu.
@@ -814,22 +814,26 @@ Choice:  Accept once    Always (notification-only)    Block
 ```
 
 - **Accept once** — current notification routes through; sender is NOT added to trust list.
-- **Always** — sender enters the trust list with scope `{sender_agent_id, receiver_agent_id, action_class=notification, namespace?}`. Future notifications route directly.
+- **Always** — sender enters the trust list with scope `{receiver_agent_id, sender_agent_id, action_class=notification}`. Future notifications route directly. Receiver-anchored — sharing a trust file across machines (e.g. dotfile sync) must not authorize the same sender for a different local receiver agent. (See RFC-OQ-10 for the per-machine binding decision.)
 - **Block** — sender enters the block list; future attempts silent-drop, no further prompt.
 
-**Why.** Inbox-open without consent is spam. The issue #110 control-plane gate is already in flight for `ControlPlaneWrite` operations (`NewTrigger`, `InstallSkill`, `SetSkillState`, etc.); first-contact is the same shape — an authorization decision the model cannot self-confirm — so reuse the gate semantics rather than invent a new trust UI.
+**Why.** Inbox-open without consent is spam. The issue #110 `ControlPlaneWrite` gate is already in flight for control-plane operations (`NewTrigger`, `InstallSkill`, `SetSkillState`, etc.) via the tool-call channel; first-contact uses the parallel trigger channel (#110 v0.2 Artifact D) keyed on `trigger_prompt_id` rather than `args_hash`. Same shape — an authorization decision the model cannot self-confirm — so reuse the gate semantics rather than invent a new trust UI.
 
 **Application.**
 
-- Implementation lives in `BeforeTriggerHook::Prompt` policy on the runtime side (per @Runtime-dev-lead, §5). **No new prompt protocol** — reuses the existing issue #110 gate channel.
-- Trust list and block list are **receiver-owned**, persisted as `~/.pie/hub-trust.json` (key tuple per @Provider-Auth-Lead). Audit record uses the existing `SessionTreeEntry::Custom` mechanism with `custom_type = "fefe_trust_decision"`; body holds `{sender_agent_id, receiver_agent_id, decision, scope, at}` — never notification payload. The custom_type registration and field schema land in §5 (Runtime owns audit records) or §8 (QA defines redaction acceptance); §4 only states the bounded contract.
+- Implementation lives in `BeforeTriggerHook::Prompt` on the runtime side (§5.6). The runtime emits `HarnessEvent::TriggerPromptRequest` and waits on `resolve_trigger_prompt` (#110 v0.2 Artifact D). **No new prompt protocol** — same prompt-card render model the tool-call channel uses.
+- **Trust list and block list are receiver-owned and embedder-managed**, persisted as `~/.pie/hub-trust.json` (canonical schema in §5.7). The runtime never reads or writes this file — embedder owns the cache (mirrors the runtime-as-remember-agnostic principle of #110 v0.2).
+- **Two complementary audit entries** per accepted-and-remembered first-contact:
+  - Runtime emits `Custom { custom_type: "trigger_prompt", ... }` for the resolution itself (allow / deny / timeout). Always written, every resolution. Schema lives with #110.
+  - Embedder additionally emits `Custom { custom_type: "fefe_trust_decision", ... }` only when the user picks `Always` or `Block` and the cache changes. Canonical schema in §5.7. Body holds `{sender_agent_id, receiver_agent_id, decision, scope, at}` — never notification payload.
 - Trust scope is the narrowest useful tuple. **Never global, never "trust the whole namespace," never "trust all MCP tools."** (Per @Provider-Auth-Lead.)
 - `action_class` starts as `notification`. New action classes (e.g. `tool_call`, `data_read`) each get their own gate; granting one does not grant another.
-- Handle rename does not migrate or invalidate trust — keyed on `agent_id`.
+- Handle rename does not migrate or invalidate trust — keyed on immutable `agent_id`.
+- Identity at the runtime boundary projects per §3.4: hub's `AgentPrincipal { user_id, namespace, agent_id, permissions, token_id }` becomes runtime-side `TriggerAuthority { principal_id = agent_id, principal_label = @handle@namespace, ... }`. Authorization keys on the UUID; label is display only.
 
 ### §4.4 Sender profile is product copy, not decoration
 
-**Rule.** Profile fields are the input that other agents' LLMs read when deciding whether to accept a notification or send one. They are the agent's marketplace listing. Treat them like product copy: bounded, structured, no ambiguity, no escape hatches.
+**Rule.** Profile fields are sender-controlled copy that other agents' LLMs read for **discovery, send-decision context, and prompt summarization** — never for first-contact authorization. The accept / block / always decision on an incoming notification is made exclusively by the human through the issue #110 prompt response (§4.3); LLM-visible profile fields are context that helps the human and the model communicate about the sender, not an authorization channel. Treat them like product copy: bounded, structured, no ambiguity, no escape hatches.
 
 **Minimum profile schema (v0).**
 
@@ -855,7 +859,10 @@ Choice:  Accept once    Always (notification-only)    Block
 **Application.**
 
 - All enforcement at the hub MCP server's field filter. Reject at registration with a recovery hint, not a technical error code ("description too long — please tighten to 200 chars," not `VALIDATION_ERR field=description`).
-- **Separate listing schema vs detail schema.** `list_agents` returns only the minimal subset `{handle, agent_id, display_name, capabilities, discoverable, inbox}`. The detail view returns more. `list_agents` MUST NOT leak raw registration metadata.
+- **Three distinct profile subsets** — each surface gets only what it needs:
+  - **List subset** (returned by `list_agents` / `discover_public_agents` per §2.3): `{agent_id, handle, namespace, display_name, capabilities, discoverable, inbox}`. MUST NOT leak raw registration metadata, timestamps the receiver doesn't need, or any internal binding ids.
+  - **Detail subset** (returned by `get_agent_profile` per §2.3): list subset + `description` + `created_at` + `last_seen_at`.
+  - **Prompt-bounded subset** (carried by `HarnessEvent::TriggerPromptRequest` to the first-contact prompt UI per §4.3 / §5.6 / #110 Artifact D): `{display_name, description, capabilities}`. **Context for a user-mediated decision, not an authorization channel.** The accept / block / always choice is made by the human via the issue #110 prompt UI; the LLM may read these fields to summarize or surface them, but neither the LLM's reading nor the sender's copy ever authorizes delivery — the user's prompt response is the only authorization input. Keeping the subset tight avoids prompt-card overflow and reduces the surface for prompt-injection via sender-controlled copy.
 - Profile updates are control-plane writes — through the same audit channel as `set_my_visibility`. Never bypass.
 - Field naming follows "tool schema = LLM API" discipline (per @Tools-MCP-Lead): snake_case, unambiguous, each field's purpose stated in its JSON-Schema `description` so the listing LLM knows what each field is for. Enums const-locked with per-variant descriptions. `additionalProperties: false` at every level.
 
@@ -865,9 +872,11 @@ Choice:  Accept once    Always (notification-only)    Block
 
 - `TriggerAuthority.principal_id` carries `agent_id` (UUID) — the authorization key.
 - `TriggerAuthority.principal_label` carries `@handle@namespace` — display only.
-- Hub-pushed notifications enter via the `mcp:pie-hub:...` source label namespace.
-- Ack / dedup via `pie_dedup_key`; default `payload_visibility = Local`; ordering not guaranteed.
-- First-contact prompt is `BeforeTriggerHook::Prompt` keyed on `{receiver_agent_id, sender_agent_id, action_class=notification}` — same prompt channel as issue #110.
+- Hub-pushed notifications enter via the `mcp:pie-hub:...` source label namespace (§5.2).
+- Ack / dedup via `_meta.pie_dedup_key`; default `payload_visibility = Local`; ordering not guaranteed (§5.5 / §5.9).
+- First-contact prompt is `BeforeTriggerHook::Prompt` → `HarnessEvent::TriggerPromptRequest` → `resolve_trigger_prompt` (#110 v0.2 Artifact D). Runtime-side binding is `trigger_prompt_id` (per-notification, anti-replay); embedder-side trust cache keys on `{receiver_agent_id, sender_agent_id, action_class=notification}` per RFC-OQ-10 / §5.7.
+- Runtime emits `Custom { custom_type: "trigger_prompt", ... }` for every resolution; embedder additionally emits `Custom { custom_type: "fefe_trust_decision", ... }` only on `Always`/`Block` cache changes (§5.7). Complementary, not duplicate.
+- Prompt-bounded subset for the first-contact card is `{display_name, description, capabilities}` (§4.4).
 
 §4 references this envelope. §4 does **not** redefine envelope shape.
 
@@ -1346,13 +1355,45 @@ Owned by @QA-Release-Lead in §8. Required contents:
 
 ### Defaults
 
-| Field                | Default at registration |
-| -------------------- | ----------------------- |
-| `discoverable`       | `public`                |
-| `inbox`              | `namespace`             |
-| Trust TTL (`Always`) | 90 days                 |
-| Trust TTL (`Block`)  | indefinite              |
-| `payload_visibility` | `Local`                 |
+| Field                              | Default                 | Source                                                  |
+| ---------------------------------- | ----------------------- | ------------------------------------------------------- |
+| `discoverable`                     | `public`                | §4.2                                                    |
+| `inbox`                            | `namespace`             | §4.2                                                    |
+| Trust TTL (`Always`)               | 90 days                 | §4.OQ-3 / §4.3                                          |
+| Trust TTL (`Block`)                | indefinite              | §4.OQ-3 / §4.3                                          |
+| `payload_visibility`               | `Local`                 | §5.4                                                    |
+| Human session idle timeout         | 24 hours                | §3.2                                                    |
+| Human session absolute max         | 30 days                 | §3.2                                                    |
+| First-contact prompt timeout       | 5 minutes               | #110 v0.2 §110.OQ-3 (embedder-configurable)            |
+| `pie_summary` hub cap              | 240 characters          | §2.5                                                    |
+| Runtime-side `payload_summary` cap | 4 KiB                   | §5.10 (defense-in-depth against hub cap regression)     |
+| Tool result body cap (non-list)    | 64 KiB                  | §2.3                                                    |
+| List-tool body cap                 | 256 KiB                 | §2.3                                                    |
+| `send_notification` request body   | 16 KiB                  | §2.7                                                    |
+
+### Cross-chapter artifact pointers
+
+Where to find canonical schemas, file shapes, and report formats so reviewers don't hunt for them:
+
+| Artifact                                                              | Lives in              | Cited by                                |
+| --------------------------------------------------------------------- | --------------------- | --------------------------------------- |
+| `~/.pie/hub-trust.json` shape                                         | §5.7                  | §4.3                                    |
+| `Custom { custom_type: "fefe_trust_decision" }` audit schema          | §5.7                  | §4.3, §8.5 (redaction acceptance)       |
+| `Custom { custom_type: "trigger_prompt" }` audit schema               | #110 v0.2 Artifact E  | §4.3, §5.6, §8.5                        |
+| `Custom { custom_type: "control_plane_prompt" }` audit schema         | #110 v0.2 Artifact E  | §5 (tool-call prompts; not fefe)        |
+| `HarnessEvent::TriggerPromptRequest` / `resolve_trigger_prompt`       | #110 v0.2 Artifact D  | §4.3, §5.6, §6a                         |
+| Release-complete report format                                        | §8.6                  | §8.4 gate 6                             |
+| Phased release gate matrix                                            | §8.4                  | Definition of done                      |
+| Permission strings (`agent:*`, `notification:*`, `token:*`, `trust:*`) | §3.3                  | §2.3 tool tables                        |
+| MCP error code namespace (`-32000`…`-32010`)                          | §2.6                  | §3.5                                    |
+| `_meta.pie_dedup_key` / `_meta.pie_summary` wire fields               | PR #56 (canonical)    | §2.5, §5.5, §5.10                       |
+
+**Audit complementarity (referenced from §4.3 / §5.6 / §5.7).** Two distinct audit types fire on different events; reviewers can confirm redaction once by reading the §5.7 forbidden-fields list and applying it equivalently:
+
+- `trigger_prompt` — runtime-emitted, **every** prompt resolution (allow / deny / timeout). Owned by #110.
+- `fefe_trust_decision` — embedder-emitted, **only** when the user picks `Always` or `Block` and the cache changes. Owned by §5.7.
+
+These complement, do not duplicate. `Accept once` writes only `trigger_prompt`. `Always` / `Block` write both.
 
 ### Cross-chapter open questions
 
@@ -1367,6 +1408,7 @@ Owned by @QA-Release-Lead in §8. Required contents:
 | RFC-OQ-7      | Collapse `inbox=open` and `inbox=invited` in v0? (§4.OQ-6)                                 | @alice: lean keep both as operator signal. Tools-MCP +1 keep-both (sender-side invitation-token semantic distinction). |
 | ~~RFC-OQ-8~~  | Deploy mechanism for `pie.0xfefe.me`: manual or CI auto-deploy?                            | **RESOLVED 2026-05-29 by @EdHuang: CI auto-deploy via GitHub Actions.** EdHuang provides a GitHub repository secret named `CF_API_KEY`. Secret stays inside GitHub Actions (encrypted secret + protected environment); never enters repo, PR body, workflow logs, artifacts, cache, test fixtures, runtime config, session, audit, bug report, or any MCP payload. Secret-hardening requirements detailed in §8 (deploy gate). Reversed an earlier 2026-05-29 manual-deploy decision; superseded entry kept in change log. |
 | RFC-OQ-9      | Agent token expiry default? (§3.OQ-2)                                                       | @Provider-Auth-Lead: prefer long-lived but rotatable tokens with mandatory revoke/rotate support before v0 deploy. |
+| RFC-OQ-10     | Per-machine receiver binding for `~/.pie/hub-trust.json` to defeat dotfile-sync trust replay (§5.OQ-3). | Lean YES — bind trust entries to `(local_machine_id, receiver_agent_id, sender_agent_id, action_class)`. Cross-machine trust replay is a real attack surface if a laptop is lost or a dotfile sync drags the file onto another machine. Promoted from §5.OQ-3 by @Runtime-dev-lead + @Provider-Auth-Lead in cross-doc review on #130 v0.2. Final decision belongs to §3 / §5 v0.2 owners. |
 
 ### Change log
 
@@ -1387,3 +1429,4 @@ Owned by @QA-Release-Lead in §8. Required contents:
 | 2026-05-29 | @Provider-Auth-Lead | §3 v0.1: identity/auth/session/namespace/agent registry draft. Added credential class separation, human session requirements, agent token lifecycle, per-call authorization rules, bounded auth errors, audit/redaction rules, threat-model checkpoints, and §3 open questions. |
 | 2026-05-29 | @Tools-MCP-Lead | §1 v0.1 partial (§1.1 framing / §1.2 ASCII component map / §1.3 9-step wire-bytes lifecycle / §1.5 reuse-vs-new ledger). Stitches §2 + §5 + §4 + §3 into one mental model. §1.5 ledger pins the operative rule: no implementation PR introduces a new runtime trait beyond what RFC 1 shipped — the hub work adds one transport (`HttpMcpTransport`), one factory (`make_pie_hub_notification_hook`), one `BeforeTriggerHook` impl (`HubTrustGate`), two Custom audit types, two `~/.pie/*.json` files, and the Worker; everything else is configuration. §1.4 placeholder calls out @Runtime-dev-lead. |
 | 2026-05-29 | @Runtime-dev-lead | §1.4 trigger pipeline reuse — Runtime side. Diagrams the pre-existing-on-`main` vs new-in-RFC #18 split on the runtime boundary; pins the "no new hook trait, no new pipeline, no new envelope, no new audit machinery" rule; lists the four Runtime-side new things (`make_pie_hub_notification_hook` factory, `HubTrustGate` impl, `~/.pie/hub-trust.json` schema, `fefe_trust_decision` Custom audit) and confirms the §1 → §1.5 → sub-PR sequencing fits ~400 LoC of `crates/agent` delta plus tests. §1 v0.1 chapter complete. |
+| 2026-05-29 | @alice | §4 v0.2: folded review feedback accumulated across §3 v0.1 (PR #125), §5 v0.1 (PR #127), §8 v0.1 (PR #126), §2 v0.1 (PR #128), and #110 design v0.2 (PR #130). §4.2 matrix "direct route" cells cite §3.4 per-call auth precondition (sender `notification:send`, receiver `notification:receive`). §4.3 expanded: names #110 v0.2 Artifact D specifically (`HarnessEvent::TriggerPromptRequest` / `resolve_trigger_prompt`), cites §5.7 as canonical location for `fefe_trust_decision` and `~/.pie/hub-trust.json` shape, documents the two complementary audit types (`trigger_prompt` runtime + `fefe_trust_decision` embedder), and projects §3.4's `AgentPrincipal` ↔ §5.3's `TriggerAuthority`. §4.4 splits the profile schema into list / detail / prompt-bounded subsets — the prompt-bounded subset `{display_name, description, capabilities}` is what `BeforeTriggerActionContext` carries to the first-contact UI (per §5.OQ-1). §4 × §5 contract section refreshed accordingly. Chapter map status normalized to single-form ("v0.1" / "v0.2" without "draft" suffix); §8 title's `~/cf_token` → `CF_API_KEY` typo fixed in chapter map. Added coordinator-maintained "Cross-chapter artifact pointers" sub-section so reviewers can find canonical schemas (audit types, hub-trust.json shape, prompt channel, permission strings, error namespace, dedup key) without grepping. Defaults table extended with §3.2 human session timeouts, §2.5/§5.10 cap layering, #110 prompt timeout. Promoted **RFC-OQ-10** (per-machine receiver binding for `~/.pie/hub-trust.json` to defeat dotfile-sync trust replay; from §5.OQ-3, surfaced by @Runtime-dev-lead + @Provider-Auth-Lead in cross-doc review on #130 v0.2). |
