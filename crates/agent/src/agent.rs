@@ -46,6 +46,7 @@ pub struct AgentOptions {
     pub get_api_key: Option<GetApiKey>,
     pub before_tool_call: Option<BeforeToolCallHook>,
     pub after_tool_call: Option<AfterToolCallHook>,
+    pub on_control_plane_prompt: Option<OnControlPlanePromptHook>,
     pub should_stop_after_turn: Option<ShouldStopHook>,
     pub prepare_next_turn: Option<PrepareNextTurnHook>,
     pub steering_mode: QueueMode,

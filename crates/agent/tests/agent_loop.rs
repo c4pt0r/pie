@@ -112,6 +112,7 @@ async fn single_turn_no_tools_emits_lifecycle_events() {
                 AgentEvent::ToolExecutionStart { .. } => "tool_execution_start",
                 AgentEvent::ToolExecutionEnd { .. } => "tool_execution_end",
                 AgentEvent::ToolExecutionUpdate { .. } => "tool_execution_update",
+                AgentEvent::ControlPlanePromptResolved { .. } => "control_plane_prompt_resolved",
             };
             events.lock().unwrap().push(tag.to_string());
         })
@@ -275,6 +276,7 @@ async fn before_tool_call_can_veto_execution() {
                 BeforeToolCallResult {
                     block: true,
                     reason: Some("policy: no echo".into()),
+                    prompt: None,
                 }
             })
         });
@@ -718,4 +720,431 @@ async fn run_one_does_not_hang_when_tool_retains_on_update_past_return() {
         elapsed < std::time::Duration::from_secs(5),
         "expected run_one to return within ~2s after the tool returned, took {elapsed:?}"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────
+// Issue #110 — ControlPlaneWrite user-Prompt gate (design v0.2)
+// ─────────────────────────────────────────────────────────────────────────────────────────
+
+/// Shared test fixture: a counted EchoTool whose `permission_classification` is dictated by
+/// the test. Test asserts on whether `execute` ran by inspecting `called`.
+mod cpw_test_util {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use async_trait::async_trait;
+    use pie_agent_core::{
+        AgentTool, AgentToolError, AgentToolResult, AgentToolUpdate, PermissionClassification,
+    };
+    use tokio_util::sync::CancellationToken;
+
+    pub(super) struct ClassifierTool {
+        pub(super) def: pie_ai::Tool,
+        pub(super) classification: PermissionClassification,
+        pub(super) called: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl AgentTool for ClassifierTool {
+        fn definition(&self) -> &pie_ai::Tool {
+            &self.def
+        }
+        fn label(&self) -> &str {
+            "classifier"
+        }
+        fn permission_classification(
+            &self,
+            _prepared_args: &serde_json::Value,
+        ) -> PermissionClassification {
+            self.classification.clone()
+        }
+        async fn execute(
+            &self,
+            _id: &str,
+            _params: serde_json::Value,
+            _cancel: CancellationToken,
+            _on_update: Option<AgentToolUpdate>,
+        ) -> Result<AgentToolResult, AgentToolError> {
+            self.called.store(true, Ordering::SeqCst);
+            Ok(AgentToolResult {
+                content: vec![pie_ai::UserContentBlock::text("did run")],
+                details: serde_json::Value::Null,
+                terminate: None,
+            })
+        }
+    }
+
+    pub(super) fn tool_call_for(name: &str) -> pie_ai::ToolCall {
+        let mut args = serde_json::Map::new();
+        args.insert("x".into(), serde_json::json!(1));
+        pie_ai::ToolCall {
+            id: "call_1".into(),
+            name: name.into(),
+            arguments: args,
+            thought_signature: None,
+        }
+    }
+}
+
+#[tokio::test]
+async fn permission_classification_default_allow_keeps_legacy_behavior() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use cpw_test_util::*;
+    use pie_agent_core::{AgentTool, PermissionClassification};
+
+    let responses = Arc::new(Mutex::new(vec![
+        assistant_with(
+            vec![ContentBlock::ToolCall(tool_call_for("classifier"))],
+            StopReason::ToolUse,
+        ),
+        assistant_with(vec![ContentBlock::text("done")], StopReason::Stop),
+    ]));
+    let called = Arc::new(AtomicBool::new(false));
+    let tool = Arc::new(ClassifierTool {
+        def: pie_ai::Tool {
+            name: "classifier".into(),
+            description: "".into(),
+            parameters: serde_json::json!({ "type": "object" }),
+        },
+        classification: PermissionClassification::Allow,
+        called: called.clone(),
+    });
+
+    let mut state = pie_agent_core::AgentState::default();
+    state.model = Some(faux_model());
+    state.tools = vec![tool as Arc<dyn AgentTool>];
+    let agent = pie_agent_core::Agent::new(pie_agent_core::AgentOptions {
+        initial_state: Some(state),
+        stream_fn: Some(faux_stream_fn_with(responses)),
+        ..Default::default()
+    });
+    agent
+        .prompt(AgentMessage::Llm(pie_ai::Message::User(
+            pie_ai::UserMessage {
+                role: pie_ai::UserRole::User,
+                content: pie_ai::UserContent::Text("run".into()),
+                timestamp: 0,
+            },
+        )))
+        .await
+        .unwrap();
+    assert!(
+        called.load(Ordering::SeqCst),
+        "default Allow classification must let the tool execute"
+    );
+}
+
+#[tokio::test]
+async fn permission_classification_block_short_circuits_before_hook_and_execute() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use cpw_test_util::*;
+    use pie_agent_core::{AgentTool, PermissionClassification};
+
+    let responses = Arc::new(Mutex::new(vec![
+        assistant_with(
+            vec![ContentBlock::ToolCall(tool_call_for("classifier"))],
+            StopReason::ToolUse,
+        ),
+        assistant_with(vec![ContentBlock::text("done")], StopReason::Stop),
+    ]));
+    let called = Arc::new(AtomicBool::new(false));
+    let tool = Arc::new(ClassifierTool {
+        def: pie_ai::Tool {
+            name: "classifier".into(),
+            description: "".into(),
+            parameters: serde_json::json!({ "type": "object" }),
+        },
+        classification: PermissionClassification::Block {
+            reason: "blocked: hard refusal".into(),
+        },
+        called: called.clone(),
+    });
+
+    // Even if the user wires a `before_tool_call` hook that returns Allow, the Block
+    // classification must short-circuit before the hook is invoked.
+    let hook_called = Arc::new(AtomicBool::new(false));
+    let hook_called_clone = hook_called.clone();
+    let before_hook: pie_agent_core::BeforeToolCallHook = Arc::new(
+        move |_ctx: pie_agent_core::BeforeToolCallContext, _cancel: CancellationToken| {
+            let hc = hook_called_clone.clone();
+            Box::pin(async move {
+                hc.store(true, Ordering::SeqCst);
+                pie_agent_core::BeforeToolCallResult::default()
+            })
+        },
+    );
+
+    let mut state = pie_agent_core::AgentState::default();
+    state.model = Some(faux_model());
+    state.tools = vec![tool as Arc<dyn AgentTool>];
+    let agent = pie_agent_core::Agent::new(pie_agent_core::AgentOptions {
+        initial_state: Some(state),
+        stream_fn: Some(faux_stream_fn_with(responses)),
+        before_tool_call: Some(before_hook),
+        ..Default::default()
+    });
+    agent
+        .prompt(AgentMessage::Llm(pie_ai::Message::User(
+            pie_ai::UserMessage {
+                role: pie_ai::UserRole::User,
+                content: pie_ai::UserContent::Text("run".into()),
+                timestamp: 0,
+            },
+        )))
+        .await
+        .unwrap();
+    assert!(
+        !called.load(Ordering::SeqCst),
+        "Block classification must skip tool execution"
+    );
+    assert!(
+        !hook_called.load(Ordering::SeqCst),
+        "Block classification must short-circuit before before_tool_call"
+    );
+}
+
+#[tokio::test]
+async fn permission_classification_prompt_with_no_hook_fails_closed() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use cpw_test_util::*;
+    use pie_agent_core::{AgentTool, PermissionClassification};
+
+    let responses = Arc::new(Mutex::new(vec![
+        assistant_with(
+            vec![ContentBlock::ToolCall(tool_call_for("classifier"))],
+            StopReason::ToolUse,
+        ),
+        assistant_with(vec![ContentBlock::text("done")], StopReason::Stop),
+    ]));
+    let called = Arc::new(AtomicBool::new(false));
+    let tool = Arc::new(ClassifierTool {
+        def: pie_ai::Tool {
+            name: "classifier".into(),
+            description: "".into(),
+            parameters: serde_json::json!({ "type": "object" }),
+        },
+        classification: PermissionClassification::Prompt {
+            reason: "control-plane write".into(),
+        },
+        called: called.clone(),
+    });
+
+    let mut state = pie_agent_core::AgentState::default();
+    state.model = Some(faux_model());
+    state.tools = vec![tool as Arc<dyn AgentTool>];
+    let agent = pie_agent_core::Agent::new(pie_agent_core::AgentOptions {
+        initial_state: Some(state),
+        stream_fn: Some(faux_stream_fn_with(responses)),
+        // No on_control_plane_prompt hook configured.
+        ..Default::default()
+    });
+    agent
+        .prompt(AgentMessage::Llm(pie_ai::Message::User(
+            pie_ai::UserMessage {
+                role: pie_ai::UserRole::User,
+                content: pie_ai::UserContent::Text("run".into()),
+                timestamp: 0,
+            },
+        )))
+        .await
+        .unwrap();
+    assert!(
+        !called.load(Ordering::SeqCst),
+        "Prompt classification with no resolution hook must fail-closed deny",
+    );
+}
+
+#[tokio::test]
+async fn permission_classification_prompt_with_hook_allow_executes_and_emits_audit_event() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use cpw_test_util::*;
+    use pie_agent_core::{
+        AgentEvent, AgentTool, ControlPlanePromptDecision, OnControlPlanePromptHook,
+        PermissionClassification,
+    };
+
+    let responses = Arc::new(Mutex::new(vec![
+        assistant_with(
+            vec![ContentBlock::ToolCall(tool_call_for("classifier"))],
+            StopReason::ToolUse,
+        ),
+        assistant_with(vec![ContentBlock::text("done")], StopReason::Stop),
+    ]));
+    let called = Arc::new(AtomicBool::new(false));
+    let tool = Arc::new(ClassifierTool {
+        def: pie_ai::Tool {
+            name: "classifier".into(),
+            description: "".into(),
+            parameters: serde_json::json!({ "type": "object" }),
+        },
+        classification: PermissionClassification::Prompt {
+            reason: "control-plane write".into(),
+        },
+        called: called.clone(),
+    });
+
+    let observed_label: Arc<std::sync::Mutex<Option<String>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let observed_args_hash: Arc<std::sync::Mutex<Option<String>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let prompt_hook: OnControlPlanePromptHook = {
+        let label = observed_label.clone();
+        let hash = observed_args_hash.clone();
+        Arc::new(move |req, _cancel| {
+            *label.lock().unwrap() = Some(req.label.clone());
+            *hash.lock().unwrap() = Some(req.args_hash.clone());
+            Box::pin(async move { ControlPlanePromptDecision::Allow })
+        })
+    };
+
+    let events: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    let listener: pie_agent_core::AgentListener = Arc::new(move |ev, _cancel| {
+        let events = events_clone.clone();
+        Box::pin(async move {
+            if let AgentEvent::ControlPlanePromptResolved {
+                tool_name,
+                decision,
+                args_hash,
+                ..
+            } = ev
+            {
+                events
+                    .lock()
+                    .unwrap()
+                    .push(format!("{tool_name}:{decision}:{args_hash}"));
+            }
+        })
+    });
+
+    let mut state = pie_agent_core::AgentState::default();
+    state.model = Some(faux_model());
+    state.tools = vec![tool as Arc<dyn AgentTool>];
+    let agent = pie_agent_core::Agent::new(pie_agent_core::AgentOptions {
+        initial_state: Some(state),
+        stream_fn: Some(faux_stream_fn_with(responses)),
+        on_control_plane_prompt: Some(prompt_hook),
+        ..Default::default()
+    });
+    let _unsub = agent.subscribe(listener);
+    agent
+        .prompt(AgentMessage::Llm(pie_ai::Message::User(
+            pie_ai::UserMessage {
+                role: pie_ai::UserRole::User,
+                content: pie_ai::UserContent::Text("run".into()),
+                timestamp: 0,
+            },
+        )))
+        .await
+        .unwrap();
+    assert!(
+        called.load(Ordering::SeqCst),
+        "Prompt + Allow decision must let the tool execute"
+    );
+    let lbl = observed_label.lock().unwrap().clone().unwrap_or_default();
+    assert!(
+        lbl.contains("classifier"),
+        "prompt label must mention the tool name, got {lbl:?}"
+    );
+    let hash = observed_args_hash
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_default();
+    assert_eq!(
+        hash.len(),
+        64,
+        "args_hash must be 64-hex (SHA-256), got len={}",
+        hash.len()
+    );
+    let evs = events.lock().unwrap().clone();
+    assert_eq!(
+        evs.len(),
+        1,
+        "expected one ControlPlanePromptResolved event"
+    );
+    assert!(
+        evs[0].starts_with("classifier:allow:"),
+        "audit event missing decision=allow, got {:?}",
+        evs[0]
+    );
+}
+
+#[tokio::test]
+async fn permission_classification_prompt_with_hook_deny_blocks_and_emits_audit_event() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use cpw_test_util::*;
+    use pie_agent_core::{
+        AgentEvent, AgentTool, ControlPlanePromptDecision, OnControlPlanePromptHook,
+        PermissionClassification,
+    };
+
+    let responses = Arc::new(Mutex::new(vec![
+        assistant_with(
+            vec![ContentBlock::ToolCall(tool_call_for("classifier"))],
+            StopReason::ToolUse,
+        ),
+        assistant_with(vec![ContentBlock::text("done")], StopReason::Stop),
+    ]));
+    let called = Arc::new(AtomicBool::new(false));
+    let tool = Arc::new(ClassifierTool {
+        def: pie_ai::Tool {
+            name: "classifier".into(),
+            description: "".into(),
+            parameters: serde_json::json!({ "type": "object" }),
+        },
+        classification: PermissionClassification::Prompt {
+            reason: "control-plane write".into(),
+        },
+        called: called.clone(),
+    });
+    let prompt_hook: OnControlPlanePromptHook = Arc::new(|_req, _cancel| {
+        Box::pin(async move {
+            ControlPlanePromptDecision::Deny {
+                reason: Some("user said no".into()),
+            }
+        })
+    });
+    let events: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let ec = events.clone();
+    let listener: pie_agent_core::AgentListener = Arc::new(move |ev, _cancel| {
+        let ec = ec.clone();
+        Box::pin(async move {
+            if let AgentEvent::ControlPlanePromptResolved { decision, .. } = ev {
+                ec.lock().unwrap().push(decision);
+            }
+        })
+    });
+
+    let mut state = pie_agent_core::AgentState::default();
+    state.model = Some(faux_model());
+    state.tools = vec![tool as Arc<dyn AgentTool>];
+    let agent = pie_agent_core::Agent::new(pie_agent_core::AgentOptions {
+        initial_state: Some(state),
+        stream_fn: Some(faux_stream_fn_with(responses)),
+        on_control_plane_prompt: Some(prompt_hook),
+        ..Default::default()
+    });
+    let _unsub = agent.subscribe(listener);
+    agent
+        .prompt(AgentMessage::Llm(pie_ai::Message::User(
+            pie_ai::UserMessage {
+                role: pie_ai::UserRole::User,
+                content: pie_ai::UserContent::Text("run".into()),
+                timestamp: 0,
+            },
+        )))
+        .await
+        .unwrap();
+    assert!(
+        !called.load(Ordering::SeqCst),
+        "Deny decision must skip tool execution"
+    );
+    let evs = events.lock().unwrap().clone();
+    assert_eq!(evs, vec!["deny".to_string()]);
 }

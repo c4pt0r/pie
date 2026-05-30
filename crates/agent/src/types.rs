@@ -210,6 +210,29 @@ pub trait AgentTool: Send + Sync {
         args
     }
 
+    /// Per-tool classification evaluated **before** [`BeforeToolCallHook`]. The agent loop
+    /// uses the returned [`PermissionClassification`] to decide whether to run the user's
+    /// `before_tool_call` hook ([`PermissionClassification::Allow`], the default), route
+    /// through the user-confirmation prompt channel ([`PermissionClassification::Prompt`]),
+    /// or hard-deny ([`PermissionClassification::Block`]).
+    ///
+    /// `prepared_args` is the value after [`AgentTool::prepare_arguments`] — the same shape
+    /// the tool will actually execute against and the same shape used to compute the
+    /// `args_hash` that binds prompt approvals. Tools should classify against the prepared
+    /// form, not the raw args.
+    ///
+    /// Default impl returns [`PermissionClassification::Allow`] so existing tools compile
+    /// unchanged and behave exactly as before. Tools opt into prompt-gating per issue #110
+    /// design v0.2 — see e.g. `SetSkillState::permission_classification` (sub-PR 3) for the
+    /// canonical pattern of returning `Prompt` for escalating arg shapes and `Allow` for
+    /// narrowing.
+    fn permission_classification(
+        &self,
+        _prepared_args: &serde_json::Value,
+    ) -> PermissionClassification {
+        PermissionClassification::Allow
+    }
+
     /// Execute the tool call. Implementations should *not* encode errors in `content` — return
     /// `Err` instead; the agent loop wraps it into an `is_error: true` tool result.
     ///
@@ -300,6 +323,20 @@ pub struct AgentState {
 /// Events emitted by the Agent for UI updates.
 #[derive(Clone, Debug)]
 pub enum AgentEvent {
+    /// A tool call's [`PermissionClassification::Prompt`] surfaced through the
+    /// `on_control_plane_prompt` hook (or fell back to fail-closed deny when no hook was
+    /// configured). Fires after the hook returns; the decision is final by this point.
+    /// Issue #110 design v0.2 — observability for prompt resolution. Harness layer
+    /// translates this into [`crate::HarnessEvent::ControlPlanePromptResolved`] and writes
+    /// the canonical `control_plane_prompt` Custom audit entry.
+    ControlPlanePromptResolved {
+        tool_call_id: String,
+        tool_name: String,
+        args_hash: String,
+        label: String,
+        decision: String,
+        reason: Option<String>,
+    },
     AgentStart,
     AgentEnd {
         messages: Vec<AgentMessage>,
@@ -343,11 +380,103 @@ pub enum AgentEvent {
 // ──────────────────────────────────────────────────────────────────────────────────────────
 
 /// Result returned from `before_tool_call`. `block: true` skips execution; `reason` becomes the
-/// error text shown in the synthesized tool result.
+/// error text shown in the synthesized tool result. When `prompt.is_some()` and `block: false`,
+/// the agent loop suspends the tool call and routes through the [`OnControlPlanePromptHook`]
+/// channel — see issue #110 design v0.2.
 #[derive(Clone, Debug, Default)]
 pub struct BeforeToolCallResult {
     pub block: bool,
     pub reason: Option<String>,
+    /// When `Some`, the agent loop awaits user confirmation via
+    /// [`OnControlPlanePromptHook`] before dispatching the tool. `block: true` always wins —
+    /// a `before_tool_call` hook that wants to hard-deny doesn't get its decision
+    /// "promoted" to a prompt. Default `None` preserves legacy behavior for every tool that
+    /// has not opted in via [`AgentTool::permission_classification`].
+    pub prompt: Option<ControlPlanePromptRequest>,
+}
+
+/// Per-tool classification override evaluated **before** [`BeforeToolCallHook`]. Tools that
+/// mutate persistent state (skills, triggers, hub trust) return [`PermissionClassification::Prompt`]
+/// with a bounded human-readable reason; tools that wrap escalations the model must never
+/// self-authorize (e.g. re-enabling a `disable_model_invocation=true` skill) return
+/// [`PermissionClassification::Block`]. Default impl on [`AgentTool::permission_classification`]
+/// returns [`PermissionClassification::Allow`] so existing tools compile and behave unchanged.
+///
+/// Issue #110 design v0.2 Artifact A.
+#[derive(Clone, Debug)]
+pub enum PermissionClassification {
+    /// Default. Tool dispatches through the existing `before_tool_call` path with no
+    /// runtime-side gating beyond what the user's hook decides.
+    Allow,
+    /// Tool requires a user-mediated confirmation before dispatch. The agent loop synthesizes
+    /// a [`BeforeToolCallResult::prompt`] from the supplied `reason` (and bounded args
+    /// preview) and routes through [`OnControlPlanePromptHook`]. If no prompt hook is
+    /// configured the runtime fails closed.
+    Prompt { reason: String },
+    /// Hard categorical refusal. The agent loop synthesizes a `Block` result with the
+    /// supplied `reason` and never invokes either the user's `before_tool_call` hook or the
+    /// prompt channel. Use for tool calls the runtime treats as non-negotiable refusals
+    /// (e.g. the `SetSkillState(enabled=true)` stopgap before issue #110 ships).
+    Block { reason: String },
+}
+
+/// Bounded preview-safe payload describing a control-plane write the runtime is asking the
+/// user to confirm. Wired through [`OnControlPlanePromptHook`]; the embedder owns rendering
+/// (CLI prompt card, Web confirmation modal, headless `--yes` policy, etc.).
+///
+/// **Bounded fields only.** The `label` and `payload` MUST NOT contain raw SKILL.md bodies,
+/// raw rule text, install source URL tokens, provider/base_url credentials, auth-store
+/// values, or raw payload bytes — same redaction discipline as `fefe_trust_decision`
+/// (RFC #18 §5.7). Runtime caps `label` at 200 chars before persistence; `payload` is
+/// embedder-defined JSON, bounded by the tool/classifier that produced it.
+#[derive(Clone, Debug)]
+pub struct ControlPlanePromptRequest {
+    /// The `tool_call_id` of the call this prompt is gating. Used by the resolution path
+    /// for replay-binding (per issue #110 design v0.2 §1 Decision binding).
+    pub tool_call_id: String,
+    /// Tool name (e.g. `InstallSkill`). Display-only at the runtime layer.
+    pub tool_name: String,
+    /// SHA-256 over `canonical_json(prepare_arguments(args))`. Binds an approval to a single
+    /// concrete invocation; the runtime rejects any resolution whose `args_hash` does not
+    /// match the in-flight call.
+    pub args_hash: String,
+    /// Embedder-facing one-line label. Runtime caps at 200 chars before persistence.
+    pub label: String,
+    /// Embedder-rendered preview payload. Runtime never inspects fields; the tool/classifier
+    /// that produced the prompt owns its shape and redaction.
+    pub payload: serde_json::Value,
+    /// Why this prompt was raised (forwarded from
+    /// [`PermissionClassification::Prompt { reason }`] verbatim).
+    pub reason: String,
+}
+
+/// Decision returned from [`OnControlPlanePromptHook`]. The agent loop maps `Allow` to
+/// dispatch, `Deny` / `Timeout` to a synthesized block. Issue #110 design v0.2 Artifact C.
+#[derive(Clone, Debug)]
+pub enum ControlPlanePromptDecision {
+    Allow,
+    Deny {
+        /// Optional reason surfaced into the synthesized tool result and audit. Embedder
+        /// caps before passing.
+        reason: Option<String>,
+    },
+    /// Embedder timed out / disconnected before the user resolved. Runtime treats
+    /// identically to `Deny { reason: Some("prompt timed out") }` but the audit records the
+    /// distinct outcome so analytics / acceptance tests can tell them apart.
+    Timeout,
+}
+
+impl ControlPlanePromptDecision {
+    /// Stable `decision` string for the `control_plane_prompt` audit entry. Avoid
+    /// stringifying the `Debug` representation — these values are part of the audit
+    /// contract.
+    pub fn as_audit_str(&self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny { .. } => "deny",
+            Self::Timeout => "timeout",
+        }
+    }
 }
 
 /// Partial override returned from `after_tool_call`. Omitted fields keep the original executed
@@ -458,6 +587,16 @@ pub struct AgentLoopConfig {
 
     pub get_steering_messages: Option<MessageQueueProvider>,
     pub get_follow_up_messages: Option<MessageQueueProvider>,
+
+    /// Control-plane prompt resolution channel. When a tool's
+    /// [`AgentTool::permission_classification`] returns
+    /// [`PermissionClassification::Prompt`] (or a `before_tool_call` hook returns
+    /// [`BeforeToolCallResult::prompt`] populated), the agent loop calls this hook with the
+    /// synthesized [`ControlPlanePromptRequest`] and awaits a
+    /// [`ControlPlanePromptDecision`]. `None` is **fail-closed deny** — any prompt-required
+    /// tool call is treated as `Deny { reason: "no prompt channel" }` so an embedder that
+    /// forgets to wire the channel cannot accidentally allow escalating writes.
+    pub on_control_plane_prompt: Option<OnControlPlanePromptHook>,
 }
 
 // Hook trait-object aliases (boxed async closures).
@@ -467,6 +606,15 @@ pub type BeforeToolCallHook = Arc<
             BeforeToolCallContext,
             CancellationToken,
         ) -> Pin<Box<dyn std::future::Future<Output = BeforeToolCallResult> + Send>>
+        + Send
+        + Sync,
+>;
+
+pub type OnControlPlanePromptHook = Arc<
+    dyn Fn(
+            ControlPlanePromptRequest,
+            CancellationToken,
+        ) -> Pin<Box<dyn std::future::Future<Output = ControlPlanePromptDecision> + Send>>
         + Send
         + Sync,
 >;

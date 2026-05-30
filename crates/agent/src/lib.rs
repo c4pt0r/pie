@@ -16,10 +16,11 @@ pub use types::{
     AfterToolCallContext, AfterToolCallHook, AfterToolCallResult, AgentContext, AgentEvent,
     AgentLoopConfig, AgentLoopTurnUpdate, AgentMessage, AgentState, AgentTool, AgentToolCall,
     AgentToolError, AgentToolResult, AgentToolUpdate, BeforeToolCallContext, BeforeToolCallHook,
-    BeforeToolCallResult, ConvertToLlm, CustomMessage, GetApiKey, MessageQueueProvider,
-    PrepareNextTurnContext, PrepareNextTurnHook, QueueMode, ShouldStopAfterTurnContext,
-    ShouldStopHook, StreamFn, ThinkingLevel, ToolExecutionMode, TransformContext,
-    default_convert_to_llm,
+    BeforeToolCallResult, ControlPlanePromptDecision, ControlPlanePromptRequest, ConvertToLlm,
+    CustomMessage, GetApiKey, MessageQueueProvider, OnControlPlanePromptHook,
+    PermissionClassification, PrepareNextTurnContext, PrepareNextTurnHook, QueueMode,
+    ShouldStopAfterTurnContext, ShouldStopHook, StreamFn, ThinkingLevel, ToolExecutionMode,
+    TransformContext, default_convert_to_llm,
 };
 
 #[cfg(feature = "harness")]

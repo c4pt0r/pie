@@ -162,6 +162,7 @@ impl PermissionPolicy {
                     PermissionDecision::Deny { reason } => BeforeToolCallResult {
                         block: true,
                         reason: Some(reason),
+                        prompt: None,
                     },
                 }
             })

@@ -685,6 +685,10 @@ impl EventData {
                 d.tool_result_summary = Some(result_summary(result));
                 Some(d)
             }
+            // Issue #110: control-plane prompt observability event. Embedder-side
+            // hook-script bridge does not currently surface this; defer to a follow-up
+            // PR once we have a concrete bridge consumer that wants it.
+            AgentEvent::ControlPlanePromptResolved { .. } => None,
         }
     }
 
