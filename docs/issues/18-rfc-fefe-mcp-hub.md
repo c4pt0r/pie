@@ -1581,7 +1581,7 @@ implemented in phases, but the grammar below is the v0 target:
 | `/hub list [--mine|--public|--namespace]` | List own / discoverable agents through §2 discovery tools. | Bounded list fields only: handle, namespace, display name, visibility summary, status. |
 | `/hub send <agent_ref> <message>` | Send a notification through the hub. Primarily a smoke / explicit user path; model-facing sends use engine tools. | Shows trace id / delivery state. Never echoes full raw payload after dispatch. |
 | `/hub inbox [--limit N]` | Inspect bounded received / pending notification metadata. | Trace id, sender handle, timestamp, state, summary; no raw payload. |
-| `/hub trust list` | Show receiver-owned trust / block state from `~/.pie/hub-trust.json` via embedder API. | Sender handle / agent id suffix, action class, state, created / last used; no raw file dump. |
+| `/hub trust list` | Show **local receiver trust cache** entries from `~/.pie/hub-trust.json` via embedder API. This is distinct from hub-side audit/list tools in §2.3; if both are ever shown, they must be labeled as separate sources. | Sender handle / agent id suffix, action class, state, created / last used; no raw file dump. |
 | `/hub trust revoke <agent_ref>` | Remove an `Always` trust decision for a sender/action tuple. | Confirmation + bounded audit line. |
 | `/hub block <agent_ref>` | Persistently block a sender for notification action class. | Confirmation + bounded audit line. |
 | `/hub unblock <agent_ref>` | Remove a block entry. | Confirmation + bounded audit line. |
