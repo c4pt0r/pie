@@ -45,17 +45,20 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use futures::StreamExt as _;
+use once_cell::sync::Lazy;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Padding, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Padding, Paragraph, Wrap};
+use regex::Regex;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tui_textarea::TextArea;
 
 use crate::agent_session::RetrySettings;
 use crate::commands::{self, CommandCtx, CommandOutcome, Registry};
+use crate::control_plane_prompt::UiControlPlanePrompt;
 use crate::history::HistoryStore;
 use crate::readline::SlashCompleter;
 use crate::{images, mentions};
@@ -72,6 +75,7 @@ const QUEUED_PREVIEW_CHARS: usize = 80;
 const TRIGGER_PANEL_MIN_TOTAL_WIDTH: u16 = 100;
 const TRIGGER_PANEL_WIDTH: u16 = 36;
 const TRIGGER_PANEL_RULE_LIMIT: usize = 5;
+const CONTROL_PROMPT_TEXT_WIDTH: usize = 68;
 
 #[derive(Clone, Debug, Default)]
 pub struct PanelStatus {
@@ -103,6 +107,7 @@ pub struct AppConfig {
     pub pending_images: Vec<PathBuf>,
     pub feed_rx: UnboundedReceiver<FeedUpdate>,
     pub main_run_rx: UnboundedReceiver<String>,
+    pub control_plane_prompt_rx: Option<UnboundedReceiver<UiControlPlanePrompt>>,
     pub panel_status: PanelStatus,
 }
 
@@ -127,6 +132,8 @@ pub struct App {
     latest_goal: Option<crate::goal::GoalState>,
     feed_rx: Option<UnboundedReceiver<FeedUpdate>>,
     main_run_rx: Option<UnboundedReceiver<String>>,
+    control_plane_prompt_rx: Option<UnboundedReceiver<UiControlPlanePrompt>>,
+    control_plane_prompt: Option<UiControlPlanePrompt>,
     panel_status: PanelStatus,
 
     input: TextArea<'static>,
@@ -168,6 +175,8 @@ impl App {
             latest_goal: None,
             feed_rx: Some(config.feed_rx),
             main_run_rx: Some(config.main_run_rx),
+            control_plane_prompt_rx: config.control_plane_prompt_rx,
+            control_plane_prompt: None,
             panel_status: config.panel_status,
             input: new_textarea(),
             completions: Vec::new(),
@@ -313,6 +322,7 @@ impl App {
         let mut tick = tokio::time::interval(Duration::from_millis(100));
         let mut feed_rx = self.feed_rx.take().expect("feed_rx taken once");
         let mut main_run_rx = self.main_run_rx.take().expect("main_run_rx taken once");
+        let mut control_plane_prompt_rx = self.control_plane_prompt_rx.take();
         let mut turn = TurnState::default();
         self.refresh_goal_state().await;
 
@@ -341,6 +351,14 @@ impl App {
                 }
                 Some(trace_id) = main_run_rx.recv(), if turn.fut.is_none() => {
                     self.start_triggered_turn(trace_id, &mut turn);
+                }
+                Some(prompt) = async {
+                    match control_plane_prompt_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => None,
+                    }
+                }, if self.control_plane_prompt.is_none() && control_plane_prompt_rx.is_some() => {
+                    self.show_control_plane_prompt(prompt);
                 }
                 _ = tick.tick() => {
                     if turn.fut.is_some() {
@@ -389,6 +407,38 @@ impl App {
         }
     }
 
+    fn show_control_plane_prompt(&mut self, prompt: UiControlPlanePrompt) {
+        let label = safe_control_prompt_label(&prompt.request.label);
+        self.control_plane_prompt = Some(prompt);
+        self.system_line(format!("approval required: {label}"));
+        self.follow = true;
+    }
+
+    fn resolve_control_plane_prompt(
+        &mut self,
+        decision: pie_agent_core::ControlPlanePromptDecision,
+    ) {
+        let Some(prompt) = self.control_plane_prompt.take() else {
+            return;
+        };
+        let label = safe_control_prompt_label(&prompt.request.label);
+        let message = match &decision {
+            pie_agent_core::ControlPlanePromptDecision::Allow => {
+                format!("approved control-plane action: {label}")
+            }
+            pie_agent_core::ControlPlanePromptDecision::Deny { reason } => {
+                let reason = reason.as_deref().unwrap_or("denied by user");
+                let reason = safe_control_prompt_text(reason, CONTROL_PROMPT_TEXT_WIDTH);
+                format!("denied control-plane action: {label} ({reason})")
+            }
+            pie_agent_core::ControlPlanePromptDecision::Timeout => {
+                format!("control-plane action timed out: {label}")
+            }
+        };
+        prompt.resolve(decision);
+        self.system_line(message);
+    }
+
     // ── event handling ──────────────────────────────────────────────────────────────────
 
     async fn handle_event(
@@ -421,6 +471,9 @@ impl App {
         turn: &mut TurnState,
         terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     ) -> Result<()> {
+        if self.handle_control_plane_prompt_key(&key) {
+            return Ok(());
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -482,6 +535,40 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    fn handle_control_plane_prompt_key(&mut self, key: &KeyEvent) -> bool {
+        if self.control_plane_prompt.is_none() {
+            return false;
+        }
+        if key.kind == KeyEventKind::Release {
+            return true;
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let allow = matches!(
+            key.code,
+            KeyCode::Enter
+                | KeyCode::Char('y')
+                | KeyCode::Char('Y')
+                | KeyCode::Char('a')
+                | KeyCode::Char('A')
+        );
+        let deny = matches!(
+            key.code,
+            KeyCode::Esc
+                | KeyCode::Char('n')
+                | KeyCode::Char('N')
+                | KeyCode::Char('d')
+                | KeyCode::Char('D')
+        ) || (ctrl && matches!(key.code, KeyCode::Char('c')));
+        if allow {
+            self.resolve_control_plane_prompt(pie_agent_core::ControlPlanePromptDecision::Allow);
+        } else if deny {
+            self.resolve_control_plane_prompt(pie_agent_core::ControlPlanePromptDecision::Deny {
+                reason: Some("denied by user".into()),
+            });
+        }
+        true
     }
 
     // ── submit / dispatch ───────────────────────────────────────────────────────────────
@@ -1099,6 +1186,59 @@ impl App {
 
         // Completion popup, drawn above the input over the feed.
         self.render_completions(frame, status_area);
+        self.render_control_plane_prompt(frame);
+    }
+
+    fn render_control_plane_prompt(&self, frame: &mut ratatui::Frame) {
+        let Some(prompt) = self.control_plane_prompt.as_ref() else {
+            return;
+        };
+        let area = frame.area();
+        let width = area.width.clamp(40, 78);
+        let height = area.height.clamp(8, 14);
+        let rect = centered_rect(area, width, height);
+        let request = &prompt.request;
+        let text = vec![
+            Line::styled(
+                "Control-plane approval required",
+                Style::default().fg(Color::Yellow),
+            ),
+            Line::raw(""),
+            Line::raw(format!(
+                "Action: {}",
+                safe_control_prompt_label(&request.label)
+            )),
+            Line::raw(format!(
+                "Tool: {}",
+                safe_control_prompt_text(&request.tool_name, 80)
+            )),
+            Line::raw(format!(
+                "Reason: {}",
+                safe_control_prompt_text(&request.reason, CONTROL_PROMPT_TEXT_WIDTH)
+            )),
+            Line::raw(format!(
+                "Args hash: {}",
+                request.args_hash.chars().take(12).collect::<String>()
+            )),
+            Line::raw(format!(
+                "Preview: {}",
+                safe_control_prompt_payload(&request.payload, CONTROL_PROMPT_TEXT_WIDTH)
+            )),
+            Line::raw(""),
+            Line::styled(
+                "Enter/Y approve · N/D/Esc/Ctrl-C deny",
+                Style::default().fg(Color::Cyan),
+            ),
+        ];
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Confirm ")
+            .border_style(Style::default().fg(Color::Yellow));
+        frame.render_widget(Clear, rect);
+        frame.render_widget(
+            Paragraph::new(text).block(block).wrap(Wrap { trim: true }),
+            rect,
+        );
     }
 
     fn render_trigger_panel(&self, frame: &mut ratatui::Frame, area: Rect) {
@@ -1533,6 +1673,45 @@ fn panel_line(text: String, color: Color, width: usize) -> Line<'static> {
     )
 }
 
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
+}
+
+fn safe_control_prompt_label(text: &str) -> String {
+    safe_control_prompt_text(text, 120)
+}
+
+fn safe_control_prompt_text(text: &str, cap: usize) -> String {
+    let redaction_window = cap.max(1).saturating_mul(4).min(1024);
+    let redacted = redact_control_prompt_secrets(&feed::truncate_chars(text, redaction_window));
+    feed::truncate_chars(&redacted, cap.max(1)).replace('\n', " ")
+}
+
+fn safe_control_prompt_payload(value: &serde_json::Value, cap: usize) -> String {
+    let text = serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string());
+    safe_control_prompt_text(&text, cap)
+}
+
+fn redact_control_prompt_secrets(text: &str) -> String {
+    static TOKENISH_FIELD: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(
+            r#"(?i)(token|secret|password|api[_-]?key|authorization|cookie)(["'=:\s]+)([^"',\s&}]+)"#,
+        )
+        .expect("control prompt redaction regex must compile")
+    });
+    let redacted = crate::bug_report::redact(text);
+    TOKENISH_FIELD
+        .replace_all(&redacted, "$1$2[REDACTED]")
+        .into_owned()
+}
+
 fn panel_rule_preview(text: &str, width: usize) -> String {
     let redacted = crate::bug_report::redact(text).replace('\n', " ");
     feed::truncate_chars(&redacted, width.max(1))
@@ -1676,6 +1855,7 @@ mod tests {
     use pie_ai::{ToolResultMessage, ToolResultRole};
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
+    use tokio_util::sync::CancellationToken;
 
     fn faux_model() -> pie_ai::Model {
         pie_ai::Model {
@@ -1730,6 +1910,7 @@ mod tests {
             pending_images: vec![],
             feed_rx,
             main_run_rx,
+            control_plane_prompt_rx: None,
             panel_status: PanelStatus::default(),
         })
     }
@@ -2426,6 +2607,102 @@ mod tests {
             !text.contains("sk-abcdefghijklmnopqrstuvwxyz123456"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn control_plane_prompt_card_redacts_payload_and_denies_without_clearing_queue() {
+        use pie_agent_core::ControlPlanePromptRequest;
+        use tokio::sync::oneshot;
+
+        let mut app = test_app();
+        app.queue_user_prompt(
+            "queued secret=should-redact".into(),
+            "queued".into(),
+            Vec::new(),
+        );
+        let (tx, _rx) = oneshot::channel();
+        app.show_control_plane_prompt(UiControlPlanePrompt {
+            request: ControlPlanePromptRequest {
+                tool_call_id: "call_1".into(),
+                tool_name: "InstallSkill".into(),
+                args_hash: "abcdef1234567890".repeat(4),
+                label: "Install https://example.com/?token=SECRET_TOKEN".into(),
+                payload: serde_json::json!({
+                    "url": "https://example.com/?token=SECRET_TOKEN",
+                    "args_hash": "abcdef1234567890"
+                }),
+                reason: "writes skill files with password=SECRET_TOKEN".into(),
+            },
+            responder: tx,
+        });
+
+        let backend = TestBackend::new(90, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let rendered = buffer_text(terminal.backend().buffer());
+        assert!(rendered.contains("Control-plane approval required"));
+        assert!(
+            !rendered.contains("SECRET_TOKEN"),
+            "prompt card must redact token-like payloads:\n{rendered}"
+        );
+        assert!(
+            app.handle_control_plane_prompt_key(&KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::empty()
+            ))
+        );
+        assert!(app.control_plane_prompt.is_none());
+        assert_eq!(
+            app.queued_turns.len(),
+            1,
+            "denying a prompt must not clear unrelated queued user input"
+        );
+    }
+
+    #[test]
+    fn headless_control_plane_prompt_hook_denies_with_recovery() {
+        let hook = crate::control_plane_prompt::deny_hook(
+            "control-plane prompt requires an interactive terminal; run pie in a TTY to approve this action",
+        );
+        let decision = futures::executor::block_on(hook(
+            pie_agent_core::ControlPlanePromptRequest {
+                tool_call_id: "call_1".into(),
+                tool_name: "InstallSkill".into(),
+                args_hash: "a".repeat(64),
+                label: "Install skill".into(),
+                payload: serde_json::json!({ "url": "https://example.com/?token=SECRET" }),
+                reason: "writes skill files".into(),
+            },
+            CancellationToken::new(),
+        ));
+        match decision {
+            pie_agent_core::ControlPlanePromptDecision::Deny { reason } => {
+                let reason = reason.unwrap_or_default();
+                assert!(reason.contains("interactive terminal"));
+                assert!(!reason.contains("SECRET"));
+            }
+            other => panic!("expected deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn headless_yes_control_plane_prompt_hook_allows_without_rendering_payload() {
+        let hook = crate::control_plane_prompt::allow_hook();
+        let decision = futures::executor::block_on(hook(
+            pie_agent_core::ControlPlanePromptRequest {
+                tool_call_id: "call_1".into(),
+                tool_name: "InstallSkill".into(),
+                args_hash: "a".repeat(64),
+                label: "Install skill".into(),
+                payload: serde_json::json!({ "url": "https://example.com/?token=SECRET" }),
+                reason: "writes skill files".into(),
+            },
+            CancellationToken::new(),
+        ));
+        assert!(matches!(
+            decision,
+            pie_agent_core::ControlPlanePromptDecision::Allow
+        ));
     }
 
     #[test]

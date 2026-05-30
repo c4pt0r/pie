@@ -37,6 +37,21 @@ fn help_lists_model_catalog_entry_points() {
 }
 
 #[test]
+fn help_lists_control_plane_yes_flag() {
+    let output = Command::new(env!("CARGO_BIN_EXE_pie"))
+        .arg("--help")
+        .output()
+        .expect("run pie --help");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--yes"), "{stdout}");
+    assert!(
+        stdout.contains("Auto-approve control-plane prompts"),
+        "{stdout}"
+    );
+}
+
+#[test]
 fn invalid_thinking_value_reports_candidates() {
     let output = Command::new(env!("CARGO_BIN_EXE_pie"))
         .args(["--thinking", "turbo", "--list-sessions"])

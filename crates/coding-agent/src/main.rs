@@ -12,6 +12,7 @@ mod builtin_skills;
 mod clipboard_image;
 mod commands;
 mod config;
+mod control_plane_prompt;
 mod debug;
 mod export;
 mod extensions;
@@ -115,6 +116,11 @@ struct Cli {
     /// Show LLM call debug logs in the conversation feed, including trigger/sub-agent calls.
     #[arg(long)]
     debug: bool,
+
+    /// Auto-approve control-plane prompts in non-interactive runs. The Web UI still
+    /// fails closed until it has a prompt surface.
+    #[arg(long)]
+    yes: bool,
 
     /// Run the local browser UI instead of the terminal UI. Defaults to loopback-only.
     #[arg(long)]
@@ -405,6 +411,26 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
     opts.turn_continuation_cap = Some(goal::MAX_CONTINUATIONS);
     opts.before_tool_call =
         Some(PermissionPolicy::default_for_coding_agent().as_before_tool_call());
+    let interactive_tui =
+        !cli.web && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let control_plane_prompt_rx = if interactive_tui {
+        let (hook, rx) = control_plane_prompt::interactive_hook();
+        opts.on_control_plane_prompt = Some(hook);
+        Some(rx)
+    } else if cli.web {
+        opts.on_control_plane_prompt = Some(control_plane_prompt::deny_hook(
+            "control-plane prompts are not available in the Web UI yet; run pie in the terminal UI to approve this action",
+        ));
+        None
+    } else if cli.yes {
+        opts.on_control_plane_prompt = Some(control_plane_prompt::allow_hook());
+        None
+    } else {
+        opts.on_control_plane_prompt = Some(control_plane_prompt::deny_hook(
+            "control-plane prompt requires an interactive terminal; run pie in a TTY to approve this action",
+        ));
+        None
+    };
     // Triggers from MCP servers configured with `inject_summary` / `inject_and_run` bypass
     // the sub-agent and inject their pushed summary into chat (the latter also runs one
     // model turn in the parent context); everything else falls through to the dynamic-rule
@@ -508,6 +534,7 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
         pending_images: std::mem::take(&mut cli.image),
         feed_rx,
         main_run_rx,
+        control_plane_prompt_rx,
         panel_status: ui::PanelStatus {
             mcp_servers: mcp.client_count,
             mcp_tools: mcp_tool_count,
@@ -690,6 +717,7 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
 fn active_hook_registrations(lsp_lang_count: usize, cli_hooks_loaded: bool) -> Vec<String> {
     let mut points = vec![
         "before_tool_call".to_string(),
+        "on_control_plane_prompt".to_string(),
         "before_trigger_action".to_string(),
     ];
     if lsp_lang_count > 0 {
@@ -945,6 +973,7 @@ mod tests {
             builtin_skill: Vec::new(),
             trigger_poll_secs: None,
             debug: false,
+            yes: false,
             web: false,
             web_host: "127.0.0.1".into(),
             web_port: 0,
