@@ -6,10 +6,14 @@ use std::sync::Mutex;
 
 use axum::Router;
 use axum::extract::State;
+use axum::http::HeaderMap;
+use axum::response::IntoResponse;
+use axum::response::Response;
 use axum::routing::post;
 use pie_agent_core::{
     AgentHarness, AgentHarnessOptions, MemorySessionStorage, Session, SessionStorage,
 };
+use serde_json::json;
 
 #[path = "../src/auth.rs"]
 mod auth;
@@ -27,6 +31,8 @@ mod goal;
 mod history;
 #[path = "../src/hub_auth.rs"]
 mod hub_auth;
+#[path = "../src/hub_client.rs"]
+mod hub_client;
 #[path = "../src/hub_join.rs"]
 mod hub_join;
 #[path = "../src/mcp_loader.rs"]
@@ -118,6 +124,16 @@ struct FauxHubJoinServer {
     state: Arc<tokio::sync::Mutex<FauxHubJoinState>>,
 }
 
+#[derive(Default)]
+struct FauxHubMcpState {
+    calls: Vec<serde_json::Value>,
+}
+
+struct FauxHubMcpServer {
+    endpoint: String,
+    state: Arc<tokio::sync::Mutex<FauxHubMcpState>>,
+}
+
 impl FauxHubJoinServer {
     async fn start() -> Self {
         let state = Arc::new(tokio::sync::Mutex::new(FauxHubJoinState::default()));
@@ -204,6 +220,129 @@ async fn drive_faux_hub_join_browser(
         .unwrap();
     assert!(response.status().is_success());
     response.text().await.unwrap()
+}
+
+impl FauxHubMcpServer {
+    async fn start() -> Self {
+        let state = Arc::new(tokio::sync::Mutex::new(FauxHubMcpState::default()));
+        let app = Router::new()
+            .route("/mcp", post(faux_hub_mcp_post).get(faux_hub_mcp_get))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        Self { endpoint, state }
+    }
+}
+
+async fn faux_hub_mcp_get(headers: HeaderMap) -> Response {
+    if let Some(response) = check_mcp_auth(&headers) {
+        return response;
+    }
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+        "event: keepalive\ndata: {}\n\n",
+    )
+        .into_response()
+}
+
+async fn faux_hub_mcp_post(
+    State(state): State<Arc<tokio::sync::Mutex<FauxHubMcpState>>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    if let Some(response) = check_mcp_auth(&headers) {
+        return response;
+    }
+    let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let Some(id) = payload.get("id").cloned() else {
+        return axum::http::StatusCode::ACCEPTED.into_response();
+    };
+    let method = payload.get("method").and_then(|m| m.as_str()).unwrap();
+    let result = match method {
+        "initialize" => json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "serverInfo": {"name": "pie-hub", "version": "test"}
+        }),
+        "tools/call" => {
+            let params = payload["params"].clone();
+            state.lock().await.calls.push(params.clone());
+            let tool = params["name"].as_str().unwrap();
+            let output = match tool {
+                "get_agent_profile" => json!({
+                    "agent": {
+                        "agent_id": "018fe23a-2222-4a22-8b33-123456789abc",
+                        "handle": "bob",
+                        "namespace": "dongxu",
+                        "display_name": "Bob Cheng",
+                        "capabilities": ["notify"],
+                        "discoverable": "public",
+                        "inbox": "open"
+                    }
+                }),
+                "discover_public_agents" => json!({
+                    "items": [
+                        {
+                            "agent_id": "018fe23a-2222-4a22-8b33-123456789abc",
+                            "handle": "bob",
+                            "namespace": "dongxu",
+                            "display_name": "Bob Cheng",
+                            "capabilities": ["notify"],
+                            "discoverable": "public",
+                            "inbox": "open"
+                        },
+                        {
+                            "agent_id": "018fe23a-3333-4a22-8b33-123456789abc",
+                            "handle": "beth",
+                            "namespace": "research",
+                            "display_name": "Beth Park",
+                            "capabilities": ["notify"],
+                            "discoverable": "public",
+                            "inbox": "namespace"
+                        }
+                    ],
+                    "next_cursor": null
+                }),
+                "send_notification" => json!({
+                    "notification_id": "018fe23a-4444-4a22-8b33-123456789abc",
+                    "status": "queued",
+                    "first_contact_required": true
+                }),
+                "list_my_inbox" => json!({
+                    "items": [{
+                        "notification_id": "018fe23a-5555-4a22-8b33-123456789abc",
+                        "sender_agent_id": "018fe23a-6666-4a22-8b33-123456789abc",
+                        "sender": "@alice@dongxu",
+                        "summary": "hello from alice",
+                        "payload_visibility": "Local",
+                        "first_contact_required": true,
+                        "status": "pending",
+                        "created_at": "2026-05-30T20:00:00Z",
+                        "delivered_at": null
+                    }],
+                    "next_cursor": null
+                }),
+                other => panic!("unexpected tool {other}"),
+            };
+            json!({"content": [{"type": "text", "text": output.to_string()}]})
+        }
+        other => panic!("unexpected method {other}"),
+    };
+    axum::Json(json!({"jsonrpc": "2.0", "id": id, "result": result})).into_response()
+}
+
+fn check_mcp_auth(headers: &HeaderMap) -> Option<Response> {
+    let auth = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if auth != "Bearer hub_agent_command_secret" {
+        return Some(axum::http::StatusCode::UNAUTHORIZED.into_response());
+    }
+    None
 }
 
 #[tokio::test]
@@ -317,4 +456,172 @@ async fn hub_join_command_success_outputs_safe_user_text_and_stores_credential()
     assert!(!text.contains("MCP"), "{text}");
     assert!(!text.contains("mcp"), "{text}");
     assert!(!text.contains("config"), "{text}");
+}
+
+#[tokio::test]
+async fn hub_send_command_resolves_mentions_and_outputs_bounded_status() {
+    let _auth_guard = auth::ENV_LOCK.lock().unwrap();
+    let _pie_guard = PIE_DIR_ENV_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let _pie_dir = EnvGuard::set("PIE_DIR", temp.path());
+    let mut store = auth::AuthStore::default();
+    store.set(
+        hub_auth::HUB_TOKEN_REF,
+        auth::ProviderCredential::ApiKey {
+            value: "hub_agent_command_secret".into(),
+        },
+    );
+    store.save().unwrap();
+
+    let server = FauxHubMcpServer::start().await;
+    let _endpoint_guard = hub_client::install_test_endpoint(server.endpoint.clone());
+    let capture = OutputCapture::install();
+
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage as Arc<dyn SessionStorage>);
+    let opts = AgentHarnessOptions::new(faux_model(), session);
+    let harness = Arc::new(AgentHarness::new(opts));
+    let registry = commands::Registry::with_builtins();
+    let cwd = std::env::current_dir().unwrap();
+    let ctx = commands::CommandCtx {
+        harness: &harness,
+        session_id: "test-hub-send-command",
+        log_path: None::<&PathBuf>,
+        tool_count: 0,
+        cwd: &cwd,
+    };
+
+    let outcome = commands::dispatch(
+        "/hub send @bob@dongxu \"hello from alice\"",
+        &registry,
+        &ctx,
+    )
+    .await;
+    assert!(matches!(outcome, commands::CommandOutcome::Handled));
+
+    let text = capture.text();
+    assert!(
+        text.contains("sent hub notification to @bob@dongxu"),
+        "{text}"
+    );
+    assert!(text.contains("hello from alice"), "{text}");
+    assert!(text.contains("queued for first-contact review"), "{text}");
+    assert!(text.contains("payload       Local (not sent)"), "{text}");
+    assert!(!text.contains("hub_agent_command_secret"), "{text}");
+    assert!(!text.contains("pie-hub:default"), "{text}");
+    assert!(!text.contains("018fe23a"), "{text}");
+    assert!(!text.contains("target_agent_id"), "{text}");
+    assert!(!text.contains("MCP"), "{text}");
+
+    let calls = server.state.lock().await.calls.clone();
+    let send = calls
+        .iter()
+        .find(|call| call["name"] == "send_notification")
+        .expect("send_notification call");
+    assert_eq!(
+        send["arguments"]["target_agent_id"].as_str(),
+        Some("018fe23a-2222-4a22-8b33-123456789abc")
+    );
+    assert_eq!(
+        send["arguments"]["payload_visibility"].as_str(),
+        Some("Local")
+    );
+    assert!(send["arguments"].get("payload").is_none());
+}
+
+#[tokio::test]
+async fn hub_inbox_command_outputs_bounded_read_only_feed() {
+    let _auth_guard = auth::ENV_LOCK.lock().unwrap();
+    let _pie_guard = PIE_DIR_ENV_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let _pie_dir = EnvGuard::set("PIE_DIR", temp.path());
+    let mut store = auth::AuthStore::default();
+    store.set(
+        hub_auth::HUB_TOKEN_REF,
+        auth::ProviderCredential::ApiKey {
+            value: "hub_agent_command_secret".into(),
+        },
+    );
+    store.save().unwrap();
+
+    let server = FauxHubMcpServer::start().await;
+    let _endpoint_guard = hub_client::install_test_endpoint(server.endpoint.clone());
+    let capture = OutputCapture::install();
+
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage as Arc<dyn SessionStorage>);
+    let opts = AgentHarnessOptions::new(faux_model(), session);
+    let harness = Arc::new(AgentHarness::new(opts));
+    let registry = commands::Registry::with_builtins();
+    let cwd = std::env::current_dir().unwrap();
+    let ctx = commands::CommandCtx {
+        harness: &harness,
+        session_id: "test-hub-inbox-command",
+        log_path: None::<&PathBuf>,
+        tool_count: 0,
+        cwd: &cwd,
+    };
+
+    let outcome = commands::dispatch("/hub inbox", &registry, &ctx).await;
+    assert!(matches!(outcome, commands::CommandOutcome::Handled));
+
+    let text = capture.text();
+    assert!(text.contains("Hub inbox:"), "{text}");
+    assert!(text.contains("@alice@dongxu"), "{text}");
+    assert!(text.contains("hello from alice"), "{text}");
+    assert!(text.contains("first-contact · payload Local"), "{text}");
+    assert!(!text.contains("hub_agent_command_secret"), "{text}");
+    assert!(!text.contains("pie-hub:default"), "{text}");
+    assert!(!text.contains("018fe23a"), "{text}");
+    assert!(!text.contains("notification_id"), "{text}");
+    assert!(!text.contains("MCP"), "{text}");
+}
+
+#[tokio::test]
+async fn hub_send_prefix_lookup_lists_safe_mentions() {
+    let _auth_guard = auth::ENV_LOCK.lock().unwrap();
+    let _pie_guard = PIE_DIR_ENV_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let _pie_dir = EnvGuard::set("PIE_DIR", temp.path());
+    let mut store = auth::AuthStore::default();
+    store.set(
+        hub_auth::HUB_TOKEN_REF,
+        auth::ProviderCredential::ApiKey {
+            value: "hub_agent_command_secret".into(),
+        },
+    );
+    store.save().unwrap();
+
+    let server = FauxHubMcpServer::start().await;
+    let _endpoint_guard = hub_client::install_test_endpoint(server.endpoint.clone());
+    let capture = OutputCapture::install();
+
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage as Arc<dyn SessionStorage>);
+    let opts = AgentHarnessOptions::new(faux_model(), session);
+    let harness = Arc::new(AgentHarness::new(opts));
+    let registry = commands::Registry::with_builtins();
+    let cwd = std::env::current_dir().unwrap();
+    let ctx = commands::CommandCtx {
+        harness: &harness,
+        session_id: "test-hub-send-prefix-lookup",
+        log_path: None::<&PathBuf>,
+        tool_count: 0,
+        cwd: &cwd,
+    };
+
+    let outcome = commands::dispatch("/hub send @bo", &registry, &ctx).await;
+    assert!(matches!(outcome, commands::CommandOutcome::Handled));
+
+    let text = capture.text();
+    assert!(text.contains("Matching hub agents:"), "{text}");
+    assert!(text.contains("@bob@dongxu"), "{text}");
+    assert!(text.contains("Bob Cheng"), "{text}");
+    assert!(
+        text.contains("use /hub send @handle@namespace \"message\""),
+        "{text}"
+    );
+    assert!(!text.contains("hub_agent_command_secret"), "{text}");
+    assert!(!text.contains("018fe23a"), "{text}");
+    assert!(!text.contains("MCP"), "{text}");
 }

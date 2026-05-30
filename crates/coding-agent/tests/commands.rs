@@ -51,6 +51,9 @@ mod history;
 #[path = "../src/hub_auth.rs"]
 mod hub_auth;
 #[allow(dead_code)]
+#[path = "../src/hub_client.rs"]
+mod hub_client;
+#[allow(dead_code)]
 #[path = "../src/hub_join.rs"]
 mod hub_join;
 #[allow(dead_code)]

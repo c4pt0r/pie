@@ -1045,13 +1045,15 @@ impl SlashCommand for HubCommand {
     }
 
     fn usage(&self) -> &'static str {
-        "[status|join|connect|logout]"
+        "[status|join|send|inbox|connect|logout]"
     }
 
     async fn run(&self, argv: &[String], ctx: &CommandCtx<'_>) -> CommandOutcome {
         match argv.first().map(String::as_str) {
             None | Some("status") => hub_status(ctx),
             Some("join") => hub_join(argv).await,
+            Some("send") => hub_send(&argv[1..]).await,
+            Some("inbox") => hub_inbox(&argv[1..]).await,
             Some("connect") => hub_connect(&argv[1..]).await,
             Some("login") => {
                 if argv.len() != 1 {
@@ -1071,13 +1073,15 @@ impl SlashCommand for HubCommand {
             }
             Some("logout") => hub_logout(),
             Some(
-                "register" | "profile" | "visibility" | "list" | "send" | "inbox" | "trust"
-                | "block" | "unblock" | "rotate",
+                "register" | "profile" | "visibility" | "list" | "trust" | "block" | "unblock"
+                | "rotate",
             ) => CommandOutcome::Error(format!(
                 "/hub {} is not wired in this client slice yet; use /hub status first; /hub join is the onboarding path",
                 argv[0]
             )),
-            Some(_) => CommandOutcome::Error("usage: /hub [status|join|connect|logout]".into()),
+            Some(_) => {
+                CommandOutcome::Error("usage: /hub [status|join|send|inbox|connect|logout]".into())
+            }
         }
     }
 }
@@ -1140,6 +1144,110 @@ fn hub_status(ctx: &CommandCtx<'_>) -> CommandOutcome {
     CommandOutcome::Handled
 }
 
+async fn hub_send(argv: &[String]) -> CommandOutcome {
+    if argv.len() == 1 && argv[0].starts_with('@') {
+        return hub_send_suggestions(&argv[0]).await;
+    }
+    let args = match parse_hub_send_args(argv) {
+        Ok(args) => args,
+        Err(e) => return CommandOutcome::Error(e),
+    };
+    let client = match crate::hub_client::HubClient::connect_default().await {
+        Ok(client) => client,
+        Err(e) => return CommandOutcome::Error(hub_recovery_error("hub send failed", &e)),
+    };
+    let target = match client.resolve_agent(&args.target).await {
+        Ok(target) => target,
+        Err(e) => {
+            client.close().await;
+            return CommandOutcome::Error(hub_recovery_error("hub target lookup failed", &e));
+        }
+    };
+    let receipt = match client
+        .send_notification(&target.agent_id, &args.summary)
+        .await
+    {
+        Ok(receipt) => receipt,
+        Err(e) => {
+            client.close().await;
+            return CommandOutcome::Error(hub_recovery_error("hub send failed", &e));
+        }
+    };
+    client.close().await;
+
+    cprintln!(
+        "sent hub notification to {} ({})",
+        target.mention(),
+        preview_agent_label(&target)
+    );
+    cprintln!("  summary       {}", preview_text(&args.summary, 120));
+    cprintln!("  delivery      {}", render_hub_delivery(&receipt));
+    cprintln!("  payload       Local (not sent)");
+    CommandOutcome::Handled
+}
+
+async fn hub_send_suggestions(prefix: &str) -> CommandOutcome {
+    let client = match crate::hub_client::HubClient::connect_default().await {
+        Ok(client) => client,
+        Err(e) => return CommandOutcome::Error(hub_recovery_error("hub lookup failed", &e)),
+    };
+    let agents = match client.matching_agents(prefix, 5).await {
+        Ok(agents) => agents,
+        Err(e) => {
+            client.close().await;
+            return CommandOutcome::Error(hub_recovery_error("hub lookup failed", &e));
+        }
+    };
+    client.close().await;
+
+    if agents.is_empty() {
+        return CommandOutcome::Error(
+            "no matching public hub agent; use /hub send @handle@namespace \"message\"".into(),
+        );
+    }
+    cprintln!("Matching hub agents:");
+    for agent in agents {
+        cprintln!("  {}  {}", agent.mention(), preview_agent_label(&agent));
+    }
+    cprintln!("use /hub send @handle@namespace \"message\"");
+    CommandOutcome::Handled
+}
+
+async fn hub_inbox(argv: &[String]) -> CommandOutcome {
+    let limit = match parse_hub_inbox_args(argv) {
+        Ok(limit) => limit,
+        Err(e) => return CommandOutcome::Error(e),
+    };
+    let client = match crate::hub_client::HubClient::connect_default().await {
+        Ok(client) => client,
+        Err(e) => return CommandOutcome::Error(hub_recovery_error("hub inbox failed", &e)),
+    };
+    let items = match client.list_inbox(limit).await {
+        Ok(items) => items,
+        Err(e) => {
+            client.close().await;
+            return CommandOutcome::Error(hub_recovery_error("hub inbox failed", &e));
+        }
+    };
+    client.close().await;
+
+    cprintln!("Hub inbox:");
+    if items.is_empty() {
+        cprintln!("  (empty)");
+        return CommandOutcome::Handled;
+    }
+    for item in items {
+        cprintln!(
+            "  {}  {}  {}",
+            preview_mention(&item.sender),
+            preview_text(&item.summary, 120),
+            render_inbox_flags(&item)
+        );
+        cprintln!("      status {} · {}", item.status, item.created_at);
+    }
+    CommandOutcome::Handled
+}
+
 async fn hub_connect(argv: &[String]) -> CommandOutcome {
     let parsed = match parse_hub_connect_args(argv) {
         Ok(parsed) => parsed,
@@ -1186,6 +1294,90 @@ fn hub_logout() -> CommandOutcome {
     }
     cprintln!("run /hub join to store a new hub credential");
     CommandOutcome::Handled
+}
+
+struct HubSendArgs {
+    target: String,
+    summary: String,
+}
+
+fn parse_hub_send_args(argv: &[String]) -> Result<HubSendArgs, String> {
+    if argv.len() < 2 {
+        return Err("usage: /hub send @handle@namespace \"message\"".into());
+    }
+    if argv
+        .iter()
+        .any(|arg| arg == "--shared" || arg == "--payload")
+    {
+        return Err("usage: /hub send @handle@namespace \"message\" (payload is Local-only in this client slice)".into());
+    }
+    let target = argv[0].clone();
+    if crate::hub_client::parse_mention(&target).is_none() {
+        return Err("hub send target must be @handle@namespace".into());
+    }
+    let summary = argv[1..].join(" ").trim().to_string();
+    if summary.is_empty() {
+        return Err("hub send message cannot be empty".into());
+    }
+    if summary.chars().count() > 240 {
+        return Err("hub send message must be at most 240 characters".into());
+    }
+    Ok(HubSendArgs { target, summary })
+}
+
+fn parse_hub_inbox_args(argv: &[String]) -> Result<usize, String> {
+    match argv {
+        [] => Ok(10),
+        [flag, value] if flag == "--limit" => value
+            .parse::<usize>()
+            .ok()
+            .filter(|limit| (1..=10).contains(limit))
+            .ok_or_else(|| "usage: /hub inbox [--limit 1..10]".to_string()),
+        _ => Err("usage: /hub inbox [--limit 1..10]".into()),
+    }
+}
+
+fn hub_recovery_error(prefix: &str, error: &anyhow::Error) -> String {
+    format!(
+        "{prefix}: {}; run /hub status or /hub join",
+        preview_text(&redact_hub_status_text(&error.to_string()), 160)
+    )
+}
+
+fn render_hub_delivery(receipt: &crate::hub_client::HubSendReceipt) -> &'static str {
+    if receipt.first_contact_required {
+        "queued for first-contact review"
+    } else if receipt.status == "delivered" {
+        "delivered"
+    } else {
+        "queued"
+    }
+}
+
+fn preview_agent_label(agent: &crate::hub_client::HubAgentSummary) -> String {
+    let label = agent
+        .display_name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("hub agent");
+    format!("{} · inbox {}", preview_text(label, 48), agent.inbox)
+}
+
+fn preview_mention(sender: &str) -> String {
+    if crate::hub_client::parse_mention(sender).is_some() {
+        sender.to_string()
+    } else {
+        "<hub sender>".into()
+    }
+}
+
+fn render_inbox_flags(item: &crate::hub_client::HubInboxItem) -> String {
+    let contact = if item.first_contact_required {
+        "first-contact"
+    } else {
+        "trusted"
+    };
+    format!("{contact} · payload {}", item.payload_visibility)
 }
 
 struct HubConnectArgs {
