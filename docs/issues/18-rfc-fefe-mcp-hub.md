@@ -14,7 +14,7 @@
 > - §6a Client integration (contract + runtime boundary) — @Tools-MCP-Lead
 > - §6b `/hub *` CLI / TUI surface — @CLI-TUI-Dev-Lead
 > - §7 Worker implementation + storage model — **TBD**
-> - §8 Deployment / `~/cf_token` boundary / CI / acceptance / release gate — @QA-Release-Lead
+> - §8 Deployment / `CF_API_KEY` boundary / CI / acceptance / release gate — @QA-Release-Lead
 
 ## Goal
 
@@ -88,14 +88,14 @@ This does NOT change the "no real Cloudflare in build/test CI" rule (§8). Build
 | §   | Title                                                          | Owner                                       | Status              |
 | --- | -------------------------------------------------------------- | ------------------------------------------- | ------------------- |
 | 1   | Architecture overview                                          | @Tools-MCP-Lead + @Runtime-dev-lead         | TBD                 |
-| 2   | Hub MCP protocol surface                                       | @Tools-MCP-Lead                             | TBD                 |
-| 3   | Identity / Auth / Session / Namespace / Agent registry         | @Provider-Auth-Lead                         | TBD                 |
+| 2   | Hub MCP protocol surface                                       | @Tools-MCP-Lead                             | **v0.1 draft**      |
+| 3   | Identity / Auth / Session / Namespace / Agent registry         | @Provider-Auth-Lead                         | **draft v0.1**      |
 | 4   | Visibility model                                               | @alice                                      | **seed draft below** |
-| 5   | Notification routing / delivery semantics                      | @Runtime-dev-lead                           | TBD                 |
+| 5   | Notification routing / delivery semantics                      | @Runtime-dev-lead                           | **v0.1 draft**      |
 | 6a  | Client integration (contract + runtime boundary)               | @Tools-MCP-Lead                             | TBD                 |
 | 6b  | `/hub *` CLI / TUI surface                                     | @CLI-TUI-Dev-Lead                           | TBD                 |
 | 7   | Worker implementation + storage                                | **TBD**                                     | TBD                 |
-| 8   | Deployment / `~/cf_token` / CI / acceptance / release gate     | @QA-Release-Lead                            | TBD                 |
+| 8   | Deployment / `CF_API_KEY` / CI / acceptance / release gate     | @QA-Release-Lead                            | **v0.1 draft**      |
 
 ---
 
@@ -325,15 +325,174 @@ cites. First-to-draft fixes the name (per the protocol agreed
 
 ## §3 Identity / Auth / Session / Namespace / Agent registry
 
-TBD — @Provider-Auth-Lead.
+Draft v0.1 — @Provider-Auth-Lead.
 
-Scope (per 2026-05-29 discussion):
+### §3.1 Security model summary
 
-- Human account: username + password registration, password hashing, session expiry / revocation, rate limit.
-- Agent credential: hub-issued token scoped to `{user_id, namespace, agent_id, permissions}`. Rotatable, revocable, server stores hash + identifier only — never plaintext.
-- Trust scope minimum tuple for `Always` grants: `{receiver_agent_id, sender_agent_id, action_class=notification}`. Any extension to namespace / team scope requires explicit risk write-up + UI copy.
-- `discoverable` controls listing only; `inbox` controls write. Every send path re-authorizes against `inbox` policy — discover result is never an authorization input.
-- MCP errors return recovery hints (re-login, re-register agent, token revoked). Never echo tokens, namespace secrets, internal binding names.
+`pie.0xfefe.me` has its own identity and credential plane. It MUST NOT reuse or proxy provider
+credentials such as OpenAI / Anthropic / Deepseek / Bedrock / Vertex API keys.
+
+Credential classes:
+
+| Credential class | Holder | Purpose | Storage | May appear in session/audit/logs? |
+| ---------------- | ------ | ------- | ------- | --------------------------------- |
+| Human password | Human account login | Establish a browser / admin session | Password hash only | No |
+| Human session | Browser / admin website | Manage namespace, agents, visibility, tokens | Server-side session id hash or signed session with server revocation | Session id no; bounded account id yes |
+| Agent token | Pie agent / external MCP client | Authenticate MCP calls for one registered agent | Server stores token hash + token id only | Token no; token id yes |
+| Cloudflare deploy token (`CF_API_KEY`) | GitHub Actions protected deploy job | Deploy Worker | GitHub encrypted secret | No |
+| Provider API key | Local pie runtime | LLM provider calls | Local `~/.pie/auth.json` | No; never leaves local provider plane |
+
+Auth invariant: every MCP call is authorized from the authenticated `agent_id` (or human session
+for admin tools), not from a display handle, discovery result, provider credential, IP address, or
+caller-supplied namespace string.
+
+### §3.2 Human account and namespace
+
+Human accounts create and own namespaces. A namespace is the root of agent ownership, registry
+management, and default same-namespace trust.
+
+Requirements:
+
+- Registration accepts `username`, `password`, and optional display metadata. The server derives a
+  canonical `namespace` slug from the username or an explicit namespace claim. Namespace slugs are
+  immutable after creation in v0.
+- Passwords are stored only as slow password hashes (`argon2id` preferred; bcrypt acceptable if the
+  Worker runtime constrains argon2 availability). The RFC implementation PR MUST document the hash
+  algorithm and parameters.
+- Login returns a human session for the admin website / control plane. Human sessions are short-lived
+  and revocable. Recommended v0 defaults: 24 hour idle timeout, 30 day absolute max, revoke-all
+  endpoint after password change.
+- Registration, login, password reset / rotation, and token creation endpoints are rate limited by
+  source IP and account/namespace. Rate-limit responses are bounded recovery errors.
+- Human sessions can create / rotate / revoke agent tokens, update agent profile fields, and change
+  visibility / inbox settings. Human sessions MUST NOT access provider credentials.
+
+### §3.3 Agent registration and token lifecycle
+
+Agent registration binds one agent to exactly one namespace and yields a globally unique immutable
+`agent_id`.
+
+Registration flow:
+
+1. Human-authenticated control plane requests `register_agent` with profile fields from §4.
+2. Hub allocates UUID `agent_id`, validates namespace-local `handle`, stores profile + visibility
+   defaults, and issues an agent token once.
+3. The token is shown only once to the human / CLI installer. After that the hub stores only
+   `{token_id, token_hash, agent_id, namespace, permissions, created_at, expires_at?, revoked_at?}`.
+
+Token requirements:
+
+- Token scope minimum: `{user_id, namespace, agent_id, permissions}`.
+- Permissions are explicit capability strings. v0 minimum set:
+  - `agent:read_self`
+  - `agent:update_self_profile`
+  - `agent:list_namespace`
+  - `agent:discover_public`
+  - `agent:delete_self`
+  - `notification:send`
+  - `notification:receive`
+  - `token:rotate_self`
+  - `trust:list`
+  - `trust:revoke`
+  - `trust:block`
+  - `trust:unblock`
+- Tokens are rotatable and revocable. Rotation creates a new token id and revokes the old token id.
+  In-flight SSE connections authenticated with a revoked token must close with a bounded
+  `auth_revoked` event or terminate on next heartbeat.
+- Token plaintext MUST NOT appear in MCP request/response bodies after issuance, notification
+  payloads, Worker logs, audit records, GitHub Actions logs, or bug reports.
+- Agent token auth uses the HTTP `Authorization` header (`Bearer <token>`) for Streamable HTTP.
+  The MCP JSON-RPC body MUST NOT carry credentials.
+
+### §3.4 Request authentication and authorization
+
+The hub authenticates first, then authorizes each tool/resource/notification action against the
+effective principal.
+
+Effective principals:
+
+- `HumanPrincipal { user_id, namespace, session_id }` for admin website / token management.
+- `AgentPrincipal { user_id, namespace, agent_id, permissions, token_id }` for MCP client calls.
+
+Authorization rules:
+
+- Trust-sensitive tool arguments use `agent_id` UUID. `agent_handle` is accepted only as a resolver
+  convenience where §2 explicitly allows it; resolver output is an `agent_id`, and all subsequent
+  authorization/audit uses the `agent_id`.
+- Caller-supplied `namespace`, `handle`, or profile metadata never overrides the namespace/agent id
+  derived from the authenticated credential.
+- `discoverable` controls listing only. `inbox` controls write. Every `send_notification` call
+  rechecks the receiver's `inbox`, trust list, block list, sender namespace, sender `agent_id`, and
+  sender permissions.
+- Same-namespace direct route in §4.2 still requires authenticated sender token with
+  `notification:send` and an active receiver with `notification:receive` enabled.
+- Cross-namespace first-contact prompts key on immutable ids:
+  `{receiver_agent_id, sender_agent_id, action_class=notification}`. Handles are display-only.
+- Any future widening of trust scope (namespace/team/all-tools) requires an RFC update with risk,
+  UI copy, and tests.
+
+### §3.5 Error and recovery vocabulary
+
+MCP auth errors must be bounded, stable, and actionable. They must not reveal tokens, token hashes,
+internal binding names, database ids, namespace secrets, Cloudflare account ids, or raw profile
+metadata.
+
+Recommended error shape (exact JSON-RPC code assignment belongs in §2):
+
+| Condition | Public error code | Recovery hint |
+| --------- | ----------------- | ------------- |
+| Missing `Authorization` | `auth_required` | Login or register this agent with the hub. |
+| Invalid / malformed token | `auth_invalid` | Re-register the agent or rotate the hub token. |
+| Revoked token | `auth_revoked` | Rotate the token from the admin website or `/hub login`. |
+| Expired human session | `session_expired` | Sign in again. |
+| Permission missing | `permission_denied` | Check the target agent visibility / inbox policy or request an invite. |
+| Unknown `agent_id` | `not_found` | Verify the target agent id or discover the agent again. |
+| Rate limited | `rate_limited` | Retry after the provided bounded `retry_after_ms`. |
+
+Messages are written for users and LLM clients. Avoid internal vocabulary such as "D1 binding",
+"wrangler", "token hash mismatch", "options.api_key", or raw exception text.
+
+### §3.6 Audit and redaction
+
+Auth and registry audit records are required for debugging and abuse response, but they carry only
+bounded metadata.
+
+Allowed audit fields:
+
+- `event_type`, `actor_kind`, `user_id`, `namespace`, `agent_id`, `receiver_agent_id`
+- `token_id` (never token plaintext or hash)
+- `permission`, `action_class`, `decision`, `reason_code`
+- `profile_field_names_changed` (names only; not full values unless values are already public list
+  fields and bounded)
+- `trace_id`, `request_id`, `created_at`, `expires_at`, `revoked_at`
+
+Forbidden everywhere outside one-time issuance UI:
+
+- Agent token plaintext, human session id, password / password hash, provider API keys, `CF_API_KEY`
+- Raw notification payload when `payload_visibility` is not public display metadata
+- Secret-bearing profile fields, URLs with userinfo/query tokens, stack traces with headers
+
+### §3.7 Threat model checkpoints
+
+The implementation and §8 acceptance matrix must cover these auth-specific threats:
+
+- Public discovery being treated as write authorization.
+- Handle rename bypassing trust/block lists.
+- Token copied from one agent being usable as another agent.
+- Revoked token keeping an SSE connection alive indefinitely.
+- PR/fork CI accessing `CF_API_KEY`.
+- Worker logs or error reports containing bearer tokens or notification payload secrets.
+- Agent profile prompt injection via markdown links / URLs / overlong descriptions.
+- Cross-namespace sender probing whether it is blocked versus unknown versus denied.
+
+### §3.8 Open questions
+
+| ID | Question | Provider/Auth take |
+| --- | -------- | ------------------ |
+| §3.OQ-1 | Exact password hash in Cloudflare Worker runtime? | Prefer `argon2id`; if unavailable, document bcrypt/scrypt fallback and parameters before implementation. |
+| §3.OQ-2 | Agent token expiry default? | Prefer long-lived but rotatable tokens with optional expiry; require revoke/rotate before v0 deploy. |
+| §3.OQ-3 | Should same-namespace sends bypass first-contact permanently? | Yes for v0, but still require `notification:send` / `notification:receive` permissions and audit. |
+| §3.OQ-4 | Can external non-pie MCP clients register agents? | Yes if they use the same human session / agent token model; no provider credentials accepted. |
 
 ## §4 Visibility model — seed draft (@alice)
 
@@ -954,6 +1113,7 @@ Owned by @QA-Release-Lead in §8. Required contents:
 | RFC-OQ-6      | Handle character set `[a-z0-9_-]{2,32}` — confirm or widen? (§4.OQ-5)                      | @alice: lock at this for v0.                          |
 | RFC-OQ-7      | Collapse `inbox=open` and `inbox=invited` in v0? (§4.OQ-6)                                 | @alice: lean keep both as operator signal. Tools-MCP +1 keep-both (sender-side invitation-token semantic distinction). |
 | ~~RFC-OQ-8~~  | Deploy mechanism for `pie.0xfefe.me`: manual or CI auto-deploy?                            | **RESOLVED 2026-05-29 by @EdHuang: CI auto-deploy via GitHub Actions.** EdHuang provides a GitHub repository secret named `CF_API_KEY`. Secret stays inside GitHub Actions (encrypted secret + protected environment); never enters repo, PR body, workflow logs, artifacts, cache, test fixtures, runtime config, session, audit, bug report, or any MCP payload. Secret-hardening requirements detailed in §8 (deploy gate). Reversed an earlier 2026-05-29 manual-deploy decision; superseded entry kept in change log. |
+| RFC-OQ-9      | Agent token expiry default? (§3.OQ-2)                                                       | @Provider-Auth-Lead: prefer long-lived but rotatable tokens with mandatory revoke/rotate support before v0 deploy. |
 
 ### Change log
 
@@ -971,3 +1131,4 @@ Owned by @QA-Release-Lead in §8. Required contents:
 | 2026-05-29 | @QA-Release-Lead | §8 v0.1: expanded phased release gates, `CF_API_KEY` GitHub Actions hardening, threat model minimums, per-phase acceptance matrix, deployed-Worker e2e scenarios, and bounded release report format. |
 | 2026-05-29 | @Tools-MCP-Lead | §2 v0.1: Hub MCP protocol surface — overview, versioning, tools (control-plane / discovery / messaging / trust-block), resources, server-push notifications, error codes, body caps + rate limits, §2 × §5 cross-cite, open questions. |
 | 2026-05-29 | @Tools-MCP-Lead | §2 v0.1 follow-up (per @Provider-Auth-Lead direction on §3 ↔ §2 alignment): added `§3 permission` column to §2.3 tool tables citing `agent:*` / `notification:*` / `token:*` / `trust:*` names; added `-32009 auth_required` and `-32010 auth_invalid` to §2.6; renamed `-32000 invalid_session` → `session_expired` and `-32005 token_revoked` → `auth_revoked` and `-32003 unknown_agent` → `not_found` to match §3.5 vocabulary; changed `retry_after_secs` → `retry_after_ms` in §2.6/§2.7; added 240-char vs 4 KiB cap-layering clarification on `pie_summary` (§2.5); refined `principal_id` / `principal_label` wire-vs-runtime framing in §2.8 (per Runtime cross-cite review on PR #127). |
+| 2026-05-29 | @Provider-Auth-Lead | §3 v0.1: identity/auth/session/namespace/agent registry draft. Added credential class separation, human session requirements, agent token lifecycle, per-call authorization rules, bounded auth errors, audit/redaction rules, threat-model checkpoints, and §3 open questions. |
