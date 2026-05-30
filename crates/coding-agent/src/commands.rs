@@ -932,11 +932,11 @@ impl SlashCommand for GoalCommand {
     }
 
     fn description(&self) -> &'static str {
-        "set, view, pause, resume, or clear the session goal stop hook"
+        "set, start, view, pause, resume, or clear the session goal stop hook"
     }
 
     fn usage(&self) -> &'static str {
-        "[<condition>|pause|resume|clear]"
+        "[<condition>|start <prompt>|pause|resume|clear]"
     }
 
     async fn run(&self, argv: &[String], ctx: &CommandCtx<'_>) -> CommandOutcome {
@@ -966,6 +966,23 @@ impl SlashCommand for GoalCommand {
                 }
                 Err(e) => CommandOutcome::Error(e),
             },
+            Some("start") => {
+                let prompt = argv[1..].join(" ").trim().to_string();
+                if prompt.is_empty() {
+                    return CommandOutcome::Error("usage: /goal start <prompt>".into());
+                }
+                if let Err(e) = crate::goal::current(ctx.harness)
+                    .await
+                    .filter(|state| state.active())
+                    .ok_or_else(|| "no active goal; set one with /goal <condition>".to_string())
+                {
+                    return CommandOutcome::Error(e);
+                }
+                CommandOutcome::RunAgentPrompt {
+                    prompt,
+                    error_context: "goal start: ",
+                }
+            }
             Some(_) => {
                 let condition = argv.join(" ").trim().to_string();
                 if condition.is_empty() {
@@ -977,6 +994,7 @@ impl SlashCommand for GoalCommand {
                         cprintln!(
                             "goal will continue after each successful turn until transcript evidence satisfies the condition"
                         );
+                        cprintln!("start by sending a normal prompt, or run /goal start <prompt>");
                         CommandOutcome::Handled
                     }
                     Err(e) => CommandOutcome::Error(e),
