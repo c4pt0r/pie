@@ -2620,7 +2620,7 @@ mod tests {
             "queued".into(),
             Vec::new(),
         );
-        let (tx, _rx) = oneshot::channel();
+        let (tx, mut rx) = oneshot::channel();
         app.show_control_plane_prompt(UiControlPlanePrompt {
             request: ControlPlanePromptRequest {
                 tool_call_id: "call_1".into(),
@@ -2652,11 +2652,52 @@ mod tests {
             ))
         );
         assert!(app.control_plane_prompt.is_none());
+        let decision = rx.try_recv().expect("deny decision should be sent");
+        match decision {
+            pie_agent_core::ControlPlanePromptDecision::Deny { reason } => {
+                assert_eq!(reason.as_deref(), Some("denied by user"));
+            }
+            other => panic!("expected deny decision, got {other:?}"),
+        }
         assert_eq!(
             app.queued_turns.len(),
             1,
             "denying a prompt must not clear unrelated queued user input"
         );
+    }
+
+    #[test]
+    fn control_plane_prompt_enter_sends_allow_decision() {
+        use pie_agent_core::ControlPlanePromptRequest;
+        use tokio::sync::oneshot;
+
+        let mut app = test_app();
+        let (tx, mut rx) = oneshot::channel();
+        app.show_control_plane_prompt(UiControlPlanePrompt {
+            request: ControlPlanePromptRequest {
+                tool_call_id: "call_1".into(),
+                tool_name: "InstallSkill".into(),
+                args_hash: "abcdef1234567890".repeat(4),
+                label: "Install skill".into(),
+                payload: serde_json::json!({
+                    "source": "user",
+                    "args_hash": "abcdef1234567890"
+                }),
+                reason: "writes skill files".into(),
+            },
+            responder: tx,
+        });
+
+        assert!(app.handle_control_plane_prompt_key(&KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        )));
+        assert!(app.control_plane_prompt.is_none());
+        let decision = rx.try_recv().expect("allow decision should be sent");
+        assert!(matches!(
+            decision,
+            pie_agent_core::ControlPlanePromptDecision::Allow
+        ));
     }
 
     #[test]
