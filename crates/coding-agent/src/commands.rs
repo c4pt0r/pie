@@ -1180,7 +1180,7 @@ async fn hub_send(argv: &[String]) -> CommandOutcome {
         target.mention(),
         preview_agent_label(&target)
     );
-    cprintln!("  summary       {}", preview_text(&args.summary, 120));
+    cprintln!("  summary       {}", preview_hub_text(&args.summary, 120));
     cprintln!("  delivery      {}", render_hub_delivery(&receipt));
     cprintln!("  payload       Local (not sent)");
     CommandOutcome::Handled
@@ -1240,10 +1240,14 @@ async fn hub_inbox(argv: &[String]) -> CommandOutcome {
         cprintln!(
             "  {}  {}  {}",
             preview_mention(&item.sender),
-            preview_text(&item.summary, 120),
+            preview_hub_text(&item.summary, 120),
             render_inbox_flags(&item)
         );
-        cprintln!("      status {} · {}", item.status, item.created_at);
+        cprintln!(
+            "      status {} · {}",
+            render_inbox_status(&item.status),
+            preview_hub_text(&item.created_at, 32)
+        );
     }
     CommandOutcome::Handled
 }
@@ -1360,7 +1364,11 @@ fn preview_agent_label(agent: &crate::hub_client::HubAgentSummary) -> String {
         .as_deref()
         .filter(|name| !name.trim().is_empty())
         .unwrap_or("hub agent");
-    format!("{} · inbox {}", preview_text(label, 48), agent.inbox)
+    format!(
+        "{} · inbox {}",
+        preview_hub_text(label, 48),
+        normalize_hub_inbox(&agent.inbox)
+    )
 }
 
 fn preview_mention(sender: &str) -> String {
@@ -1377,7 +1385,55 @@ fn render_inbox_flags(item: &crate::hub_client::HubInboxItem) -> String {
     } else {
         "trusted"
     };
-    format!("{contact} · payload {}", item.payload_visibility)
+    format!(
+        "{contact} · payload {}",
+        normalize_payload_visibility(&item.payload_visibility)
+    )
+}
+
+fn render_inbox_status(status: &str) -> &'static str {
+    if is_allowed_hub_status(status) {
+        match status {
+            "pending" => "pending",
+            "delivered" => "delivered",
+            "acked" => "acked",
+            "queued" => "queued",
+            "accepted" => "accepted",
+            _ => "unknown",
+        }
+    } else {
+        "unknown"
+    }
+}
+
+fn normalize_hub_inbox(value: &str) -> &'static str {
+    match value {
+        "open" => "open",
+        "namespace" => "namespace",
+        "invited" => "invited",
+        "closed" => "closed",
+        _ => "unknown",
+    }
+}
+
+fn normalize_payload_visibility(value: &str) -> &'static str {
+    match value {
+        "Local" => "Local",
+        "Shared" => "Shared",
+        "Redacted" => "Redacted",
+        _ => "unknown",
+    }
+}
+
+fn is_allowed_hub_status(status: &str) -> bool {
+    matches!(
+        status,
+        "queued" | "delivered" | "pending" | "acked" | "accepted"
+    )
+}
+
+fn preview_hub_text(text: &str, max_chars: usize) -> String {
+    preview_text(&redact_hub_status_text(text), max_chars)
 }
 
 struct HubConnectArgs {

@@ -277,10 +277,10 @@ async fn faux_hub_mcp_post(
                         "agent_id": "018fe23a-2222-4a22-8b33-123456789abc",
                         "handle": "bob",
                         "namespace": "dongxu",
-                        "display_name": "Bob Cheng",
+                        "display_name": "Bob Cheng hub_agent_profile_secret 018fe23a-9999-4a22-8b33-123456789abc",
                         "capabilities": ["notify"],
                         "discoverable": "public",
-                        "inbox": "open"
+                        "inbox": "hub_hs_inbox_secret"
                     }
                 }),
                 "discover_public_agents" => json!({
@@ -289,7 +289,7 @@ async fn faux_hub_mcp_post(
                             "agent_id": "018fe23a-2222-4a22-8b33-123456789abc",
                             "handle": "bob",
                             "namespace": "dongxu",
-                            "display_name": "Bob Cheng",
+                            "display_name": "Bob Cheng hub_agent_candidate_secret 018fe23a-aaaa-4a22-8b33-123456789abc",
                             "capabilities": ["notify"],
                             "discoverable": "public",
                             "inbox": "open"
@@ -308,7 +308,7 @@ async fn faux_hub_mcp_post(
                 }),
                 "send_notification" => json!({
                     "notification_id": "018fe23a-4444-4a22-8b33-123456789abc",
-                    "status": "queued",
+                    "status": "hub_agent_status_secret",
                     "first_contact_required": true
                 }),
                 "list_my_inbox" => json!({
@@ -316,10 +316,10 @@ async fn faux_hub_mcp_post(
                         "notification_id": "018fe23a-5555-4a22-8b33-123456789abc",
                         "sender_agent_id": "018fe23a-6666-4a22-8b33-123456789abc",
                         "sender": "@alice@dongxu",
-                        "summary": "hello from alice",
-                        "payload_visibility": "Local",
+                        "summary": "hello from alice hub_agent_summary_secret 018fe23a-bbbb-4a22-8b33-123456789abc",
+                        "payload_visibility": "hub_hs_payload_secret",
                         "first_contact_required": true,
-                        "status": "pending",
+                        "status": "hub_agent_inbox_status_secret",
                         "created_at": "2026-05-30T20:00:00Z",
                         "delivered_at": null
                     }],
@@ -508,8 +508,11 @@ async fn hub_send_command_resolves_mentions_and_outputs_bounded_status() {
     assert!(text.contains("queued for first-contact review"), "{text}");
     assert!(text.contains("payload       Local (not sent)"), "{text}");
     assert!(!text.contains("hub_agent_command_secret"), "{text}");
+    assert!(!text.contains("hub_agent_profile_secret"), "{text}");
+    assert!(!text.contains("hub_agent_status_secret"), "{text}");
     assert!(!text.contains("pie-hub:default"), "{text}");
     assert!(!text.contains("018fe23a"), "{text}");
+    assert!(!text.contains("123456789abc"), "{text}");
     assert!(!text.contains("target_agent_id"), "{text}");
     assert!(!text.contains("MCP"), "{text}");
 
@@ -569,10 +572,15 @@ async fn hub_inbox_command_outputs_bounded_read_only_feed() {
     assert!(text.contains("Hub inbox:"), "{text}");
     assert!(text.contains("@alice@dongxu"), "{text}");
     assert!(text.contains("hello from alice"), "{text}");
-    assert!(text.contains("first-contact · payload Local"), "{text}");
+    assert!(text.contains("first-contact · payload unknown"), "{text}");
+    assert!(text.contains("status unknown"), "{text}");
     assert!(!text.contains("hub_agent_command_secret"), "{text}");
+    assert!(!text.contains("hub_agent_summary_secret"), "{text}");
+    assert!(!text.contains("hub_agent_inbox_status_secret"), "{text}");
+    assert!(!text.contains("hub_hs_payload_secret"), "{text}");
     assert!(!text.contains("pie-hub:default"), "{text}");
     assert!(!text.contains("018fe23a"), "{text}");
+    assert!(!text.contains("123456789abc"), "{text}");
     assert!(!text.contains("notification_id"), "{text}");
     assert!(!text.contains("MCP"), "{text}");
 }
@@ -622,6 +630,8 @@ async fn hub_send_prefix_lookup_lists_safe_mentions() {
         "{text}"
     );
     assert!(!text.contains("hub_agent_command_secret"), "{text}");
+    assert!(!text.contains("hub_agent_candidate_secret"), "{text}");
     assert!(!text.contains("018fe23a"), "{text}");
+    assert!(!text.contains("123456789abc"), "{text}");
     assert!(!text.contains("MCP"), "{text}");
 }
