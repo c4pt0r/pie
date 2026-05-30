@@ -89,7 +89,7 @@ This does NOT change the "no real Cloudflare in build/test CI" rule (§8). Build
 | --- | -------------------------------------------------------------- | ------------------------------------------- | ------------------- |
 | 1   | Architecture overview                                          | @Tools-MCP-Lead + @Runtime-dev-lead         | **v0.1**            |
 | 2   | Hub MCP protocol surface                                       | @Tools-MCP-Lead                             | **v0.1**            |
-| 3   | Identity / Auth / Session / Namespace / Agent registry         | @Provider-Auth-Lead                         | **v0.1**            |
+| 3   | Identity / Auth / Session / Namespace / Agent registry         | @Provider-Auth-Lead                         | **v0.2**            |
 | 4   | Visibility model                                               | @alice                                      | **v0.2**            |
 | 5   | Notification routing / delivery semantics                      | @Runtime-dev-lead                           | **v0.1**            |
 | 6a  | Client integration (contract + runtime boundary)               | @Tools-MCP-Lead                             | TBD                 |
@@ -236,8 +236,8 @@ through every component on the path:
    (§5.5), cycle suppression, and `BeforeTriggerHook`.
 7. **First-contact gate (§5.6, #110).** `HubTrustGate` (Runtime-side, §5.6)
    looks up `~/.pie/hub-trust.json` (§5.7) keyed on
-   `{receiver_agent_id, sender_agent_id, action_class=notification}`. On a
-   miss for a cross-namespace sender, the runtime emits
+   `{local_receiver_instance_id, receiver_agent_id, sender_agent_id, action_class=notification}`
+   per §3.4 / §5.7. On a miss for a cross-namespace sender, the runtime emits
    `HarnessEvent::TriggerPromptRequest` (#110 Artifact D, v0.2). The
    embedder renders a prompt card (§6b) — same UX shape as the
    `ControlPlaneWrite` prompt the rest of the runtime already uses for
@@ -578,7 +578,7 @@ cites. First-to-draft fixes the name (per the protocol agreed
 
 ## §3 Identity / Auth / Session / Namespace / Agent registry
 
-Draft v0.1 — @Provider-Auth-Lead.
+Draft v0.2 — @Provider-Auth-Lead.
 
 ### §3.1 Security model summary
 
@@ -631,7 +631,7 @@ Registration flow:
 2. Hub allocates UUID `agent_id`, validates namespace-local `handle`, stores profile + visibility
    defaults, and issues an agent token once.
 3. The token is shown only once to the human / CLI installer. After that the hub stores only
-   `{token_id, token_hash, agent_id, namespace, permissions, created_at, expires_at?, revoked_at?}`.
+   `{token_id, token_hash, agent_id, namespace, permissions, created_at, last_used_at?, expires_at?, revoked_at?}`.
 
 Token requirements:
 
@@ -649,9 +649,19 @@ Token requirements:
   - `trust:revoke`
   - `trust:block`
   - `trust:unblock`
+- **Expiry default (v0): agent tokens are long-lived and do not auto-expire by default**
+  (`expires_at = null`) unless the user / admin explicitly sets an expiry during registration or
+  rotation. Rationale: agents are expected to run unattended, and silent expiry creates
+  availability failures without meaningfully replacing revoke / rotate. The server still records
+  `created_at` and `last_used_at` so abuse response can identify stale tokens and future policy can
+  add explicit expiry without changing the token schema.
 - Tokens are rotatable and revocable. Rotation creates a new token id and revokes the old token id.
-  In-flight SSE connections authenticated with a revoked token must close with a bounded
+  The old token may be accepted only for a bounded grace period (v0 max: 5 minutes) to let an
+  already-open SSE stream drain; all new MCP requests must use the new token immediately after
+  rotation. In-flight SSE connections authenticated with a revoked token must close with a bounded
   `auth_revoked` event or terminate on next heartbeat.
+- Token rotation and revoke are mandatory before v0 deploy; optional expiry UI can ship later, but
+  there must be a supported recovery path for a leaked token on day one.
 - Token plaintext MUST NOT appear in MCP request/response bodies after issuance, notification
   payloads, Worker logs, audit records, GitHub Actions logs, or bug reports.
 - Agent token auth uses the HTTP `Authorization` header (`Bearer <token>`) for Streamable HTTP.
@@ -679,8 +689,14 @@ Authorization rules:
   sender permissions.
 - Same-namespace direct route in §4.2 still requires authenticated sender token with
   `notification:send` and an active receiver with `notification:receive` enabled.
-- Cross-namespace first-contact prompts key on immutable ids:
-  `{receiver_agent_id, sender_agent_id, action_class=notification}`. Handles are display-only.
+- Cross-namespace first-contact prompts key on immutable ids. The durable local trust cache key is
+  `{local_receiver_instance_id, receiver_agent_id, sender_agent_id, action_class=notification}`.
+  `receiver_agent_id` and `sender_agent_id` are hub-issued UUIDs; handles are display-only.
+  `local_receiver_instance_id` is a random UUID generated by this local pie install for the
+  receiver's hub profile. It is **not** a hardware serial, hostname, MAC address, or Cloudflare id.
+  If the local instance id is missing or corrupt, the client must fail closed and prompt again
+  rather than dropping that key segment. This prevents dotfile-synced `~/.pie/hub-trust.json`
+  entries from authorizing a different local receiver machine by accident.
 - Any future widening of trust scope (namespace/team/all-tools) requires an RFC update with risk,
   UI copy, and tests.
 
@@ -715,6 +731,7 @@ Allowed audit fields:
 - `event_type`, `actor_kind`, `user_id`, `namespace`, `agent_id`, `receiver_agent_id`
 - `token_id` (never token plaintext or hash)
 - `permission`, `action_class`, `decision`, `reason_code`
+- `local_receiver_instance_id_hash` (hash only; never the raw local instance id)
 - `profile_field_names_changed` (names only; not full values unless values are already public list
   fields and bounded)
 - `trace_id`, `request_id`, `created_at`, `expires_at`, `revoked_at`
@@ -732,6 +749,8 @@ The implementation and §8 acceptance matrix must cover these auth-specific thre
 - Public discovery being treated as write authorization.
 - Handle rename bypassing trust/block lists.
 - Token copied from one agent being usable as another agent.
+- Dotfile-synced `~/.pie/hub-trust.json` replay authorizing a sender on a different local receiver
+  machine.
 - Revoked token keeping an SSE connection alive indefinitely.
 - PR/fork CI accessing `CF_API_KEY`.
 - Worker logs or error reports containing bearer tokens or notification payload secrets.
@@ -743,9 +762,10 @@ The implementation and §8 acceptance matrix must cover these auth-specific thre
 | ID | Question | Provider/Auth take |
 | --- | -------- | ------------------ |
 | §3.OQ-1 | Exact password hash in Cloudflare Worker runtime? | Prefer `argon2id`; if unavailable, document bcrypt/scrypt fallback and parameters before implementation. |
-| §3.OQ-2 | Agent token expiry default? | Prefer long-lived but rotatable tokens with optional expiry; require revoke/rotate before v0 deploy. |
+| ~~§3.OQ-2~~ | Agent token expiry default? | **RESOLVED v0.2:** default `expires_at = null` (no automatic expiry) for unattended agents; tokens remain rotatable / revocable, record `created_at` + `last_used_at`, and may have explicit user/admin-set expiry. Rotation/revoke must ship before v0 deploy. |
 | §3.OQ-3 | Should same-namespace sends bypass first-contact permanently? | Yes for v0, but still require `notification:send` / `notification:receive` permissions and audit. |
 | §3.OQ-4 | Can external non-pie MCP clients register agents? | Yes if they use the same human session / agent token model; no provider credentials accepted. |
+| ~~§3.OQ-5~~ | Should first-contact trust bind to a per-machine receiver identity? | **RESOLVED v0.2:** yes. `~/.pie/hub-trust.json` keys include `local_receiver_instance_id` + `receiver_agent_id` + `sender_agent_id` + `action_class`. The local instance id is a random local UUID, not hardware identity. |
 
 ## §4 Visibility model — v0.2 (@alice)
 
@@ -814,7 +834,7 @@ Choice:  Accept once    Always (notification-only)    Block
 ```
 
 - **Accept once** — current notification routes through; sender is NOT added to trust list.
-- **Always** — sender enters the trust list with scope `{receiver_agent_id, sender_agent_id, action_class=notification}`. Future notifications route directly. Receiver-anchored — sharing a trust file across machines (e.g. dotfile sync) must not authorize the same sender for a different local receiver agent. (See RFC-OQ-10 for the per-machine binding decision.)
+- **Always** — sender enters the trust list with scope `{local_receiver_instance_id, receiver_agent_id, sender_agent_id, action_class=notification}`. Future notifications route directly. Receiver-anchored — sharing a trust file across machines (e.g. dotfile sync) must not authorize the same sender for a different local receiver instance. (See §3.4 / RFC-OQ-10 for the per-machine binding decision.)
 - **Block** — sender enters the block list; future attempts silent-drop, no further prompt.
 
 **Why.** Inbox-open without consent is spam. The issue #110 `ControlPlaneWrite` gate is already in flight for control-plane operations (`NewTrigger`, `InstallSkill`, `SetSkillState`, etc.) via the tool-call channel; first-contact uses the parallel trigger channel (#110 v0.2 Artifact D) keyed on `trigger_prompt_id` rather than `args_hash`. Same shape — an authorization decision the model cannot self-confirm — so reuse the gate semantics rather than invent a new trust UI.
@@ -874,7 +894,7 @@ Choice:  Accept once    Always (notification-only)    Block
 - `TriggerAuthority.principal_label` carries `@handle@namespace` — display only.
 - Hub-pushed notifications enter via the `mcp:pie-hub:...` source label namespace (§5.2).
 - Ack / dedup via `_meta.pie_dedup_key`; default `payload_visibility = Local`; ordering not guaranteed (§5.5 / §5.9).
-- First-contact prompt is `BeforeTriggerHook::Prompt` → `HarnessEvent::TriggerPromptRequest` → `resolve_trigger_prompt` (#110 v0.2 Artifact D). Runtime-side binding is `trigger_prompt_id` (per-notification, anti-replay); embedder-side trust cache keys on `{receiver_agent_id, sender_agent_id, action_class=notification}` per RFC-OQ-10 / §5.7.
+- First-contact prompt is `BeforeTriggerHook::Prompt` → `HarnessEvent::TriggerPromptRequest` → `resolve_trigger_prompt` (#110 v0.2 Artifact D). Runtime-side binding is `trigger_prompt_id` (per-notification, anti-replay); embedder-side trust cache keys on `{local_receiver_instance_id, receiver_agent_id, sender_agent_id, action_class=notification}` per §3.4 / RFC-OQ-10 / §5.7.
 - Runtime emits `Custom { custom_type: "trigger_prompt", ... }` for every resolution; embedder additionally emits `Custom { custom_type: "fefe_trust_decision", ... }` only on `Always`/`Block` cache changes (§5.7). Complementary, not duplicate.
 - Prompt-bounded subset for the first-contact card is `{display_name, description, capabilities}` (§4.4).
 
@@ -1014,7 +1034,8 @@ opts.before_trigger = Some(
 
 Decision flow inside the hook, evaluated only for triggers whose `source_label` starts with `mcp:pie-hub:`:
 
-1. Read `(receiver_agent_id, sender_agent_id, action_class)` from the trigger.
+1. Read `(receiver_agent_id, sender_agent_id, action_class)` from the trigger and
+   `local_receiver_instance_id` from the local hub client config (defined by §3.4).
 2. Look up `~/.pie/hub-trust.json` ([§5.7](#57-trust-decision-audit-and-persistence)).
 3. Decision:
    - Found entry `Always` and not expired (per RFC-OQ-4 §4.OQ-3: 90-day TTL) → `BeforeTriggerDecision::Allow`.
@@ -1022,7 +1043,7 @@ Decision flow inside the hook, evaluated only for triggers whose `source_label` 
    - No entry, sender is same-namespace → fall through to next stage (`inbox` enforcement per §4.2; if hub already rejected non-matching `inbox` at send time, this is a defensive belt).
    - No entry, sender is cross-namespace → `BeforeTriggerDecision::Prompt { reason: <bounded sender summary> }`.
 4. The runtime emits `HarnessEvent::TriggerHandled { state: NeedsApproval, ... }`. The embedder consumes this through the issue #110 `ControlPlaneWrite` prompt channel — the same UX surface that gates `InstallSkill`, `NewTrigger`, etc.
-5. User's three-way decision (`Accept once` / `Always` / `Block` per §4.3) becomes a `fefe_trust_decision` audit entry ([§5.7](#57-trust-decision-audit-and-persistence)).
+5. User's three-way decision (`Accept once` / `Always` / `Block` per §4.3) resolves the trigger prompt. `Always` / `Block` decisions additionally update `~/.pie/hub-trust.json` and emit a `fefe_trust_decision` audit entry ([§5.7](#57-trust-decision-audit-and-persistence)).
 
 **Hard dependency on issue #110.** Without the `PermissionDecision::Prompt` channel wired through `before_tool_call`, the `NeedsApproval` state has no embedder-side rendering and the trigger is effectively dropped silently. Issue #110 is P0 alongside this chapter; both must land before the first-contact gate ships.
 
@@ -1030,7 +1051,7 @@ Decision flow inside the hook, evaluated only for triggers whose `source_label` 
 
 Two distinct artifacts:
 
-1. **Runtime-emitted audit entry** — `SessionTreeEntry::Custom { custom_type: "fefe_trust_decision", data: {...} }`. Written by the runtime via existing `Session::append_custom`. One entry per user decision (`Accept once` writes one entry without modifying the trust list; `Always` and `Block` write the entry AND persist to disk).
+1. **Embedder-emitted trust-change audit entry** — `SessionTreeEntry::Custom { custom_type: "fefe_trust_decision", data: {...} }`. Written by the embedder via existing `Session::append_custom` only when the user picks `Always` or `Block` and the trust cache changes. `Accept once` writes the runtime `trigger_prompt` audit entry (#110 Artifact E) but does not modify the trust list and does not emit `fefe_trust_decision`.
 
 2. **Embedder-owned trust list** — `~/.pie/hub-trust.json`. Read every time `HubTrustGate` evaluates; written when the user picks `Always` or `Block`. Shape:
 
@@ -1040,6 +1061,7 @@ Two distinct artifacts:
      "entries": [
        {
          "key": {
+           "local_receiver_instance_id": "<local random UUID>",
            "receiver_agent_id": "<UUID>",
            "sender_agent_id":   "<UUID>",
            "action_class":      "notification"
@@ -1060,6 +1082,7 @@ The `fefe_trust_decision` Custom audit `data` shape (definition; cited by §4 an
   "schema_version":   1,
   "trace_id":         "<UUID>",
   "receiver_agent_id":"<UUID>",
+  "local_receiver_instance_id_hash": "<short stable hash>",
   "sender_agent_id":  "<UUID>",
   "sender_handle":    "@handle@namespace",
   "decision":         "accept_once" | "always" | "block",
@@ -1129,7 +1152,7 @@ Senders that need stronger ordering should embed application-level sequence numb
 | ---------- | ---------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
 | §5.OQ-1    | Should `BeforeTriggerHook::Prompt` for hub triggers carry the sender's bounded profile (description + capabilities) so the prompt UI can render context without a second hub roundtrip? | Yes — fold the bounded profile (`display_name`, `description`, `capabilities[]` from §4.4 listing schema) into `BeforeTriggerActionContext`. Adds one field, avoids the second hit. |
 | §5.OQ-2    | Trust TTL refresh on use: does an `Always` entry's `expires_at` slide forward each time it permits a notification? | No, default to fixed TTL from grant time (per §4.OQ-3 = 90 days). Sliding TTLs hide silent over-trust. Revisit if users complain about re-prompt fatigue. |
-| §5.OQ-3    | When `~/.pie/hub-trust.json` is shared across pie machines (e.g. via dotfile sync), receiver_agent_id may differ per machine. Does the entry key on `local_machine_id + receiver_agent_id` for safety? | Lean YES — bind to per-machine receiver. Cross-machine trust replay is a real attack surface if a laptop is lost. Open question for @Provider-Auth-Lead. |
+| ~~§5.OQ-3~~ | When `~/.pie/hub-trust.json` is shared across pie machines (e.g. via dotfile sync), receiver_agent_id may differ per machine. Does the entry key on `local_machine_id + receiver_agent_id` for safety? | **RESOLVED by §3 v0.2:** yes, bind trust cache entries to `local_receiver_instance_id + receiver_agent_id + sender_agent_id + action_class`. The local instance id is random local state, not hardware identity; logs/audit carry only `local_receiver_instance_id_hash`. |
 | §5.OQ-4    | Should hub-originated triggers be allowed to cause cycle suppression with non-hub triggers? (i.e. is a hub notification "the same cycle hop" as a local MCP trigger?) | Yes — `cycle_id` is per-thread, not per-source. Hub notifications counted against the same cycle budget. Prevents trivial cross-source cycles. |
 | §5.OQ-5    | Audit redaction: hub `agent_id` is a UUID; should `fefe_trust_decision` audit also include a stable short hash of the sender's `agent_id` for human-readable correlation, or only the full UUID? | Both fields — full UUID for system join, 8-char prefix for human eyeballs. Already what `trigger_audit` does for trace ids. |
 | §5.OQ-6    | Issue #110 timing: do we hold §5 implementation merge until #110 lands, or merge §5 stub and have the trust gate fall through to deny-cross-namespace until #110 lands? | Land §5 plumbing + `make_pie_hub_notification_hook` factory first; trust gate stub fails closed (deny cross-namespace) until #110 ships. Lets §6a / Worker integration test against the runtime API without waiting on #110.
@@ -1240,6 +1263,7 @@ The RFC approval gate is blocked until a threat model exists. It must cover at l
 | Secret leakage through CI deploy | Protected environment, scoped `CF_API_KEY`, no echo/log/artifact/cache exposure. |
 | Notification payload leakage | Bounded summaries, `payload_visibility`, redaction, and no raw payload in list/audit/report surfaces. |
 | Token replay or movement across agents | Agent token scoped to `{user_id, namespace, agent_id, permissions}`; server stores hash/identifier only. |
+| Dotfile-synced trust replay | `~/.pie/hub-trust.json` keys include `local_receiver_instance_id + receiver_agent_id + sender_agent_id + action_class`; audit/report expose only `local_receiver_instance_id_hash`. |
 | Duplicate / replayed notifications | Stable notification id and `_meta.pie_dedup_key`; idempotent receive path. |
 | Worker outage / rollback | Disable/rollback workflow, health checks, bounded client recovery hints. |
 
@@ -1264,12 +1288,13 @@ Gate 6 must run against real `https://pie.0xfefe.me` after deploy. Minimum scena
 4. **First-contact prompt** — Cross-namespace send to an untrusted target with prompt-eligible inbox produces the issue #110 prompt path, not direct trigger execution.
 5. **Accepted notification path** — After `Accept once` or `Always`, notification becomes `McpNotificationHook` → `Trigger` → agent flow; audit/feed contain bounded metadata only.
 6. **Trust persistence** — `Always` trust routes a second notification without prompting; handle rename does not bypass trust because trust keys on `agent_id`.
-7. **Block path** — `Block` suppresses future prompts and prevents notification delivery with non-distinguishing sender result.
-8. **Dedup / idempotency** — Replaying the same notification id / `_meta.pie_dedup_key` does not double-run the receiver.
-9. **Token revoke / rotate** — Revoked sender token cannot list/send; rotated token works; errors contain recovery hint only.
-10. **Body cap / rate limit** — Oversized notification and rate-limit exceedance fail closed with bounded errors; no raw body leaks in logs/audit/report.
-11. **Rollback / disable rehearsal** — Run or dry-run protected rollback/disable workflow; confirm operators know how to stop service or revert deployment.
-12. **Redaction sweep** — Inspect live e2e logs/report/artifacts for forbidden values: `CF_API_KEY`, hub sessions, agent tokens, provider keys, raw payload secrets, password hashes.
+7. **Trust replay defense** — Copy a `hub-trust.json` entry to a different local receiver instance id; delivery must prompt again rather than auto-trust. Report only `local_receiver_instance_id_hash`, never raw local ids.
+8. **Block path** — `Block` suppresses future prompts and prevents notification delivery with non-distinguishing sender result.
+9. **Dedup / idempotency** — Replaying the same notification id / `_meta.pie_dedup_key` does not double-run the receiver.
+10. **Token revoke / rotate** — Revoked sender token cannot list/send; rotated token works; errors contain recovery hint only. If an explicit token expiry is configured, expired token behavior matches `auth_revoked` / re-register recovery without leaking token material.
+11. **Body cap / rate limit** — Oversized notification and rate-limit exceedance fail closed with bounded errors; no raw body leaks in logs/audit/report.
+12. **Rollback / disable rehearsal** — Run or dry-run protected rollback/disable workflow; confirm operators know how to stop service or revert deployment.
+13. **Redaction sweep** — Inspect live e2e logs/report/artifacts for forbidden values: `CF_API_KEY`, hub sessions, agent tokens, provider keys, raw payload secrets, password hashes, raw `local_receiver_instance_id`.
 
 ### §8.6 Report format
 
@@ -1283,14 +1308,14 @@ worker: pie.0xfefe.me
 started_at: <timestamp>
 completed_at: <timestamp>
 result: pass|fail
-scenarios: <12-line pass/fail matrix from §8.5>
+scenarios: <13-line pass/fail matrix from §8.5>
 trace_ids: [<bounded trace ids>]
 rollback_status: available|executed|not_available
 redaction_check: pass|fail
 notes: <bounded recovery notes, no secrets>
 ```
 
-Forbidden in reports: `CF_API_KEY`, hub session cookies, agent tokens, notification body secrets, provider keys, full payloads, password hashes, raw database rows, Cloudflare internal binding secrets.
+Forbidden in reports: `CF_API_KEY`, hub session cookies, agent tokens, notification body secrets, provider keys, full payloads, password hashes, raw database rows, Cloudflare internal binding secrets, raw `local_receiver_instance_id`.
 
 ---
 
@@ -1370,6 +1395,7 @@ Owned by @QA-Release-Lead in §8. Required contents:
 | Tool result body cap (non-list)    | 64 KiB                  | §2.3                                                    |
 | List-tool body cap                 | 256 KiB                 | §2.3                                                    |
 | `send_notification` request body   | 16 KiB                  | §2.7                                                    |
+| Agent token expiry                 | no automatic expiry (`expires_at = null`) unless user / admin sets one | §3.3 |
 
 ### Cross-chapter artifact pointers
 
@@ -1377,7 +1403,7 @@ Where to find canonical schemas, file shapes, and report formats so reviewers do
 
 | Artifact                                                              | Lives in              | Cited by                                |
 | --------------------------------------------------------------------- | --------------------- | --------------------------------------- |
-| `~/.pie/hub-trust.json` shape                                         | §5.7                  | §4.3                                    |
+| `~/.pie/hub-trust.json` key tuple and shape                           | §3.4, §5.7            | §4.3                                    |
 | `Custom { custom_type: "fefe_trust_decision" }` audit schema          | §5.7                  | §4.3, §8.5 (redaction acceptance)       |
 | `Custom { custom_type: "trigger_prompt" }` audit schema               | #110 v0.2 Artifact E  | §4.3, §5.6, §8.5                        |
 | `Custom { custom_type: "control_plane_prompt" }` audit schema         | #110 v0.2 Artifact E  | §5 (tool-call prompts; not fefe)        |
@@ -1407,8 +1433,8 @@ These complement, do not duplicate. `Accept once` writes only `trigger_prompt`. 
 | RFC-OQ-6      | Handle character set `[a-z0-9_-]{2,32}` — confirm or widen? (§4.OQ-5)                      | @alice: lock at this for v0.                          |
 | RFC-OQ-7      | Collapse `inbox=open` and `inbox=invited` in v0? (§4.OQ-6)                                 | @alice: lean keep both as operator signal. Tools-MCP +1 keep-both (sender-side invitation-token semantic distinction). |
 | ~~RFC-OQ-8~~  | Deploy mechanism for `pie.0xfefe.me`: manual or CI auto-deploy?                            | **RESOLVED 2026-05-29 by @EdHuang: CI auto-deploy via GitHub Actions.** EdHuang provides a GitHub repository secret named `CF_API_KEY`. Secret stays inside GitHub Actions (encrypted secret + protected environment); never enters repo, PR body, workflow logs, artifacts, cache, test fixtures, runtime config, session, audit, bug report, or any MCP payload. Secret-hardening requirements detailed in §8 (deploy gate). Reversed an earlier 2026-05-29 manual-deploy decision; superseded entry kept in change log. |
-| RFC-OQ-9      | Agent token expiry default? (§3.OQ-2)                                                       | @Provider-Auth-Lead: prefer long-lived but rotatable tokens with mandatory revoke/rotate support before v0 deploy. |
-| RFC-OQ-10     | Per-machine receiver binding for `~/.pie/hub-trust.json` to defeat dotfile-sync trust replay (§5.OQ-3). | Lean YES — bind trust entries to `(local_machine_id, receiver_agent_id, sender_agent_id, action_class)`. Cross-machine trust replay is a real attack surface if a laptop is lost or a dotfile sync drags the file onto another machine. Promoted from §5.OQ-3 by @Runtime-dev-lead + @Provider-Auth-Lead in cross-doc review on #130 v0.2. Final decision belongs to §3 / §5 v0.2 owners. |
+| ~~RFC-OQ-9~~  | Agent token expiry default? (§3.OQ-2)                                                       | **RESOLVED in §3 v0.2:** no automatic expiry by default (`expires_at = null`) for unattended agents; token rotate/revoke remains mandatory before v0 deploy, and explicit expiry may be set by user/admin policy. |
+| ~~RFC-OQ-10~~ | Per-machine receiver binding for `~/.pie/hub-trust.json` to defeat dotfile-sync trust replay (§5.OQ-3). | **RESOLVED in §3 v0.2 / §5.OQ-3:** include `local_receiver_instance_id` in the trust key. It is a random local UUID, not hardware identity; audit/logs carry only `local_receiver_instance_id_hash`. |
 
 ### Change log
 
@@ -1430,3 +1456,4 @@ These complement, do not duplicate. `Accept once` writes only `trigger_prompt`. 
 | 2026-05-29 | @Tools-MCP-Lead | §1 v0.1 partial (§1.1 framing / §1.2 ASCII component map / §1.3 9-step wire-bytes lifecycle / §1.5 reuse-vs-new ledger). Stitches §2 + §5 + §4 + §3 into one mental model. §1.5 ledger pins the operative rule: no implementation PR introduces a new runtime trait beyond what RFC 1 shipped — the hub work adds one transport (`HttpMcpTransport`), one factory (`make_pie_hub_notification_hook`), one `BeforeTriggerHook` impl (`HubTrustGate`), two Custom audit types, two `~/.pie/*.json` files, and the Worker; everything else is configuration. §1.4 placeholder calls out @Runtime-dev-lead. |
 | 2026-05-29 | @Runtime-dev-lead | §1.4 trigger pipeline reuse — Runtime side. Diagrams the pre-existing-on-`main` vs new-in-RFC #18 split on the runtime boundary; pins the "no new hook trait, no new pipeline, no new envelope, no new audit machinery" rule; lists the four Runtime-side new things (`make_pie_hub_notification_hook` factory, `HubTrustGate` impl, `~/.pie/hub-trust.json` schema, `fefe_trust_decision` Custom audit) and confirms the §1 → §1.5 → sub-PR sequencing fits ~400 LoC of `crates/agent` delta plus tests. §1 v0.1 chapter complete. |
 | 2026-05-29 | @alice | §4 v0.2: folded review feedback accumulated across §3 v0.1 (PR #125), §5 v0.1 (PR #127), §8 v0.1 (PR #126), §2 v0.1 (PR #128), and #110 design v0.2 (PR #130). §4.2 matrix "direct route" cells cite §3.4 per-call auth precondition (sender `notification:send`, receiver `notification:receive`). §4.3 expanded: names #110 v0.2 Artifact D specifically (`HarnessEvent::TriggerPromptRequest` / `resolve_trigger_prompt`), cites §5.7 as canonical location for `fefe_trust_decision` and `~/.pie/hub-trust.json` shape, documents the two complementary audit types (`trigger_prompt` runtime + `fefe_trust_decision` embedder), and projects §3.4's `AgentPrincipal` ↔ §5.3's `TriggerAuthority`. §4.4 splits the profile schema into list / detail / prompt-bounded subsets — the prompt-bounded subset `{display_name, description, capabilities}` is what `BeforeTriggerActionContext` carries to the first-contact UI (per §5.OQ-1). §4 × §5 contract section refreshed accordingly. Chapter map status normalized to single-form ("v0.1" / "v0.2" without "draft" suffix); §8 title's `~/cf_token` → `CF_API_KEY` typo fixed in chapter map. Added coordinator-maintained "Cross-chapter artifact pointers" sub-section so reviewers can find canonical schemas (audit types, hub-trust.json shape, prompt channel, permission strings, error namespace, dedup key) without grepping. Defaults table extended with §3.2 human session timeouts, §2.5/§5.10 cap layering, #110 prompt timeout. Promoted **RFC-OQ-10** (per-machine receiver binding for `~/.pie/hub-trust.json` to defeat dotfile-sync trust replay; from §5.OQ-3, surfaced by @Runtime-dev-lead + @Provider-Auth-Lead in cross-doc review on #130 v0.2). |
+| 2026-05-29 | @Provider-Auth-Lead | §3 v0.2: resolved RFC-OQ-9 and RFC-OQ-10. Agent tokens default to no automatic expiry (`expires_at = null`) unless user/admin sets one, while rotate/revoke and bounded revoke behavior remain mandatory before v0 deploy. First-contact trust cache keys now include `local_receiver_instance_id + receiver_agent_id + sender_agent_id + action_class`; local instance id is random local state, not hardware identity, and audit/logs expose only `local_receiver_instance_id_hash`. Updated §5.OQ-3 and the `hub-trust.json` shape to match. |
