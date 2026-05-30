@@ -1051,9 +1051,7 @@ impl SlashCommand for HubCommand {
     async fn run(&self, argv: &[String], ctx: &CommandCtx<'_>) -> CommandOutcome {
         match argv.first().map(String::as_str) {
             None | Some("status") => hub_status(ctx),
-            Some("join") => CommandOutcome::Error(
-                "/hub join browser onboarding is not wired in this client slice yet; use /hub status to inspect the built-in hub".into(),
-            ),
+            Some("join") => hub_join(argv).await,
             Some("connect") => hub_connect(&argv[1..]).await,
             Some("login") => {
                 if argv.len() != 1 {
@@ -1079,10 +1077,26 @@ impl SlashCommand for HubCommand {
                 "/hub {} is not wired in this client slice yet; use /hub status first; /hub join is the onboarding path",
                 argv[0]
             )),
-            Some(_) => CommandOutcome::Error(
-                "usage: /hub [status|join|connect|logout]".into(),
-            ),
+            Some(_) => CommandOutcome::Error("usage: /hub [status|join|connect|logout]".into()),
         }
+    }
+}
+
+async fn hub_join(argv: &[String]) -> CommandOutcome {
+    if argv.len() != 1 {
+        return CommandOutcome::Error("usage: /hub join".into());
+    }
+    cprintln!("Opening browser to join pie.0xfefe.me...");
+    match crate::hub_join::join_default_hub().await {
+        Ok(joined) => {
+            cprintln!("Joined hub as @{}@{}", joined.handle, joined.namespace);
+            cprintln!("restart pie to load the hub MCP transport, then run /hub status");
+            CommandOutcome::Handled
+        }
+        Err(e) => CommandOutcome::Error(format!(
+            "hub join failed: {}",
+            redact_hub_status_text(&e.to_string())
+        )),
     }
 }
 

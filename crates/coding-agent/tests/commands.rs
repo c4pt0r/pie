@@ -48,6 +48,12 @@ mod goal;
 #[path = "../src/history.rs"]
 mod history;
 #[allow(dead_code)]
+#[path = "../src/hub_auth.rs"]
+mod hub_auth;
+#[allow(dead_code)]
+#[path = "../src/hub_join.rs"]
+mod hub_join;
+#[allow(dead_code)]
 #[path = "../src/mcp_loader.rs"]
 mod mcp_loader;
 #[allow(dead_code)]
@@ -1622,10 +1628,10 @@ async fn dispatch_hub_join_is_present_without_exposing_mcp_or_tokens() {
         cwd: &cwd,
     };
 
-    let outcome = commands::dispatch("/hub join", &registry, &ctx).await;
+    let outcome = commands::dispatch("/hub join unexpected", &registry, &ctx).await;
     match outcome {
         commands::CommandOutcome::Error(message) => {
-            assert!(message.contains("browser onboarding"), "{message}");
+            assert!(message.contains("usage: /hub join"), "{message}");
             assert!(!message.contains("mcp.toml"), "{message}");
             assert!(!message.contains("pie-hub:default"), "{message}");
             assert!(!message.contains("hub_agent_"), "{message}");
