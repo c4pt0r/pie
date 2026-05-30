@@ -263,7 +263,63 @@ configuration of an existing hook) and `HubTrustGate` as a
 
 ### §1.4 Trigger pipeline reuse — what's runtime, what's hub-specific
 
-*Owned by @Runtime-dev-lead. Patches in on the same PR as §1.1–§1.3 / §1.5.*
+The §1.3 lifecycle reads like the hub is a first-class runtime concern. It is not. **The Runtime side of this RFC introduces no new hook trait, no new pipeline, no new envelope, and no new audit machinery.** What it adds is two small things that plug into existing slots: a *configured instance* of `McpNotificationHook` and a `BeforeTriggerHook` implementation. Everything else cited in §1.3 is already on `main` from RFC 1 (issue #20) and the MCP adapter chain (PRs #35 / #56 / #61 / #62 / #63).
+
+Concretely, the Runtime-side delta:
+
+```
+                                    ┌──────────────────────────────┐
+                                    │  pre-existing on main today  │
+                                    │  (RFC 1 + MCP adapter chain) │
+                                    │                              │
+   hub-pushed MCP notification ──►  │  McpNotificationHook  ────►  │  Trigger envelope
+   (over HttpMcpTransport §6a)      │  (PR #56)                    │  (RFC 1 issue #20)
+                                    │       ▲                      │
+                                    │       │ configured by        │
+                                    └───────│──────────────────────┘
+                                            │
+                                    ┌───────│──────────────────────┐
+                                    │  new in RFC #18 — Runtime    │
+                                    │                              │
+                                    │  make_pie_hub_notification_  │
+                                    │    hook(source_kind_prefix=  │
+                                    │       "pie-hub")             │
+                                    │       │                      │
+                                    │       ▼                      │
+                                    │  factory returns a           │
+                                    │  configured McpNotification- │
+                                    │  Hook — no new trait impl    │
+                                    └──────────────────────────────┘
+
+   Trigger envelope  ──────────────►  register_notification_hook supervisor
+                                      (RFC 1 sub-PR 3, PR #61)        │
+                                                                      │
+                                      BeforeTriggerHook slot          │
+                                      (RFC 1 sub-PR 4, PR #62)        │
+                                                ▲                     │
+                                                │ filled by           │
+                                    ┌───────────│─────────────────────┘
+                                    │  new in RFC #18 — Runtime
+                                    │
+                                    │  HubTrustGate (§5.6)
+                                    │   - reads ~/.pie/hub-trust.json
+                                    │   - on miss for cross-namespace,
+                                    │     returns BeforeTriggerDecision::
+                                    │     Prompt + emits TriggerPrompt-
+                                    │     Request (#110 Artifact D)
+                                    └────────────────────────────────────
+```
+
+That is the entire Runtime-side surface this RFC introduces. Specifically:
+
+- **`make_pie_hub_notification_hook(source_kind_prefix: "pie-hub") -> DynNotificationHook`** is **pure configuration** of `McpNotificationHook`. It pins the source-label namespace (§5.2) and gives the supervisor a stable identity to mount the hub adapter under. Zero new trait code; this is the same shape as a fresh `mcp.toml` row enabling a new stdio MCP server. Adding a second deployment (e.g. staging) is one more factory call with a different `source_kind_prefix`.
+- **`HubTrustGate`** is the one *new implementation* RFC #18 adds on the Runtime side. It implements the existing `BeforeTriggerHook` trait (already declared in RFC 1 sub-PR 4) by consulting an embedder-owned trust file. It does not invent a Prompt protocol — it returns `BeforeTriggerDecision::Prompt` and the runtime translates that into `HarnessEvent::TriggerPromptRequest` per the #110 v0.2 Artifact D channel, which the embedder resolves through the same UI shape that `InstallSkill` / `SetSkillState(enabled=true)` use. One channel, two binding shapes (`tool_call_id + args_hash` for tools; `trigger_prompt_id` for triggers — see #110 §A2 / §A3).
+- **Trust persistence** (`~/.pie/hub-trust.json`) lives **entirely on the embedder side** per §5.7 and #110 v0.2. Runtime is remember-agnostic: the trust file is just a JSON the embedder reads in `HubTrustGate` and writes when the user picks `Always`. Runtime never touches it. This mirrors how `~/.pie/skills-state.json` (issue #23) works for skill enable/disable overlays.
+- **Audit reuse** — every persistence point in the §1.3 lifecycle goes through the existing `Session::append_custom` channel (RFC 1 sub-PR 2, PR #59). The only new `custom_type`s are `fefe_trust_decision` (defined in §5.7, written by embedder) and `trigger_prompt` (defined in #110 Artifact E, written by runtime). They follow the same redaction rule as the existing `trigger_audit` / `trigger_result` / `trigger_promotion` entries: no raw payload, no tokens, no internal binding names.
+
+What this means for the §7 Worker implementation owner and for §6a / §6b: **the Runtime side does not gate the hub's wire shape, error vocabulary, or transport semantics.** The §2 / §5 protocol locked the wire and the envelope; the hub MCP server author can build, deploy, and version the Worker without further Runtime sign-off as long as `notifications/agent_message` carries `_meta.pie_dedup_key` and `_meta.pie_summary` per the existing `McpNotificationHook` convention (PR #56). The only Runtime-side prerequisite for shipping is that issue #110 has landed (without it, `HubTrustGate` falls back to fail-closed deny on cross-namespace — see §5.OQ-6).
+
+Implementation-side, this is the §1 → §1.5 → sub-PR sequencing: the four reuse rows in the §1.5 ledger are zero-code citations in the implementation PR; the four "new" rows on the Runtime side (`make_pie_hub_notification_hook`, `HubTrustGate`, `~/.pie/hub-trust.json` schema, `fefe_trust_decision` Custom audit) collectively fit in roughly 400 LoC of `crates/agent` Rust plus tests, all behind §5 / §5.7 / #110 v0.2 design contracts already on `main` or in flight.
 
 ### §1.5 Reuse-vs-new ledger
 
