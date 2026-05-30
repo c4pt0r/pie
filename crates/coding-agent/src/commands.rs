@@ -1385,7 +1385,8 @@ fn preview_mention(sender: &str) -> String {
 }
 
 fn safe_agent_mention(agent: &crate::hub_client::HubAgentSummary) -> String {
-    crate::hub_client::parse_mention(&agent.mention()).unwrap_or_else(|| "@unknown@hub".into())
+    let redacted = redact_hub_status_text(&agent.mention());
+    crate::hub_client::parse_mention(&redacted).unwrap_or_else(|| "@unknown@hub".into())
 }
 
 fn render_inbox_flags(item: &crate::hub_client::HubInboxItem) -> String {

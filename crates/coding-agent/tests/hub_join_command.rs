@@ -275,7 +275,7 @@ async fn faux_hub_mcp_post(
                 "get_agent_profile" => json!({
                     "agent": {
                         "agent_id": "018fe23a-2222-4a22-8b33-123456789abc",
-                        "handle": "bob",
+                        "handle": "hub_agent_profile_secret",
                         "namespace": "dongxu",
                         "display_name": "Bob Cheng hub_agent_profile_secret 018fe23a-9999-4a22-8b33-123456789abc xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
                         "capabilities": ["notify"],
@@ -287,7 +287,7 @@ async fn faux_hub_mcp_post(
                     "items": [
                         {
                             "agent_id": "018fe23a-2222-4a22-8b33-123456789abc",
-                            "handle": "bob",
+                        "handle": "hub_agent_candidate_secret",
                             "namespace": "dongxu",
                             "display_name": "Bob Cheng hub_agent_candidate_secret 018fe23a-aaaa-4a22-8b33-123456789abc",
                             "capabilities": ["notify"],
@@ -501,7 +501,7 @@ async fn hub_send_command_resolves_mentions_and_outputs_bounded_status() {
 
     let text = capture.text();
     assert!(
-        text.contains("sent hub notification to @bob@dongxu"),
+        text.contains("sent hub notification to @unknown@hub"),
         "{text}"
     );
     assert!(text.contains("hello from alice"), "{text}");
@@ -620,12 +620,12 @@ async fn hub_send_prefix_lookup_lists_safe_mentions() {
         cwd: &cwd,
     };
 
-    let outcome = commands::dispatch("/hub send @bo", &registry, &ctx).await;
+    let outcome = commands::dispatch("/hub send @hub_agent", &registry, &ctx).await;
     assert!(matches!(outcome, commands::CommandOutcome::Handled));
 
     let text = capture.text();
     assert!(text.contains("Matching hub agents:"), "{text}");
-    assert!(text.contains("@bob@dongxu"), "{text}");
+    assert!(text.contains("@unknown@hub"), "{text}");
     assert!(text.contains("Bob Cheng"), "{text}");
     assert!(
         text.contains("use /hub send @handle@namespace \"message\""),
