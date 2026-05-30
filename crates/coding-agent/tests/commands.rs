@@ -9,9 +9,10 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 
 use pie_agent_core::{
-    AgentHarness, AgentHarnessOptions, AgentMessage, AgentTool, LoadSkillsOutput,
-    MemorySessionStorage, OnTurnEndContext, ReloadSkillsFn, Session, SessionStorage,
-    SessionTreeEntry, Skill, SkillSource, ThinkingLevel, TurnEndAction,
+    AgentHarness, AgentHarnessOptions, AgentMessage, AgentTool, ControlPlanePromptDecision,
+    LoadSkillsOutput, MemorySessionStorage, OnControlPlanePromptHook, OnTurnEndContext,
+    ReloadSkillsFn, Session, SessionStorage, SessionTreeEntry, Skill, SkillSource, ThinkingLevel,
+    TurnEndAction,
 };
 use pie_ai::{
     AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream, AssistantRole,
@@ -59,6 +60,17 @@ mod tools;
 #[allow(dead_code)]
 #[path = "../src/triggers/mod.rs"]
 mod triggers;
+
+/// Auto-approve `on_control_plane_prompt` for tests that exercise a tool whose
+/// `permission_classification` returns `Prompt` (issue #110 sub-PR 3 — `NewTriggerTool`,
+/// `RemoveTriggerTool`, `SetTriggerStateTool` enable, `InstallSkillTool`, `RemoveSkillTool`,
+/// `SetSkillStateTool` enable). Without this, the harness defaults to fail-closed deny and
+/// the tool's `execute` never runs. Production behavior is gated on the embedder's real
+/// prompt card; these integration tests focus on the post-approval code path.
+fn allow_all_control_plane_hook() -> OnControlPlanePromptHook {
+    use std::sync::Arc;
+    Arc::new(|_req, _cancel| Box::pin(async { ControlPlanePromptDecision::Allow }))
+}
 
 fn faux_model() -> pie_ai::Model {
     pie_ai::Model {
@@ -767,6 +779,12 @@ async fn dispatch_new_trigger_registers_dynamic_rule() {
     let mut opts = AgentHarnessOptions::new(faux_model(), session.clone());
     opts.tools = vec![Arc::new(triggers::NewTriggerTool) as Arc<dyn AgentTool>];
     opts.stream_fn = Some(new_trigger_extraction_stream());
+    // Issue #110 sub-PR 3: NewTriggerTool::permission_classification returns
+    // Prompt — without an explicit hook the harness defaults to fail-closed
+    // deny and the tool never runs. This test focuses on the post-approval
+    // path, so install an auto-approve hook. Production deployments rely on
+    // the embedder's real prompt card; see PR #138 for the CLI/TUI wiring.
+    opts.on_control_plane_prompt = Some(allow_all_control_plane_hook());
     let harness = Arc::new(AgentHarness::new(opts));
 
     let registry = commands::Registry::with_builtins();

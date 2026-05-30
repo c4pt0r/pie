@@ -52,7 +52,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use once_cell::sync::Lazy;
 use pie_agent_core::{
-    AgentTool, AgentToolError, AgentToolResult, AgentToolUpdate, ToolExecutionMode,
+    AgentTool, AgentToolError, AgentToolResult, AgentToolUpdate, PermissionClassification,
+    ToolExecutionMode,
 };
 use pie_ai::{Tool, UserContentBlock};
 use serde::Deserialize;
@@ -129,6 +130,23 @@ impl AgentTool for InstallSkillTool {
         // reload — request sequential execution so it doesn't race other tool calls in
         // the same turn (e.g. a second InstallSkill, or reads of the skill catalog).
         Some(ToolExecutionMode::Sequential)
+    }
+
+    /// Issue #110 sub-PR 3 classifier — every install is a persistent control-plane write
+    /// that grows the model's tool surface, so always route through the
+    /// `on_control_plane_prompt` channel. The bounded reason names the source kind only
+    /// (`url` / `path` / `content`); the URL / path string itself is potentially
+    /// secret-bearing (e.g. tokenized URLs) and is kept out of the prompt label per the
+    /// Provider/Auth URL audit-redaction discipline (PR `742dd6c`).
+    fn permission_classification(&self, prepared_args: &Value) -> PermissionClassification {
+        let source_kind = prepared_args
+            .get("source")
+            .and_then(|s| s.get("type"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("source");
+        PermissionClassification::Prompt {
+            reason: format!("install user skill from {source_kind}"),
+        }
     }
 
     async fn execute(

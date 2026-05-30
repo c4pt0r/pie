@@ -17,9 +17,9 @@ use parking_lot::Mutex;
 use pie_agent_core::{
     AgentTool, AgentToolError, AgentToolResult, AgentToolUpdate, BeforeTriggerActionContext,
     BeforeTriggerActionHook, CredentialScope, HarnessEvent, HarnessListener, HookError, HookState,
-    NotificationHook, NotificationHookStatus, PayloadVisibility, PromoteAction, ReplacementPolicy,
-    SourceKind, ToolExecutionMode, Trigger, TriggerAction, TriggerAuthority, TriggerDelivery,
-    TriggerSink, TriggerSource,
+    NotificationHook, NotificationHookStatus, PayloadVisibility, PermissionClassification,
+    PromoteAction, ReplacementPolicy, SourceKind, ToolExecutionMode, Trigger, TriggerAction,
+    TriggerAuthority, TriggerDelivery, TriggerSink, TriggerSource,
 };
 use pie_ai::{Tool, UserContentBlock};
 use serde::{Deserialize, Serialize};
@@ -767,6 +767,34 @@ impl AgentTool for NewTriggerTool {
         Some(ToolExecutionMode::Parallel)
     }
 
+    /// Issue #110 sub-PR 3 classifier — every new dynamic trigger is a persistent
+    /// agent-self-modification: the model attaches a recurring action to a future external
+    /// event. Always Prompt. The bounded reason names the trigger's `condition` and `action`
+    /// in summary form (callers may pass either a structured rule via `condition` + `action`
+    /// or a free-form `spec` string; the reason takes whichever is present, truncated).
+    fn permission_classification(&self, prepared_args: &Value) -> PermissionClassification {
+        // Keep the reason short and free of raw payload — the embedder prompt card carries
+        // the full args separately. 80-char cap matches §5.10 `event_label` discipline.
+        fn brief(v: Option<&Value>) -> Option<String> {
+            v.and_then(|x| x.as_str()).map(|s| {
+                let mut out = s.trim().chars().take(80).collect::<String>();
+                if s.chars().count() > 80 {
+                    out.push('…');
+                }
+                out
+            })
+        }
+        let condition = brief(prepared_args.get("condition"));
+        let action = brief(prepared_args.get("action"));
+        let spec = brief(prepared_args.get("spec"));
+        let reason = match (condition, action, spec) {
+            (Some(c), Some(a), _) => format!("create trigger: when `{c}` then `{a}`"),
+            (_, _, Some(s)) => format!("create trigger from spec: `{s}`"),
+            _ => "create dynamic trigger".to_string(),
+        };
+        PermissionClassification::Prompt { reason }
+    }
+
     async fn execute(
         &self,
         _id: &str,
@@ -881,6 +909,25 @@ impl AgentTool for RemoveTriggerTool {
         Some(ToolExecutionMode::Parallel)
     }
 
+    /// Issue #110 sub-PR 3 classifier — every trigger removal is a destructive
+    /// control-plane write. Prompt with a reason that distinguishes single-id removal from
+    /// the `all = true` bulk path (which is meaningfully more destructive and gets its own
+    /// emphasized reason on the prompt card).
+    fn permission_classification(&self, prepared_args: &Value) -> PermissionClassification {
+        let reason = if prepared_args
+            .get("all")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            "remove ALL dynamic triggers".to_string()
+        } else if let Some(id) = prepared_args.get("id").and_then(|v| v.as_str()) {
+            format!("remove dynamic trigger `{id}`")
+        } else {
+            "remove dynamic trigger".to_string()
+        };
+        PermissionClassification::Prompt { reason }
+    }
+
     async fn execute(
         &self,
         _id: &str,
@@ -941,6 +988,27 @@ impl AgentTool for SetTriggerStateTool {
 
     fn execution_mode(&self) -> Option<ToolExecutionMode> {
         Some(ToolExecutionMode::Parallel)
+    }
+
+    /// Issue #110 sub-PR 3 classifier — same narrowing/escalating split as
+    /// `SetSkillStateTool`: disabling an existing trigger is narrowing (the trigger stops
+    /// firing) and falls through `Allow`; re-enabling an existing trigger is escalating
+    /// (the model re-opens a recurring side-effect path) and routes through the prompt.
+    fn permission_classification(&self, prepared_args: &Value) -> PermissionClassification {
+        let enabled = prepared_args
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !enabled {
+            return PermissionClassification::Allow;
+        }
+        let id = prepared_args
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unknown>");
+        PermissionClassification::Prompt {
+            reason: format!("re-enable dynamic trigger `{id}`"),
+        }
     }
 
     async fn execute(

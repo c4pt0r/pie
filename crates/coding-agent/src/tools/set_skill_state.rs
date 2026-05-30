@@ -1,37 +1,41 @@
-//! `SetSkillState` builtin tool (skill-lifecycle task #23, S-A2): **disable** a loaded skill
-//! at runtime without editing its `SKILL.md`.
+//! `SetSkillState` builtin tool (skill-lifecycle task #23, S-A2): enable or disable a loaded
+//! skill at runtime without editing its `SKILL.md`.
 //!
 //! Persistence is the `~/.pie/skills-state.json` overlay (see [`crate::skills_state`]) keyed
 //! by `{source, name}` — the user's SKILL.md stays pristine and the choice survives restarts
 //! and reloads. Works for ANY source: a builtin or project skill that can't be deleted can
 //! still be disabled. (Removal of user-installed skills is the separate `RemoveSkill` tool.)
 //!
-//! **Disable-only (Provider/Auth gate, PR #108)**: the model-facing tool rejects
-//! `enabled: true`. Re-enabling is a persistent privilege escalation (re-opening a skill an
-//! author or user disabled) and, until `ControlPlaneWrite` has a real user-Prompt gate, the
-//! two-phase confirm is model-self-confirmed rather than user-mediated. Enabling is therefore
-//! a user action via the `/skills enable <name>` slash command (S-B), which calls the same
-//! `skills_state::set_and_save(.., enabled=true)` under a real keystroke. The overlay itself
-//! supports both states; only the tool surface is restricted.
+//! **Authorization model (issue #110 sub-PR 3, post-PR-#108 lift)**: the model-facing tool is
+//! no longer disable-only. The narrowing/escalating split moved from `execute` into
+//! [`AgentTool::permission_classification`]:
+//! - `enabled: false` (disable) is narrowing → `PermissionClassification::Allow`. The model
+//!   may disable a skill on its own; the user can always re-enable via `/skills enable`.
+//! - `enabled: true` (re-enable) is escalating → `PermissionClassification::Prompt` with a
+//!   bounded reason naming the skill. The runtime routes through `on_control_plane_prompt`
+//!   (PRs #135 / #137 / #138), and the user explicitly confirms each re-enable through the
+//!   embedder prompt card. Replaces the PR #108 hard-block stopgap.
 //!
 //! Safety:
-//! - Two-phase: the first call (without `confirm: true`) previews the change (current vs
-//!   target enabled state, resolved source) without writing. `confirm: true` applies it.
-//! - `PermissionCategory::ControlPlaneWrite` (persistent agent self-modification), same tier
-//!   as trigger/skill writes. The two-phase schema is the immediate guard while the runtime
-//!   Prompt path for that category is wired (shared follow-up across all control-plane tools).
+//! - Two-phase preview: the first call (without `confirm: true`) previews the change (current
+//!   vs target enabled state, resolved source) without writing. `confirm: true` applies it.
+//!   The preview is now a UX affordance (lets the model surface its intent in chat before the
+//!   user sees the prompt card); the actual security gate is `permission_classification`.
 //! - Source resolution is unambiguous: `harness.skills()` is deduped by name (project shadows
 //!   user), so the active skill for a name has exactly one source. The optional `source` arg,
 //!   if given, must match the resolved source.
 //! - Audit: `Custom { custom_type: "skill_control_plane" }` records op/name/source/
-//!   before+after enabled state + actor. No skill body.
+//!   before+after enabled state + actor. No skill body. Issue #110 sub-PR 1.5 additionally
+//!   writes a `control_plane_prompt` audit entry on the runtime side for every prompt
+//!   resolution; the two audits complement each other (per-decision vs. per-state-change).
 
 use std::path::PathBuf;
 
 use async_trait::async_trait;
 use once_cell::sync::Lazy;
 use pie_agent_core::{
-    AgentTool, AgentToolError, AgentToolResult, AgentToolUpdate, SkillSource, ToolExecutionMode,
+    AgentTool, AgentToolError, AgentToolResult, AgentToolUpdate, PermissionClassification,
+    SkillSource, ToolExecutionMode,
 };
 use pie_ai::{Tool, UserContentBlock};
 use serde::Deserialize;
@@ -95,6 +99,31 @@ impl AgentTool for SetSkillStateTool {
         Some(ToolExecutionMode::Sequential)
     }
 
+    /// Issue #110 sub-PR 3 classifier — branches on the prepared `enabled` arg:
+    /// - `enabled: false` (disable) is **narrowing** — the model cannot use a skill the user
+    ///   already disabled. No user confirmation needed; the classifier returns `Allow`.
+    /// - `enabled: true` (re-enable) is **escalating** — re-opens a skill an author or user
+    ///   intentionally disabled. The model cannot self-authorize this; the runtime routes
+    ///   through the `on_control_plane_prompt` channel (PR #135 / #138) for explicit user
+    ///   confirmation. The hard-block stopgap from PR #108 has been lifted — re-enabling is
+    ///   now allowed once the user approves the prompt.
+    fn permission_classification(&self, prepared_args: &Value) -> PermissionClassification {
+        let enabled = prepared_args
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !enabled {
+            return PermissionClassification::Allow;
+        }
+        let name = prepared_args
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unknown>");
+        PermissionClassification::Prompt {
+            reason: format!("re-enable user-disabled skill `{name}`"),
+        }
+    }
+
     async fn execute(
         &self,
         _id: &str,
@@ -105,24 +134,10 @@ impl AgentTool for SetSkillStateTool {
         let input: Input = serde_json::from_value(params)
             .map_err(|e| AgentToolError::Message(format!("invalid arguments: {e}")))?;
 
-        // Security gate (Provider/Auth review on PR #108): the model-facing tool may only
-        // DISABLE a skill. Re-enabling is a persistent privilege escalation — a skill the
-        // author shipped with `disable_model_invocation=true`, or one a user explicitly
-        // disabled, would be re-opened by the model itself. Because `ControlPlaneWrite` has
-        // no real user-Prompt gate yet (the two-phase confirm is model-self-confirmed, not
-        // user-mediated), enabling must come from an explicit user action — the
-        // `/skills enable <name>` slash command (S-B), which calls
-        // `skills_state::set_and_save(.., enabled=true)` under a real user keystroke. Lift
-        // this restriction once the runtime Prompt path for ControlPlaneWrite lands.
-        if input.enabled {
-            return Err(AgentToolError::Message(format!(
-                "the SetSkillState tool can only disable a skill, not enable one. Re-enabling \
-                 '{}' is a user action — run `/skills enable {}` in the terminal. (Enabling \
-                 via the tool will be allowed once control-plane writes require user \
-                 confirmation.)",
-                input.name, input.name
-            )));
-        }
+        // PR #108's hard-block on `enabled: true` was a stopgap until ControlPlaneWrite had a
+        // real user-Prompt gate. Issue #110 sub-PRs 1 / 1.5 / 2 landed that channel; sub-PR 3
+        // moves the gate into `permission_classification` above so a user actually confirms
+        // each re-enable through the embedder prompt card. No code here re-rejects enable.
 
         let harness = self
             .harness
@@ -445,10 +460,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_rejects_enable_directing_to_slash_command() {
-        // Security gate (Provider/Auth, PR #108): the model-facing tool may only disable.
-        // `enabled: true` is rejected — even in preview — with a hint to the user-driven
-        // `/skills enable` command. No overlay is written and the skill stays disabled.
+    async fn classifier_routes_disable_through_allow_and_enable_through_prompt() {
+        // Issue #110 sub-PR 3 (Tools-MCP): the old PR #108 hard-block on `enabled: true` is
+        // gone. The classifier now narrows disables to `Allow` and routes enables through the
+        // `on_control_plane_prompt` channel so a real user (not the model) approves each
+        // re-enable. This test asserts the per-arg classification shape; the integration test
+        // for "Prompt + Deny actually blocks the tool" lives in the agent crate's
+        // `permission_classification_prompt_with_hook_deny_blocks_and_emits_audit_event`.
+        let dir = tempfile::tempdir().unwrap();
+        let (_harness, cell) = build(
+            vec![skill("foo", SkillSource::User, true)],
+            dir.path().into(),
+        );
+        let tool = SetSkillStateTool::with_base_dir(cell, dir.path().into());
+
+        // Disable = narrowing = Allow.
+        let disable = tool.permission_classification(&json!({"name": "foo", "enabled": false}));
+        assert!(
+            matches!(disable, PermissionClassification::Allow),
+            "disable must classify as Allow (narrowing), got {disable:?}"
+        );
+
+        // Enable = escalating = Prompt with the skill name in the reason. The bounded reason
+        // is what the embedder renders on the confirmation card (per §6b.5 prompt card UX).
+        let enable = tool.permission_classification(&json!({"name": "foo", "enabled": true}));
+        match enable {
+            PermissionClassification::Prompt { reason } => {
+                assert!(
+                    reason.contains("re-enable"),
+                    "reason must signal escalation, got: {reason}"
+                );
+                assert!(
+                    reason.contains("`foo`"),
+                    "reason must include the bounded skill name, got: {reason}"
+                );
+            }
+            other => panic!("enable must classify as Prompt, got {other:?}"),
+        }
+
+        // Missing `enabled` field defaults to `false` (narrowing) — defensive default.
+        let missing = tool.permission_classification(&json!({"name": "foo"}));
+        assert!(
+            matches!(missing, PermissionClassification::Allow),
+            "missing enabled must default to narrowing (Allow), got {missing:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn enable_no_longer_short_circuits_in_execute() {
+        // Regression for PR #108's lifted hard-block: `enabled: true` is no longer rejected
+        // at execute() entry. (The runtime gate is `permission_classification` + the
+        // embedder's prompt hook; if the user denies, the agent loop never calls execute. If
+        // the user accepts, execute proceeds and the skill is re-enabled.)
         let dir = tempfile::tempdir().unwrap();
         let (harness, cell) = build(
             vec![skill("foo", SkillSource::User, true)],
@@ -456,45 +519,27 @@ mod tests {
         );
         let tool = SetSkillStateTool::with_base_dir(cell, dir.path().into());
 
-        for params in [
-            json!({"name": "foo", "enabled": true}),
+        // Direct execute() of an enable + confirm now succeeds (no model-side reject).
+        let result = exec(
+            &tool,
             json!({"name": "foo", "enabled": true, "confirm": true}),
-        ] {
-            let err = exec(&tool, params)
-                .await
-                .expect_err("enable must be rejected");
-            let AgentToolError::Message(m) = err else {
-                panic!("typed error")
-            };
-            assert!(
-                m.contains("/skills enable foo"),
-                "error should direct to the user command, got: {m}"
-            );
-        }
+        )
+        .await
+        .expect("execute(enable) must succeed once the prompt-gate stopgap is lifted");
+        assert!(
+            !result.content.is_empty(),
+            "successful enable returns a result message"
+        );
 
-        // Frontmatter-disabled skill stays disabled; no overlay written.
+        // Skill is now enabled in the live catalog after the reload.
         let foo = harness
             .skills()
             .into_iter()
             .find(|s| s.name == "foo")
             .unwrap();
-        assert!(foo.disable_model_invocation, "skill remains disabled");
         assert!(
-            !skills_state::state_path(dir.path()).exists(),
-            "rejected enable must not write the overlay"
-        );
-        // No audit entry either — the gate returns before any session write (QA gate:
-        // rejected enable must not write overlay, reload, or audit).
-        let audited = harness
-            .session()
-            .entries()
-            .await
-            .unwrap()
-            .iter()
-            .any(|e| matches!(e, pie_agent_core::SessionTreeEntry::Custom { custom_type, .. } if custom_type == "skill_control_plane"));
-        assert!(
-            !audited,
-            "rejected enable must not write a skill_control_plane audit entry"
+            !foo.disable_model_invocation,
+            "skill is enabled after execute(enable)"
         );
     }
 

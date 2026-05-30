@@ -10,9 +10,9 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use pie_agent_core::{
     AgentHarness, AgentHarnessOptions, AgentTool, AgentToolError, AgentToolResult, AgentToolUpdate,
-    CredentialScope, HarnessEvent, MemorySessionStorage, PayloadVisibility, ReplacementPolicy,
-    Session, SessionStorage, Skill, SkillSource, SourceKind, StreamFn, Trigger, TriggerAuthority,
-    TriggerSource,
+    ControlPlanePromptDecision, CredentialScope, HarnessEvent, MemorySessionStorage,
+    OnControlPlanePromptHook, PayloadVisibility, ReplacementPolicy, Session, SessionStorage, Skill,
+    SkillSource, SourceKind, StreamFn, Trigger, TriggerAuthority, TriggerSource,
 };
 use pie_ai::{
     AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream, AssistantRole,
@@ -36,6 +36,16 @@ mod triggers;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 static DYNAMIC_TRIGGER_LOCK: Mutex<()> = Mutex::new(());
+
+/// Auto-approve `on_control_plane_prompt` for tests that exercise tools whose
+/// `permission_classification` returns `Prompt` (issue #110 sub-PR 3 — `NewTriggerTool`,
+/// `RemoveTriggerTool`, `SetTriggerStateTool` enable). Without this, the harness defaults
+/// to fail-closed deny and the tool never runs. These integration tests focus on the
+/// post-approval code paths; the real prompt-card UX lives in PR #138.
+fn allow_all_control_plane_hook() -> OnControlPlanePromptHook {
+    use std::sync::Arc;
+    Arc::new(|_req, _cancel| Box::pin(async { ControlPlanePromptDecision::Allow }))
+}
 
 fn faux_model() -> pie_ai::Model {
     pie_ai::Model {
@@ -494,6 +504,7 @@ async fn natural_language_prompt_creates_dynamic_trigger_and_runtime_event_execu
     let storage = Arc::new(MemorySessionStorage::new());
     let session = Session::new(storage.clone() as Arc<dyn SessionStorage>);
     let mut opts = AgentHarnessOptions::new(faux_model(), session.clone());
+    opts.on_control_plane_prompt = Some(allow_all_control_plane_hook());
     opts.tools = vec![
         Arc::new(triggers::NewTriggerTool) as Arc<dyn AgentTool>,
         Arc::new(RecordingBashTool::new(bash_calls.clone())) as Arc<dyn AgentTool>,
@@ -569,6 +580,7 @@ async fn natural_language_scheduled_job_creates_cron_not_dynamic_trigger_chinese
     let storage = Arc::new(MemorySessionStorage::new());
     let session = Session::new(storage as Arc<dyn SessionStorage>);
     let mut opts = AgentHarnessOptions::new(faux_model(), session);
+    opts.on_control_plane_prompt = Some(allow_all_control_plane_hook());
     opts.tools = vec![
         Arc::new(triggers::NewCronJobTool::new(None)) as Arc<dyn AgentTool>,
         Arc::new(triggers::NewTriggerTool) as Arc<dyn AgentTool>,
@@ -600,6 +612,7 @@ async fn natural_language_scheduled_job_creates_cron_not_dynamic_trigger_english
     let storage = Arc::new(MemorySessionStorage::new());
     let session = Session::new(storage as Arc<dyn SessionStorage>);
     let mut opts = AgentHarnessOptions::new(faux_model(), session);
+    opts.on_control_plane_prompt = Some(allow_all_control_plane_hook());
     opts.tools = vec![
         Arc::new(triggers::NewCronJobTool::new(None)) as Arc<dyn AgentTool>,
         Arc::new(triggers::NewTriggerTool) as Arc<dyn AgentTool>,
@@ -631,6 +644,7 @@ async fn promoted_dynamic_trigger_result_enters_parent_chat_context() {
     let storage = Arc::new(MemorySessionStorage::new());
     let session = Session::new(storage.clone() as Arc<dyn SessionStorage>);
     let mut opts = AgentHarnessOptions::new(faux_model(), session.clone());
+    opts.on_control_plane_prompt = Some(allow_all_control_plane_hook());
     opts.tools = vec![
         Arc::new(triggers::NewTriggerTool) as Arc<dyn AgentTool>,
         Arc::new(RecordingBashTool::new(bash_calls.clone())) as Arc<dyn AgentTool>,
@@ -722,6 +736,7 @@ async fn audit_only_match_is_not_promoted_when_other_rule_requests_chat_promotio
     let storage = Arc::new(MemorySessionStorage::new());
     let session = Session::new(storage.clone() as Arc<dyn SessionStorage>);
     let mut opts = AgentHarnessOptions::new(faux_model(), session.clone());
+    opts.on_control_plane_prompt = Some(allow_all_control_plane_hook());
     opts.tools = vec![Arc::new(RecordingBashTool::new(bash_calls.clone())) as Arc<dyn AgentTool>];
     opts.stream_fn = Some(dynamic_trigger_stream());
     opts.before_trigger_action = Some(triggers::before_trigger_action_hook(
@@ -776,6 +791,7 @@ async fn trigger_sub_agent_sees_parent_skill_catalog() {
     let storage = Arc::new(MemorySessionStorage::new());
     let session = Session::new(storage as Arc<dyn SessionStorage>);
     let mut opts = AgentHarnessOptions::new(faux_model(), session);
+    opts.on_control_plane_prompt = Some(allow_all_control_plane_hook());
     opts.skills = vec![Skill {
         name: "alpha".into(),
         description: "handles alpha workflows".into(),
@@ -833,6 +849,7 @@ async fn home_helloworld_trigger_prints_file_contents() {
     let storage = Arc::new(MemorySessionStorage::new());
     let session = Session::new(storage.clone() as Arc<dyn SessionStorage>);
     let mut opts = AgentHarnessOptions::new(faux_model(), session.clone());
+    opts.on_control_plane_prompt = Some(allow_all_control_plane_hook());
     opts.tools = vec![
         Arc::new(triggers::NewTriggerTool) as Arc<dyn AgentTool>,
         Arc::new(HomeFileBashTool::new(bash_calls.clone())) as Arc<dyn AgentTool>,
@@ -921,6 +938,7 @@ async fn periodic_dynamic_hook_checks_rules_and_executes_matching_action() {
     let storage = Arc::new(MemorySessionStorage::new());
     let session = Session::new(storage as Arc<dyn SessionStorage>);
     let mut opts = AgentHarnessOptions::new(faux_model(), session);
+    opts.on_control_plane_prompt = Some(allow_all_control_plane_hook());
     opts.tools = vec![Arc::new(RecordingBashTool::new(bash_calls.clone())) as Arc<dyn AgentTool>];
     opts.stream_fn = Some(dynamic_trigger_stream());
     opts.before_trigger_action = Some(triggers::before_trigger_action_hook(registry.clone()));

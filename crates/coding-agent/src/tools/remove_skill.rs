@@ -24,7 +24,8 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use once_cell::sync::Lazy;
 use pie_agent_core::{
-    AgentTool, AgentToolError, AgentToolResult, AgentToolUpdate, SkillSource, ToolExecutionMode,
+    AgentTool, AgentToolError, AgentToolResult, AgentToolUpdate, PermissionClassification,
+    SkillSource, ToolExecutionMode,
 };
 use pie_ai::{Tool, UserContentBlock};
 use serde::Deserialize;
@@ -79,6 +80,20 @@ impl AgentTool for RemoveSkillTool {
         // Deletes a directory + reloads the catalog — serialize against other control-plane
         // writes in the same turn.
         Some(ToolExecutionMode::Sequential)
+    }
+
+    /// Issue #110 sub-PR 3 classifier — removing a user skill is a destructive
+    /// control-plane write the model cannot self-authorize. Always route through the prompt
+    /// channel. The bounded reason includes the skill name (which the user already typed
+    /// into a prior session or saw in `/skills`) so the prompt card is decision-useful.
+    fn permission_classification(&self, prepared_args: &Value) -> PermissionClassification {
+        let name = prepared_args
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unknown>");
+        PermissionClassification::Prompt {
+            reason: format!("remove user skill `{name}`"),
+        }
     }
 
     async fn execute(
