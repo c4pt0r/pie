@@ -93,7 +93,7 @@ This does NOT change the "no real Cloudflare in build/test CI" rule (§8). Build
 | 4   | Visibility model                                               | @alice                                      | **v0.2**            |
 | 5   | Notification routing / delivery semantics                      | @Runtime-dev-lead                           | **v0.1**            |
 | 6a  | Client integration (contract + runtime boundary)               | @Tools-MCP-Lead                             | **v0.1**            |
-| 6b  | `/hub *` CLI / TUI surface                                     | @CLI-TUI-Dev-Lead                           | TBD                 |
+| 6b  | `/hub *` CLI / TUI surface                                     | @CLI-TUI-Dev-Lead                           | **v0.1**            |
 | 7   | Worker implementation + storage                                | **TBD**                                     | TBD                 |
 | 8   | Deployment / `CF_API_KEY` / CI / acceptance / release gate     | @QA-Release-Lead                            | **v0.1**            |
 
@@ -1519,11 +1519,234 @@ work fully through the §4.2 "direct route" path.
 - Issue #20 (RFC 1) — existing `Transport` trait, `McpClient`, `McpNotificationHook` building blocks.
 - Issue #110 — `BeforeToolCallResult::Prompt` / `HarnessEvent::TriggerPromptRequest` channel reused by `HubTrustGate`.
 
-## §6b `/hub *` CLI / TUI surface
+## §6b `/hub *` CLI / TUI surface — v0.1 (@CLI-TUI-Dev-Lead)
 
-TBD — @CLI-TUI-Dev-Lead. User-facing surface: `/hub login`, `/hub register`, `/hub status`, `/hub list`, Hub panel in the TUI, Feed-line display rules for hub-originated notifications, error wording with next-step recovery actions (per Provider-Auth-Lead's "internal vocabulary → user recovery action" rule).
+> Status: **v0.1 draft.** Defines user-visible commands, status surfaces,
+> first-contact prompt UX, and redaction / test gates for the hub client.
+> The CLI / TUI / Web layer consumes the §6a engine API only; it does not own
+> a second hub client and does not parse raw MCP responses.
 
-**§6a × §6b contract.** CLI commands call §6a's engine API only. CLI does not parse hub MCP responses directly, does not own connection state, does not run a parallel client. Schema lives in §6a. Mirrors the engine / slash-command split in [[02-slash-commands]] task #23.
+### §6b.1 What this chapter owns
+
+This chapter owns the **user path** for hub setup, observability, and trust
+decisions:
+
+- `/hub *` slash commands and their recovery-oriented output.
+- TUI and Web status surfaces for the configured hub connection.
+- First-contact prompt card rendering and user decisions
+  (`Accept once` / `Always` / `Block` / `Deny` / `Timeout`).
+- Feed-line display rules for hub-originated notifications and post-trigger
+  results.
+- Mapping §2 / §3 hub errors to user recovery actions without exposing
+  internal vocabulary.
+- User-path test requirements: command dispatch, prompt decisions,
+  queue / suspended-turn behavior, TUI / Web parity, and redaction.
+
+Not in scope: MCP wire schemas (§2), identity / token lifecycle (§3),
+visibility policy semantics (§4), trigger envelope / trust file schemas (§5),
+the `HttpMcpTransport` / loader implementation (§6a), Worker code (§7), or
+deploy / live e2e gates (§8).
+
+### §6b.2 Engine boundary — no parallel client
+
+All `/hub *` commands call the engine APIs defined in §6a:
+
+- The UI reads hub connection state from `LoadedMcp` / `mcp_loader`-owned
+  state and bounded status snapshots.
+- The UI asks the engine to execute hub operations (`register_agent`,
+  `list_my_agents`, `discover_public_agents`, `send_notification`,
+  trust-list operations) rather than constructing MCP JSON-RPC manually.
+- The UI displays errors after they have been mapped into bounded recovery
+  hints; it never branches on raw hub JSON or raw MCP payload.
+- The UI does not read or write hub tokens directly. It may ask the auth
+  store to resolve a logical handle, but token bytes never enter slash command
+  output, TUI state, Web `/state`, feed lines, audit, or bug reports.
+
+This mirrors the skill-control split from task #23: engine owns durable state
+and security semantics; slash commands own wording, discoverability, and
+interactive confirmation.
+
+### §6b.3 Slash command surface
+
+Commands are intentionally small and recovery-oriented. Subcommands may be
+implemented in phases, but the grammar below is the v0 target:
+
+| Command | Purpose | Output shape |
+| --- | --- | --- |
+| `/hub status` | Show local hub config, connection, auth, current agent registration, and last delivery state. | Compact table + recovery hint. No token, cookie, raw endpoint credential, or trust-file body. |
+| `/hub login` | Start or repair the human / namespace session required by §3.2. | Opens or prints the bounded login recovery path. Does not accept password text inside chat/TUI. |
+| `/hub register [--handle <handle>] [--name <display_name>]` | Register this local pie agent in the logged-in namespace (§3.3). | Shows handle, namespace, agent id suffix / copyable id, visibility / inbox defaults, and next steps. |
+| `/hub profile [--name ...] [--description ...] [--capability ...]` | Update prompt-bounded profile fields (§4.4). | Shows bounded diff of display fields only. Reject markdown links / over-cap fields before calling engine. |
+| `/hub visibility [--discoverable <public|namespace|none>] [--inbox <open|namespace|invited|closed>]` | Update the two-axis visibility model (§4.2). | Shows old → new values and recovery if policy conflicts with sends. |
+| `/hub list [--mine|--public|--namespace]` | List own / discoverable agents through §2 discovery tools. | Bounded list fields only: handle, namespace, display name, visibility summary, status. |
+| `/hub send <agent_ref> <message>` | Send a notification through the hub. Primarily a smoke / explicit user path; model-facing sends use engine tools. | Shows trace id / delivery state. Never echoes full raw payload after dispatch. |
+| `/hub inbox [--limit N]` | Inspect bounded received / pending notification metadata. | Trace id, sender handle, timestamp, state, summary; no raw payload. |
+| `/hub trust list` | Show receiver-owned trust / block state from `~/.pie/hub-trust.json` via embedder API. | Sender handle / agent id suffix, action class, state, created / last used; no raw file dump. |
+| `/hub trust revoke <agent_ref>` | Remove an `Always` trust decision for a sender/action tuple. | Confirmation + bounded audit line. |
+| `/hub block <agent_ref>` | Persistently block a sender for notification action class. | Confirmation + bounded audit line. |
+| `/hub unblock <agent_ref>` | Remove a block entry. | Confirmation + bounded audit line. |
+| `/hub rotate` | Rotate this agent's hub token (§3.3). | Success / recovery only. Never displays old or new token. |
+| `/hub logout` | Clear local human session / mark agent token stale. | Local-only state summary + next login/register steps. |
+
+`agent_ref` accepts the human-readable handle form (`@handle@namespace`) and,
+where ambiguity matters, the immutable `agent_id`. Trust, block, audit, and
+send authorization always resolve to immutable `agent_id`; handles are display
+aliases only.
+
+### §6b.4 TUI and Web status surfaces
+
+The main TUI may show a compact "Hub" row / panel when a hub entry exists.
+The Web `/state` snapshot exposes the same bounded fields.
+
+Visible fields:
+
+- Hub name and endpoint host only (`pie-hub`, `pie.0xfefe.me`), not full
+  secret-bearing URLs.
+- Connection state: `not configured`, `connecting`, `connected`,
+  `reconnecting`, `offline`, `auth required`, `revoked`.
+- Logged-in namespace and registered agent handle / agent id suffix.
+- Visibility summary: `discoverable`, `inbox`.
+- Last heartbeat / last delivery timestamp.
+- Pending first-contact prompt count.
+- Last bounded error recovery action.
+
+Forbidden fields:
+
+- Hub token, human session cookie, `CF_API_KEY`, provider API keys.
+- Raw notification payload, raw MCP JSON, raw deploy logs.
+- Raw `~/.pie/hub-trust.json` contents or raw `local_receiver_instance_id`.
+- Password hashes, database rows, Cloudflare binding names / secrets.
+
+Status surfaces should be quiet by default. Normal reconnect / heartbeat noise
+does not enter the main conversation feed; only user-actionable state changes
+and completed notification-trigger results are surfaced.
+
+### §6b.5 First-contact prompt card
+
+First-contact prompts are not ordinary chat messages. They render as a
+control-plane prompt card backed by #110's trigger prompt channel
+(`HarnessEvent::TriggerPromptRequest` / `resolve_trigger_prompt`) and §5.6's
+`HubTrustGate`.
+
+Prompt card fields:
+
+- Sender handle + namespace + immutable agent id suffix.
+- Prompt-bounded sender profile subset from §4.4:
+  `display_name`, `description`, `capabilities`.
+- Receiver handle / namespace (if registered).
+- Action class (`notification` for v0).
+- Bounded notification summary (`_meta.pie_summary`), trace id, timestamp.
+- Trust state: `new sender`, `trusted`, `blocked`, or `policy denied`.
+
+Available actions:
+
+- **Accept once** — resolves the current trigger prompt only. Writes
+  `trigger_prompt` audit; does not update `~/.pie/hub-trust.json`.
+- **Always** — resolves current prompt and persists the §5.7 trust tuple
+  (`local_receiver_instance_id + receiver_agent_id + sender_agent_id +
+  action_class`) via embedder code. Writes `fefe_trust_decision`.
+- **Block** — persists a block for that sender/action tuple and denies current
+  and future notifications. Writes `fefe_trust_decision`.
+- **Deny** — denies current prompt only. Does not persist trust or block.
+- **Timeout** — fail-closed deny after the #110 prompt timeout; display as
+  a distinct state so users can distinguish inaction from explicit denial.
+
+Queue and interruption rules:
+
+- A pending first-contact prompt suspends only the associated trigger; it does
+  not consume normal user prompt input.
+- If the agent is already streaming, the prompt appears in the control-plane
+  prompt area and waits for user action; it does not interleave into the
+  assistant's streaming text.
+- Additional user prompts remain in the existing turn queue. Resolving a hub
+  prompt must not clear unrelated queued input.
+- `Esc` / `Ctrl-C` on the prompt card denies the active prompt only; a second
+  `Ctrl-C` may still abort the running agent turn per existing TUI semantics.
+
+### §6b.6 Feed display rules
+
+Hub-originated status is split by user value:
+
+- **No feed line** for polling, heartbeat, reconnect retry, empty inbox, or
+  unactionable server-push bookkeeping.
+- **Status / prompt surface** for first-contact prompts, auth-required states,
+  revoked tokens, and delivery failures that need user recovery.
+- **Normal conversation feed** only after a notification has been accepted and
+  the receiving pie agent finishes the resulting trigger / LLM work. Display
+  it with a distinct but bounded prefix such as
+  `Hub notification from @handle@namespace` plus timestamp / trace id.
+
+Feed lines may include: handle, namespace, display name, trace id, timestamp,
+bounded summary, final assistant result. Feed lines must not include raw hub
+payloads, raw MCP JSON, tokens, cookies, or raw trust-file data.
+
+### §6b.7 Error wording and recovery actions
+
+UI copy follows the Provider/Auth rule: **internal cause → user recovery
+action**. Do not expose internal field names such as `Authorization`,
+`options.api_key`, worker binding names, database table names, or raw provider /
+hub error payloads unless the recovery action requires the literal user input.
+
+| Error / state | User-facing recovery |
+| --- | --- |
+| `session_expired` | "Hub login expired. Run `/hub login`." |
+| `auth_required` | "This agent is not connected to the hub. Run `/hub login`, then `/hub register`." |
+| `auth_invalid` | "Hub credential is invalid. Run `/hub rotate` or `/hub register`." |
+| `auth_revoked` | "Agent token was revoked. Run `/hub rotate` or register this agent again." |
+| `permission_denied` | "This sender is not allowed by the receiver's inbox policy. Check `/hub status` or ask the receiver to change inbox policy." |
+| `not_found` | "Agent not found. Run `/hub list --public` or verify the full `agent_id`." |
+| `rate_limited` | "Hub rate limit reached. Wait and retry." If §2 supplies `retry_after_ms`, render the bounded wait. |
+| `payload_too_large` | "Notification is too large. Shorten the message or send a bounded summary." |
+| `worker_unavailable` / transport offline | "Hub is temporarily unavailable. Pie will reconnect; run `/hub status` for details." |
+| trust file unreadable | "Local hub trust file is unreadable. First-contact will ask again; fix file permissions or remove the corrupt file." |
+
+### §6b.8 Tests and acceptance
+
+Implementation PRs for §6b must include user-path tests, not just helper unit
+tests:
+
+- Slash dispatch tests for `/hub status`, `/hub register`, `/hub list`,
+  `/hub trust`, `/hub block`, `/hub rotate`, and error mapping.
+- Redaction tests proving token-like strings, `CF_API_KEY`, session cookies,
+  raw payloads, and raw trust-file contents never appear in command output,
+  TUI snapshots, Web `/state`, or feed lines.
+- First-contact prompt rendering tests for `Accept once`, `Always`, `Block`,
+  `Deny`, and `Timeout`, including distinct visible states and audit calls.
+- Queue / suspended-trigger tests: a pending hub prompt does not run the
+  trigger until resolved and does not clear unrelated queued user input.
+- TUI and Web parity tests for hub status fields and bounded error recovery.
+- Feed tests proving heartbeat / no-op status does not flood the main feed,
+  while an accepted notification result appears with bounded sender metadata.
+- Config / auth recovery tests: missing hub config, invalid token, revoked
+  token, unauthenticated state, and offline hub all produce next-step copy.
+
+### §6b.9 Open questions
+
+| ID | Question | CLI/TUI take |
+| --- | --- | --- |
+| §6b.OQ-1 | Should `/hub login` open the browser, print a device-code flow, or both? | Lean both: open browser when possible, always print a bounded recovery URL / code. Never accept password text inside the chat/TUI. |
+| §6b.OQ-2 | Should `/hub send` be shipped in v0 or reserved for smoke/e2e only? | Lean ship as explicit user command because gate 6 needs human-debuggable sends. Keep model-facing send behind tools / engine policy, not slash parsing. |
+| §6b.OQ-3 | Should the Hub panel show by default, or only after `/hub status` / configured hub? | Lean only when configured or recently actionable; avoid permanent panel noise for users not using fefe. |
+| §6b.OQ-4 | How does Web UI render the first-contact prompt before full TUI parity? | Must render at least the same actions and bounded fields as TUI before gate 4; richer layout can follow. |
+| §6b.OQ-5 | Multiple hubs in `mcp.toml`: should `/hub` require `--hub <name>`? | For v0, canonical `pie-hub` is default; staging / extra hubs can use `--hub <entry.name>` in advanced commands. |
+| §6b.OQ-6 | What is the exact timeout UI after #110 lands? | Use #110 default timeout; render countdown only if cheap and stable. Timeout is always fail-closed deny. |
+
+### §6b.10 Cited from other chapters
+
+- [§2.6](#26-error-codes) — error code namespace and recovery hints.
+- [§3.3](#33-agent-registration-and-token-lifecycle) — token rotation,
+  revocation, and agent registration semantics.
+- [§4.2](#42-visibility-and-inbox-matrix) — `discoverable` / `inbox`
+  defaults and authorization model.
+- [§4.4](#44-agent-profile-schema) — list / detail / prompt-bounded profile
+  field subsets.
+- [§5.6](#56-first-contact-gate-hookup--issue-110) — `HubTrustGate` and the
+  first-contact trigger prompt.
+- [§5.7](#57-trust-decision-audit-and-persistence) — `~/.pie/hub-trust.json`
+  shape and `fefe_trust_decision` audit.
+- [§6a](#6a-client-integration--contract--runtime-boundary--v01-tools-mcp-lead)
+  — engine API, connection state, and transport boundary consumed by UI.
+- [§8.4](#84-per-phase-acceptance-matrix) — client UX gate.
 
 ## §7 Worker implementation + storage model
 
@@ -1793,3 +2016,4 @@ These complement, do not duplicate. `Accept once` writes only `trigger_prompt`. 
 | 2026-05-29 | @alice | §4 v0.2: folded review feedback accumulated across §3 v0.1 (PR #125), §5 v0.1 (PR #127), §8 v0.1 (PR #126), §2 v0.1 (PR #128), and #110 design v0.2 (PR #130). §4.2 matrix "direct route" cells cite §3.4 per-call auth precondition (sender `notification:send`, receiver `notification:receive`). §4.3 expanded: names #110 v0.2 Artifact D specifically (`HarnessEvent::TriggerPromptRequest` / `resolve_trigger_prompt`), cites §5.7 as canonical location for `fefe_trust_decision` and `~/.pie/hub-trust.json` shape, documents the two complementary audit types (`trigger_prompt` runtime + `fefe_trust_decision` embedder), and projects §3.4's `AgentPrincipal` ↔ §5.3's `TriggerAuthority`. §4.4 splits the profile schema into list / detail / prompt-bounded subsets — the prompt-bounded subset `{display_name, description, capabilities}` is what `BeforeTriggerActionContext` carries to the first-contact UI (per §5.OQ-1). §4 × §5 contract section refreshed accordingly. Chapter map status normalized to single-form ("v0.1" / "v0.2" without "draft" suffix); §8 title's `~/cf_token` → `CF_API_KEY` typo fixed in chapter map. Added coordinator-maintained "Cross-chapter artifact pointers" sub-section so reviewers can find canonical schemas (audit types, hub-trust.json shape, prompt channel, permission strings, error namespace, dedup key) without grepping. Defaults table extended with §3.2 human session timeouts, §2.5/§5.10 cap layering, #110 prompt timeout. Promoted **RFC-OQ-10** (per-machine receiver binding for `~/.pie/hub-trust.json` to defeat dotfile-sync trust replay; from §5.OQ-3, surfaced by @Runtime-dev-lead + @Provider-Auth-Lead in cross-doc review on #130 v0.2). |
 | 2026-05-29 | @Provider-Auth-Lead | §3 v0.2: resolved RFC-OQ-9 and RFC-OQ-10. Agent tokens default to no automatic expiry (`expires_at = null`) unless user/admin sets one, while rotate/revoke and bounded revoke behavior remain mandatory before v0 deploy. First-contact trust cache keys now include `local_receiver_instance_id + receiver_agent_id + sender_agent_id + action_class`; local instance id is random local state, not hardware identity, and audit/logs expose only `local_receiver_instance_id_hash`. Updated §5.OQ-3 and the `hub-trust.json` shape to match. |
 | 2026-05-29 | @Tools-MCP-Lead | §6a v0.1: client integration engine contract — `HttpMcpTransport` impl Transport over Streamable HTTP (POST + SSE), `~/.pie/mcp.toml` hub entry shape (`kind = "streamable_http"`), `mcp_loader::connect_one` dispatch extension, `make_pie_hub_notification_hook` factory call site, `Authorization: Bearer` header-only token discipline (per Provider/Auth §1 review ask), body-cap + error-mapping defense-in-depth, reconnect / `Last-Event-ID` resume / dedup wiring, embedder install point for `HubTrustGate` as `BeforeTriggerHook`, faux HTTP/SSE fixture test strategy. Owns the engine API only — CLI/TUI surface stays in §6b. |
+| 2026-05-29 | @CLI-TUI-Dev-Lead | §6b v0.1: `/hub *` CLI / TUI / Web UX surface — command grammar for status/login/register/profile/visibility/list/send/inbox/trust/block/rotate/logout; strict §6a engine-only boundary (no parallel hub client, no raw MCP parsing); Hub panel and Web state bounded fields; first-contact prompt card UX through #110 trigger prompt channel; feed display rules keeping heartbeat/reconnect noise out of the main conversation while showing accepted notification results; error-to-recovery copy table; user-path test matrix and open questions for login flow, `/hub send`, default panel visibility, Web prompt rendering, multi-hub selector, and timeout UI. |
