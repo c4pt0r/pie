@@ -29,9 +29,9 @@ on:
   workflow_dispatch:
     inputs:
       worker_dir:
-        description: "Worker source directory (default: worker/)"
+        description: "Worker source directory (default: workers/fefe-hub)"
         required: false
-        default: "worker/"
+        default: "workers/fefe-hub"
       wrangler_version:
         description: "Pinned wrangler version (default: 3)"
         required: false

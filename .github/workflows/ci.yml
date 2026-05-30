@@ -88,3 +88,20 @@ jobs:
           CODEX_AUTH_TOKEN: ""
           AZURE_OPENAI_API_KEY: ""
         run: cargo test --workspace
+
+  fefe-worker:
+    name: fefe worker
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: workers/fefe-hub
+    steps:
+      - uses: actions/checkout@v4
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: workers/fefe-hub/package-lock.json
+      - run: npm ci
+      - run: npm test

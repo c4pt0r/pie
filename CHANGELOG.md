@@ -134,6 +134,18 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
 - **#16** `--image <path>` CLI flag (repeatable, PNG/JPEG/WebP/GIF, 10 MiB per image, 10
   per message). Magic-byte mime detection.
 
+### Added — Tier 8 (cross-agent connectivity)
+
+- **#18** Initial `pie.0xfefe.me` Cloudflare Worker MVP under `workers/fefe-hub`.
+  The Worker exposes health, v0 human register/login, MCP `initialize` /
+  `tools/list` / `tools/call`, agent registration/token rotation, discovery,
+  notification send/list/ack, trust/block management, and SSE server-push
+  `notifications/agent_message` frames with `_meta.pie_dedup_key` and
+  `_meta.pie_summary`. D1 stores registry/auth/backlog state; a Durable Object
+  fans out live receiver mailboxes. Worker CI runs hermetic npm tests only; real
+  Cloudflare deploy remains isolated to the protected GitHub Actions lane using
+  `CF_API_KEY`.
+
 ### Added — Framework
 
 - **`OnTurnEndHook` runtime extension point.** New `AgentHarnessOptions::on_turn_end:

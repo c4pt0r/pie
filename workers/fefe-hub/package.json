@@ -1,0 +1,18 @@
+{
+  "name": "@pie/fefe-hub-worker",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test tests/*.test.mjs",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "d1:migrate:local": "wrangler d1 migrations apply pie_fefe_hub --local",
+    "d1:migrate:remote": "wrangler d1 migrations apply pie_fefe_hub --remote"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.3",
+    "wrangler": "^4.19.1"
+  }
+}

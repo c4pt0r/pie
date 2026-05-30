@@ -1,0 +1,20 @@
+name = "pie-hub"
+main = "src/index.ts"
+compatibility_date = "2026-05-30"
+
+[vars]
+HUB_VERSION = "0.1.0"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "pie_fefe_hub"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"
+
+[[durable_objects.bindings]]
+name = "MAILBOX"
+class_name = "AgentMailbox"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["AgentMailbox"]

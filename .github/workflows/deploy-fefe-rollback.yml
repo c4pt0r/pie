@@ -44,9 +44,9 @@ on:
         required: false
         default: ""
       worker_dir:
-        description: "Worker source directory (default: worker/)"
+        description: "Worker source directory (default: workers/fefe-hub)"
         required: false
-        default: "worker/"
+        default: "workers/fefe-hub"
       wrangler_version:
         description: "Pinned wrangler version. Strict semver prefix ('3', '3.93', '3.93.0')."
         required: false

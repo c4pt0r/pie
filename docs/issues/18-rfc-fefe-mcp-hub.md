@@ -1759,14 +1759,37 @@ tests:
 
 Status: implementation in progress. Worker MVP scope (matches §8.5 scenario 1 + 5 minimum live e2e): human auth + `register_agent` + `send_notification` + SSE push + `notifications/agent_message`. Other §2.3 tools follow in iteration. Deploy goes through the GitHub Actions workflow added in PR #140.
 
-Carry-forward open questions for the §7 owner:
+MVP storage choice:
 
-- Storage choice: D1 (relational) vs KV vs Durable Objects vs combination. Trade-offs: D1 for joins / queries; KV for cheap reads; DO for stateful per-namespace coordination and consistent fan-out.
-- Sharding strategy and migration story.
-- Rate-limit numbers (per namespace / per agent / per source IP).
-- Body cap numbers.
-- Cold-start budget for serverless invocation.
-- Notification at-least-once delivery: durable queue or DO replay?
+- **D1** stores users, human sessions, agent profiles, hashed agent tokens,
+  trust/block lists, and notification backlog. This keeps registry,
+  discovery, and authorization joins explicit and testable.
+- **Durable Objects** provide one live SSE mailbox per receiver `agent_id`.
+  D1 remains the durable source of truth; DO delivery is the low-latency fanout
+  path.
+- **No KV in v0.** KV can be added later for public discovery caching if D1
+  query volume proves it is needed.
+
+MVP implementation scope:
+
+- `GET /health`
+- human register/login endpoints for v0 namespace bootstrap
+- MCP `initialize`, `tools/list`, `tools/call`, `resources/list`,
+  `resources/read`
+- `register_agent`, `update_agent_profile`, token rotate/revoke,
+  `list_my_agents`, `discover_public_agents`, `get_agent_profile`,
+  `send_notification`, `list_my_inbox`, `ack_notification`, `list_trust`,
+  `revoke_trust`, `block_sender`, `unblock_sender`
+- `GET /mcp` SSE with `notifications/agent_message` and canonical
+  `_meta.pie_dedup_key` / `_meta.pie_summary`
+
+Carry-forward open questions after MVP:
+
+- Sharding strategy and migration story once the first production D1 database
+  and route are created.
+- Production rate-limit persistence and operator dashboards.
+- Backlog retention duration and queue compaction.
+- Cold-start budget and whether public discovery needs a cache tier.
 
 ## §8 Deployment / `CF_API_KEY` / CI / acceptance / release gate
 

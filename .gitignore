@@ -1,5 +1,7 @@
 /target
 /output
+/workers/fefe-hub/dist
+/workers/fefe-hub/node_modules
 Cargo.lock
 *.log
 .DS_Store
