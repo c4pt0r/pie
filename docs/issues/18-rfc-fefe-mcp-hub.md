@@ -1316,18 +1316,47 @@ pub async fn connect_one(entry: &McpServerEntry) -> Result<LoadedMcp, McpLoaderE
         McpServerKind::StreamableHttp => connect_streamable_http(entry).await?, // new
     };
     let tools = client.list_tools().await?;
-    let notification_hook = make_pie_hub_notification_hook_if_applicable(&entry.name, client.take_notifications());
+    // Every MCP server (stdio or streamable_http) gets exactly one McpNotificationHook
+    // — the existing PR #63 convention. Hook configuration (specifically the
+    // `source_kind_prefix`) is what makes a hub entry trust-scoped vs. a generic MCP
+    // server. There is no "no-hook" code path for any kind.
+    let notification_hook = make_pie_hub_notification_hook(&entry.name, client.take_notifications());
     Ok(LoadedMcp { client, tools, notification_hook })
 }
 ```
 
-`make_pie_hub_notification_hook_if_applicable` returns
-`Some(McpNotificationHook configured for hub)` for entries whose `name`
-matches the canonical hub-name convention (and is registered via Runtime's
-factory per §5.1), else `None` (an arbitrary `streamable_http` MCP server
-that is not the pie hub still gets `McpNotificationHook`, but it uses the
-generic `mcp:{server_name}:` source label rather than the `mcp:pie-hub:`
-trust scope).
+**Hook contract (§6a × §5.1).** `make_pie_hub_notification_hook(name, rx) ->
+Arc<McpNotificationHook>` **always returns a configured hook**. The hub-vs-
+generic distinction is encoded in the configuration the factory chooses
+from `name`, NOT in whether a hook exists at all:
+
+**Match shape (§5.2):** trust matching is on a **fully-segmented prefix with
+trailing `:` delimiter**, NOT a raw `starts_with` on the source label string.
+A `Trigger.source_label` of `mcp:pie-hub:custom:agent_message:<id>` matches
+`mcp:pie-hub:` but **MUST NOT** match `mcp:pie-hub-staging:` (or vice
+versa). The factory writes prefixes with the trailing delimiter; the
+gate's match function MUST split on `:` and compare the full leading segments,
+not call `str::starts_with` on a delimiter-less prefix. This is the same
+discipline as RFC 1's `source_kind_prefix` segmentation (PR #56).
+
+| Entry name                                | `source_kind_prefix` (delimiter-included) | Trust-scope match for `HubTrustGate`? |
+| ----------------------------------------- | ----------------------------------------- | ------------------------------------- |
+| `pie-hub` (canonical hub)                 | `mcp:pie-hub:`                            | yes — `HubTrustGate` matches this exact-segment prefix and reads `~/.pie/hub-trust.json` per §5.6 |
+| `pie-hub-staging` (per-deployment hub)    | `mcp:pie-hub-staging:`                    | no by default — distinct segment from `mcp:pie-hub:`, so prod gate does NOT match staging traffic. Embedder may install a second `HubTrustGate` instance pointed at a different trust file if desired. |
+| `my-local-tool` (stdio MCP server)        | `mcp:my-local-tool:`                      | no — generic MCP source, never enters the hub trust path |
+| any non-hub `streamable_http` MCP server  | `mcp:{entry.name}:`                       | no — same as stdio, generic MCP source |
+
+Three properties this contract guarantees:
+
+1. **No silent-no-hook fallback.** Every MCP server gets push-notification
+   delivery via `McpNotificationHook`; the only thing the factory varies is
+   the prefix it tags onto `Trigger.source_label`.
+2. **Trust scope is name-derived, not transport-derived.** A
+   `streamable_http` MCP server that happens not to be the pie hub gets the
+   same source-label discipline as a stdio server — no automatic trust gate.
+3. **PR-X1 implementation flexibility = zero.** There is one valid behavior
+   per `entry.name`; no "if applicable / else" branching that could implement
+   two different things.
 
 ### §6a.5 Auth — `Authorization: Bearer` only
 
