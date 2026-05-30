@@ -43,6 +43,7 @@ Every sub-issue below MUST address the same five axes in its design write-up bef
 ### Tier 3 — safety / sandboxing
 
 - ~~#8 — Sandboxing: scoped file writes, network egress policy, `.pieignore`~~ — **de-scoped, closed**
+- [ ] **#110 — `ControlPlaneWrite` user-Prompt gate** (P0; critical-path for [[18-rfc-fefe-mcp-hub]] §5.6 first-contact; see [[110-control-plane-write-prompt-gate]])
 
 ### Tier 4 — framework depth (skills + harness elevated to top)
 
