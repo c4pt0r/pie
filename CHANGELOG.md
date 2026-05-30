@@ -59,6 +59,10 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
   canonical `streamable_http` MCP entry, `/hub login` stores the hub token through the
   existing no-echo secret prompt, `/hub status` renders bounded local config/auth/hook
   state, and `/hub logout` clears the local hub credential without printing token refs.
+- The official `pie.0xfefe.me` hub is now a built-in default client profile: `/hub status`
+  works on a clean install without `mcp.toml`, and the loader auto-enables the canonical
+  `pie-hub` transport after the local hub credential exists without emitting missing-token
+  startup diagnostics.
 - **#66** `/triggers` slash command for the RFC 1 trigger surface. It now shows runtime
   counters, hook health, running trigger actions, recent trigger audit rows, and supports
   aborting one or all in-flight trigger actions from the terminal while rendering only

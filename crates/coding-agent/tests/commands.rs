@@ -1454,6 +1454,8 @@ async fn dispatch_hub_connect_writes_streamable_http_config_without_token_output
     assert!(matches!(outcome, commands::CommandOutcome::Handled));
     let text = capture.text();
     assert!(text.contains("hub configured"), "{text}");
+    assert!(text.contains("next: run /hub join"), "{text}");
+    assert!(!text.contains("/hub login"), "{text}");
     assert!(!text.contains("pie-hub:default"), "{text}");
     assert!(!text.contains("hub_agent_"), "{text}");
 
@@ -1470,6 +1472,50 @@ async fn dispatch_hub_connect_writes_streamable_http_config_without_token_output
         config_text.contains("token_keychain_ref = \"pie-hub:default\""),
         "{config_text}"
     );
+}
+
+#[tokio::test]
+async fn dispatch_hub_connect_rejects_custom_endpoint_reusing_official_scope() {
+    let _auth_guard = auth::ENV_LOCK.lock().unwrap();
+    let _pie_guard = PIE_DIR_ENV_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let _pie_dir = EnvGuard::set("PIE_DIR", temp.path());
+
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage as Arc<dyn SessionStorage>);
+    let opts = AgentHarnessOptions::new(faux_model(), session);
+    let harness = Arc::new(AgentHarness::new(opts));
+
+    let registry = commands::Registry::with_builtins();
+    let cwd = std::env::current_dir().unwrap();
+    let ctx = commands::CommandCtx {
+        harness: &harness,
+        session_id: "test-hub-connect-custom-scope",
+        log_path: None,
+        tool_count: 0,
+        cwd: &cwd,
+    };
+
+    let outcome = commands::dispatch(
+        "/hub connect --endpoint https://staging.0xfefe.me/mcp",
+        &registry,
+        &ctx,
+    )
+    .await;
+    match outcome {
+        commands::CommandOutcome::Error(message) => {
+            assert!(
+                message.contains("built-in pie-hub profile is reserved"),
+                "{message}"
+            );
+            assert!(
+                message.contains("separate mcp.toml server name"),
+                "{message}"
+            );
+            assert!(!message.contains("pie-hub:default"), "{message}");
+        }
+        other => panic!("expected Error outcome, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -1517,6 +1563,75 @@ fn hub_status_error_redacts_token_like_text() {
     assert!(!message.contains("Bearer hub_agent"), "{message}");
     assert!(!message.contains("hub_agent_"), "{message}");
     assert!(!message.contains("hub_hs_"), "{message}");
+}
+
+#[tokio::test]
+async fn dispatch_hub_status_uses_built_in_default_without_mcp_config() {
+    let _auth_guard = auth::ENV_LOCK.lock().unwrap();
+    let _pie_guard = PIE_DIR_ENV_LOCK.lock().unwrap();
+    let _output_guard = COMMAND_OUTPUT_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let _pie_dir = EnvGuard::set("PIE_DIR", temp.path());
+    let capture = OutputCapture::install();
+
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage as Arc<dyn SessionStorage>);
+    let opts = AgentHarnessOptions::new(faux_model(), session);
+    let harness = Arc::new(AgentHarness::new(opts));
+
+    let registry = commands::Registry::with_builtins();
+    let cwd = std::env::current_dir().unwrap();
+    let ctx = commands::CommandCtx {
+        harness: &harness,
+        session_id: "test-hub-status-built-in",
+        log_path: None,
+        tool_count: 0,
+        cwd: &cwd,
+    };
+
+    let outcome = commands::dispatch("/hub status", &registry, &ctx).await;
+    assert!(matches!(outcome, commands::CommandOutcome::Handled));
+    let text = capture.text();
+    assert!(
+        text.contains("config        configured (built-in)"),
+        "{text}"
+    );
+    assert!(text.contains("server        pie-hub"), "{text}");
+    assert!(text.contains("endpoint      pie.0xfefe.me"), "{text}");
+    assert!(text.contains("credential    missing"), "{text}");
+    assert!(text.contains("recovery      run /hub join"), "{text}");
+    assert!(!temp.path().join("mcp.toml").exists());
+    assert!(!text.contains("mcp.toml"), "{text}");
+    assert!(!text.contains("pie-hub:default"), "{text}");
+}
+
+#[tokio::test]
+async fn dispatch_hub_join_is_present_without_exposing_mcp_or_tokens() {
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage as Arc<dyn SessionStorage>);
+    let opts = AgentHarnessOptions::new(faux_model(), session);
+    let harness = Arc::new(AgentHarness::new(opts));
+
+    let registry = commands::Registry::with_builtins();
+    let cwd = std::env::current_dir().unwrap();
+    let ctx = commands::CommandCtx {
+        harness: &harness,
+        session_id: "test-hub-join-present",
+        log_path: None,
+        tool_count: 0,
+        cwd: &cwd,
+    };
+
+    let outcome = commands::dispatch("/hub join", &registry, &ctx).await;
+    match outcome {
+        commands::CommandOutcome::Error(message) => {
+            assert!(message.contains("browser onboarding"), "{message}");
+            assert!(!message.contains("mcp.toml"), "{message}");
+            assert!(!message.contains("pie-hub:default"), "{message}");
+            assert!(!message.contains("hub_agent_"), "{message}");
+        }
+        other => panic!("expected Error outcome, got {other:?}"),
+    }
 }
 
 #[tokio::test]
