@@ -1136,14 +1136,7 @@ fn hub_status(ctx: &CommandCtx<'_>) -> CommandOutcome {
     cprintln!("Hub status:");
     if let Some(entry) = &config {
         cprintln!("  config        configured ({})", entry.source);
-        cprintln!("  server        {}", HUB_SERVER_NAME);
-        cprintln!(
-            "  endpoint      {}",
-            entry
-                .endpoint_host
-                .as_deref()
-                .unwrap_or("<invalid endpoint host>")
-        );
+        cprintln!("  hub           {}", entry.display_host());
         cprintln!(
             "  auth          {}",
             if entry.auth_configured {
@@ -1569,6 +1562,14 @@ struct EffectiveHubConfig {
     source: &'static str,
     endpoint_host: Option<String>,
     auth_configured: bool,
+}
+
+impl EffectiveHubConfig {
+    fn display_host(&self) -> &str {
+        self.endpoint_host
+            .as_deref()
+            .unwrap_or("<invalid endpoint host>")
+    }
 }
 
 fn effective_hub_config(cwd: &std::path::Path) -> Option<EffectiveHubConfig> {

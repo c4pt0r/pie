@@ -1668,12 +1668,12 @@ async fn dispatch_hub_status_uses_built_in_default_without_mcp_config() {
         text.contains("config        configured (built-in)"),
         "{text}"
     );
-    assert!(text.contains("server        pie-hub"), "{text}");
-    assert!(text.contains("endpoint      pie.0xfefe.me"), "{text}");
+    assert!(text.contains("hub           pie.0xfefe.me"), "{text}");
     assert!(text.contains("credential    missing"), "{text}");
     assert!(text.contains("recovery      run /hub join"), "{text}");
     assert!(!temp.path().join("mcp.toml").exists());
     assert!(!text.contains("mcp.toml"), "{text}");
+    assert!(!text.contains("server        pie-hub"), "{text}");
     assert!(!text.contains("pie-hub:default"), "{text}");
 }
 
@@ -1754,9 +1754,10 @@ auth = { kind = "bearer", token_keychain_ref = "pie-hub:default" }
     let outcome = commands::dispatch("/hub status", &registry, &ctx).await;
     assert!(matches!(outcome, commands::CommandOutcome::Handled));
     let text = capture.text();
-    assert!(text.contains("endpoint      pie.0xfefe.me"), "{text}");
+    assert!(text.contains("hub           pie.0xfefe.me"), "{text}");
     assert!(text.contains("credential    stored"), "{text}");
     assert!(!text.contains(secret), "{text}");
+    assert!(!text.contains("server        pie-hub"), "{text}");
     assert!(!text.contains("pie-hub:default"), "{text}");
     assert!(!text.contains("Authorization"), "{text}");
 }

@@ -440,6 +440,8 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
 
 ### Fixed
 
+- `/hub status` now describes the built-in connection as `hub pie.0xfefe.me`
+  instead of exposing the internal `pie-hub` server label in user-facing output.
 - `find` tool results are now bounded more tightly by default to reduce token waste and
   oversized TUI previews. The default path limit is 200 instead of 1000, truncated results
   include a clear recovery hint, and structured details now report the limit and whether it
