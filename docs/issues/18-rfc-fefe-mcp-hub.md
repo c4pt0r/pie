@@ -38,7 +38,7 @@ Concretely, the RFC is "done" only when:
 2. Two real pie agents on different machines (or different namespaces) can register, discover each other, send and receive notifications, exercise the first-contact gate end-to-end against the deployed Worker.
 3. The acceptance matrix in §8 has been run against the deployed Worker — not just faux fixtures.
 
-This does NOT change the "no real Cloudflare in CI" rule (§8). CI uses faux Worker / `wrangler dev` / Miniflare; the deployed-Worker e2e is a distinct gate, executed manually by a human reviewer before the RFC is marked complete in the master roadmap.
+This does NOT change the "no real Cloudflare in build/test CI" rule (§8). Build/test CI uses faux Worker / `wrangler dev` / Miniflare. Deploy is a **separate, approval-gated CI lane** (GitHub Actions deploy job with protected environment + @EdHuang approval) — see §8 gate 5. The deployed-Worker e2e is gate 6.
 
 **Status terminology (per @QA-Release-Lead 2026-05-29).** Two distinct states to avoid future misjudgement:
 
@@ -102,6 +102,8 @@ This does NOT change the "no real Cloudflare in CI" rule (§8). CI uses faux Wor
 ## §1 Architecture overview
 
 TBD — @Tools-MCP-Lead (hub MCP service model) + @Runtime-dev-lead (RFC 1 trigger pipeline reuse boundary; envelope contract with §4 / §5).
+
+**Drafting sequence (per @Runtime-dev-lead + @Tools-MCP-Lead 2026-05-29):** §2 (MCP surface) and §5 (notification envelope) are two views of the same wire bytes; draft them first in parallel, cross-cite + co-review, then stitch §1 architecture. §3 + §6a + §6b follow. §7 Worker PR can start once §1/§2/§5 are merged, reducing the risk that the Worker author has to rework against a moving envelope.
 
 ## §2 Hub MCP protocol surface
 
@@ -302,12 +304,19 @@ Phased gates (per 2026-05-29 outline). Each gate must explicitly state: required
 2. **Transport PR gate** — `HttpMcpTransport` lands as a generic capability with faux HTTP / SSE tests; no real Cloudflare in CI.
 3. **Worker local / faux gate** — Worker implementation passes against local fixture (`wrangler dev` or Miniflare); no real `~/cf_token` used in CI.
 4. **Client UX gate** — `/hub *` CLI / TUI commands, `~/.pie/mcp.toml` hub entry shape, first-contact prompt UX, error → recovery-action wording.
-5. **Real deploy gate** — manual `~/cf_token` use to deploy the Worker to the real `pie.0xfefe.me`. README / CHANGELOG with bindings, migrations, deploy steps, rollback procedure. Pre-deploy review by a named human approver.
-6. **Deployed-Worker e2e gate (definition of done — per @EdHuang)** — **the RFC is NOT complete until this gate passes.** Two real pie agents on different machines / namespaces register, discover each other, send notifications, and exercise the first-contact gate end-to-end against the deployed `pie.0xfefe.me`. The full §8 acceptance matrix runs against the deployed Worker — faux-fixture passes alone do not satisfy this gate. Rollback path documented and rehearsed.
+5. **Real deploy gate (CI auto-deploy via GitHub Actions)** — `.github/workflows/deploy-fefe.yml` deploys the Worker to the real `pie.0xfefe.me`. Secret hardening (per team consensus 2026-05-29 — fold into §8 v0.1):
+   - Cloudflare token lives in GitHub repository secret `CF_API_KEY`, scoped minimally to this Worker (`Workers Scripts:Edit` + required KV/D1/DO bindings).
+   - Deploy job runs only on protected branch / tag or `workflow_dispatch`; PRs from forks cannot access the secret.
+   - Deploy job runs in a protected GitHub Environment (e.g. `production`) with **required reviewer = @EdHuang** approval before execution.
+   - The secret is read only via `${{ secrets.CF_API_KEY }}` in the deploy step's job-level env, never the workflow-global env.
+   - No `set -x`, no wrangler debug logging, no echo of secret-bearing config. Logs / artifacts / cache MUST NOT contain the token.
+   - Rollback / disable runs in a separate, equally-protected workflow.
+   - README / CHANGELOG document workflow file path, environment protection, bindings, migrations, rollback procedure.
+6. **Deployed-Worker e2e gate (definition of done — per @EdHuang)** — **the RFC is NOT complete until this gate passes.** Two real pie agents on different machines / namespaces register, discover each other, send notifications, and exercise the first-contact gate end-to-end against the deployed `pie.0xfefe.me`. Per @Tools-MCP-Lead, a post-deploy CI job can run this automatically against the live Worker (gated on the protected environment). The full §8 acceptance matrix runs against the deployed Worker — faux-fixture passes alone do not satisfy this gate. E2E reports only contain `deployment_id` / `version` / `trace_id` / bounded result — never the token, hub session, agent token, or payload secret. Rollback path documented and rehearsed.
 
-`~/cf_token` boundary: usable only in gates 5 and 6 (manual human deploy / human-run e2e). MUST NOT appear in repo, CI, runtime config, session, audit, bug report, or any MCP / notification payload.
+`CF_API_KEY` boundary: usable only inside the deploy job of gate 5 and (optionally) the post-deploy live-Worker job of gate 6. MUST NOT appear in CI build / test logs, runtime config, session, audit, bug report, MCP / notification payload, or any artifact.
 
-**CI vs acceptance gate distinction.** Gates 2, 3, 4 are CI-friendly (no real Cloudflare). Gates 5 and 6 are manual / human-gated and target the real deployed Worker. The "no real Cloudflare in CI" rule is preserved; the "done" criterion is intentionally outside CI.
+**CI vs acceptance gate distinction.** Gates 2, 3, 4 are CI-friendly without the secret (no Cloudflare access). Gate 5 deploy is automated but **environment-gated by @EdHuang's approval**, not a free-running CI step. Gate 6 e2e targets the real deployed Worker. The "no real Cloudflare in CI" rule is preserved for build / test CI; deploy CI is a separate, approval-gated lane.
 
 ---
 
@@ -391,7 +400,7 @@ Owned by @QA-Release-Lead in §8. Required contents:
 | RFC-OQ-5      | `inbox = invited` in v0? (§4.OQ-4)                                                         | @alice: ship in v0; gate populates it.                |
 | RFC-OQ-6      | Handle character set `[a-z0-9_-]{2,32}` — confirm or widen? (§4.OQ-5)                      | @alice: lock at this for v0.                          |
 | RFC-OQ-7      | Collapse `inbox=open` and `inbox=invited` in v0? (§4.OQ-6)                                 | @alice: lean keep both as operator signal. Tools-MCP +1 keep-both (sender-side invitation-token semantic distinction). |
-| ~~RFC-OQ-8~~  | Deploy mechanism for `pie.0xfefe.me`: manual or CI auto-deploy?                            | **RESOLVED 2026-05-29 by @EdHuang: manual deploy.** `~/cf_token` stays on the operator's machine only; never enters GitHub Secrets, CI, repo, runtime, session, audit, bug report, or any MCP payload. Any future CI auto-deploy would require a separate design and security gate. |
+| ~~RFC-OQ-8~~  | Deploy mechanism for `pie.0xfefe.me`: manual or CI auto-deploy?                            | **RESOLVED 2026-05-29 by @EdHuang: CI auto-deploy via GitHub Actions.** EdHuang provides a GitHub repository secret named `CF_API_KEY`. Secret stays inside GitHub Actions (encrypted secret + protected environment); never enters repo, PR body, workflow logs, artifacts, cache, test fixtures, runtime config, session, audit, bug report, or any MCP payload. Secret-hardening requirements detailed in §8 (deploy gate). Reversed an earlier 2026-05-29 manual-deploy decision; superseded entry kept in change log. |
 
 ### Change log
 
@@ -403,3 +412,5 @@ Owned by @QA-Release-Lead in §8. Required contents:
 | 2026-05-29 | @alice | Per @EdHuang: completion criterion is e2e against the real deployed `pie.0xfefe.me`. Added "Definition of done" section; reorganized §8 phased gates so Real-deploy and Deployed-Worker-e2e are explicit terminal gates, with the e2e gate as definition-of-done. Preserved "no real Cloudflare in CI" rule by distinguishing CI-friendly gates (2/3/4) from manual / human-gated terminal gates (5/6). Raises priority on §7 Worker owner assignment (RFC-OQ-1). |
 | 2026-05-29 | @alice | Fold in QA-Release-Lead's status terminology (pre-deploy complete vs release complete / done) and Runtime-dev-lead's critical-path note (#110 P0 alongside §5 implementation). Added RFC-OQ-8 for deploy mechanism (manual vs CI auto-deploy), QA default = manual until @EdHuang decides. |
 | 2026-05-29 | @alice | RFC-OQ-8 RESOLVED by @EdHuang: manual deploy. `~/cf_token` constraint locked. Open question struck through with resolution recorded inline. |
+| 2026-05-29 | @alice | RFC-OQ-8 **superseded** later same day by @EdHuang: CI auto-deploy via GitHub Actions. Secret name = `CF_API_KEY`. Updated OQ-8 resolution; rewrote §8 gate 5 with secret-hardening checklist (protected environment + EdHuang approval + min token scope + no echo / no global env + separate rollback workflow + bounded e2e report). Folded in @Tools-MCP-Lead's note that post-deploy live-Worker e2e can be a CI job (still env-gated). |
+| 2026-05-29 | @alice | Ordering note (per @Runtime-dev-lead + @Tools-MCP-Lead): §2 (MCP surface) and §5 (notification envelope) are two views of the same wire bytes. Recommended sequence after scaffold merge: §2 + §5 parallel drafts → cross-cite + co-review → §1 architecture stitch → §3 + §6a + §6b → Worker PR. §7 Worker implementation owner can be named after §1/§2/§5 stabilize, reducing rework risk. Captured in §1 placeholder note (no chapter content change). |
