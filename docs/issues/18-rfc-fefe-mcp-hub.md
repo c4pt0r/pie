@@ -267,6 +267,11 @@ TBD — @Runtime-dev-lead. Scope per 2026-05-29 commitment:
 - Envelope: source label `mcp:pie-hub:...`, ack / dedup via `pie_dedup_key`, default `payload_visibility = Local`, redelivery / idempotency semantics, offline + reconnect backlog bounds, ordering not guaranteed.
 - Hub-side fan-out / inbox delivery semantics live in §6 / §7; §5 covers the boundary from client receive to `Trigger` conversion.
 
+**§2 × §5 coordination protocol (per Runtime + Tools-MCP 2026-05-29).** §2 (MCP surface) and §5 (envelope) are two views of the same wire bytes; both reference, not redefine. Existing `_meta.pie_dedup_key` / `_meta.pie_summary` from PR #56 (`McpNotificationHook`) is the source of truth and is cited from both chapters. New fields divide by layer:
+- Envelope-internal (`TriggerAuthority`, `payload_visibility`, etc.) — Runtime defines in §5; §2 cites.
+- MCP wire-level (`_meta.*` namespace additions, tool param names) — Tools-MCP defines in §2; §5 cites.
+- Whoever drafts first picks the name; the other follows. Drafts ship in the same commit; reviewer merges as a pair.
+
 ## §6a Client integration — contract + runtime boundary
 
 TBD — @Tools-MCP-Lead. `HttpMcpTransport` (MCP spec 2025-03-26 streamable HTTP — POST for requests, SSE for server-push), `~/.pie/mcp.toml` hub entry shape, `mcp_loader.rs` adapter, `McpNotificationHook` wiring, first-contact gate cite to issue #110.
