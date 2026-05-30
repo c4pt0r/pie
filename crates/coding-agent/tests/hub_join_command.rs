@@ -277,7 +277,7 @@ async fn faux_hub_mcp_post(
                         "agent_id": "018fe23a-2222-4a22-8b33-123456789abc",
                         "handle": "bob",
                         "namespace": "dongxu",
-                        "display_name": "Bob Cheng hub_agent_profile_secret 018fe23a-9999-4a22-8b33-123456789abc",
+                        "display_name": "Bob Cheng hub_agent_profile_secret 018fe23a-9999-4a22-8b33-123456789abc xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
                         "capabilities": ["notify"],
                         "discoverable": "public",
                         "inbox": "hub_hs_inbox_secret"
@@ -315,12 +315,12 @@ async fn faux_hub_mcp_post(
                     "items": [{
                         "notification_id": "018fe23a-5555-4a22-8b33-123456789abc",
                         "sender_agent_id": "018fe23a-6666-4a22-8b33-123456789abc",
-                        "sender": "@alice@dongxu",
+                        "sender": "@hub_agent_sender_secret@dongxu",
                         "summary": "hello from alice hub_agent_summary_secret 018fe23a-bbbb-4a22-8b33-123456789abc",
                         "payload_visibility": "hub_hs_payload_secret",
                         "first_contact_required": true,
                         "status": "hub_agent_inbox_status_secret",
-                        "created_at": "2026-05-30T20:00:00Z",
+                        "created_at": "hub_agent_time_secret",
                         "delivered_at": null
                     }],
                     "next_cursor": null
@@ -570,11 +570,13 @@ async fn hub_inbox_command_outputs_bounded_read_only_feed() {
 
     let text = capture.text();
     assert!(text.contains("Hub inbox:"), "{text}");
-    assert!(text.contains("@alice@dongxu"), "{text}");
+    assert!(text.contains("<hub sender>"), "{text}");
     assert!(text.contains("hello from alice"), "{text}");
     assert!(text.contains("first-contact · payload unknown"), "{text}");
     assert!(text.contains("status unknown"), "{text}");
+    assert!(text.contains("<unknown time>"), "{text}");
     assert!(!text.contains("hub_agent_command_secret"), "{text}");
+    assert!(!text.contains("hub_agent_sender_secret"), "{text}");
     assert!(!text.contains("hub_agent_summary_secret"), "{text}");
     assert!(!text.contains("hub_agent_inbox_status_secret"), "{text}");
     assert!(!text.contains("hub_hs_payload_secret"), "{text}");

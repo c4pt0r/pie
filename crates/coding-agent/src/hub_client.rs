@@ -209,6 +209,9 @@ pub fn parse_mention(input: &str) -> Option<String> {
     if handle.is_empty() || namespace.is_empty() || namespace.contains('@') {
         return None;
     }
+    if !(2..=32).contains(&handle.len()) || !(2..=32).contains(&namespace.len()) {
+        return None;
+    }
     if !is_handle_part(handle) || !is_handle_part(namespace) {
         return None;
     }

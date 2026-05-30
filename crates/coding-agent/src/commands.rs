@@ -1177,7 +1177,7 @@ async fn hub_send(argv: &[String]) -> CommandOutcome {
 
     cprintln!(
         "sent hub notification to {} ({})",
-        target.mention(),
+        safe_agent_mention(&target),
         preview_agent_label(&target)
     );
     cprintln!("  summary       {}", preview_hub_text(&args.summary, 120));
@@ -1207,7 +1207,11 @@ async fn hub_send_suggestions(prefix: &str) -> CommandOutcome {
     }
     cprintln!("Matching hub agents:");
     for agent in agents {
-        cprintln!("  {}  {}", agent.mention(), preview_agent_label(&agent));
+        cprintln!(
+            "  {}  {}",
+            safe_agent_mention(&agent),
+            preview_agent_label(&agent)
+        );
     }
     cprintln!("use /hub send @handle@namespace \"message\"");
     CommandOutcome::Handled
@@ -1246,7 +1250,7 @@ async fn hub_inbox(argv: &[String]) -> CommandOutcome {
         cprintln!(
             "      status {} · {}",
             render_inbox_status(&item.status),
-            preview_hub_text(&item.created_at, 32)
+            render_hub_timestamp(&item.created_at)
         );
     }
     CommandOutcome::Handled
@@ -1372,11 +1376,16 @@ fn preview_agent_label(agent: &crate::hub_client::HubAgentSummary) -> String {
 }
 
 fn preview_mention(sender: &str) -> String {
-    if crate::hub_client::parse_mention(sender).is_some() {
-        sender.to_string()
+    let redacted = redact_hub_status_text(sender);
+    if let Some(sender) = crate::hub_client::parse_mention(&redacted) {
+        sender
     } else {
         "<hub sender>".into()
     }
+}
+
+fn safe_agent_mention(agent: &crate::hub_client::HubAgentSummary) -> String {
+    crate::hub_client::parse_mention(&agent.mention()).unwrap_or_else(|| "@unknown@hub".into())
 }
 
 fn render_inbox_flags(item: &crate::hub_client::HubInboxItem) -> String {
@@ -1403,6 +1412,14 @@ fn render_inbox_status(status: &str) -> &'static str {
         }
     } else {
         "unknown"
+    }
+}
+
+fn render_hub_timestamp(value: &str) -> String {
+    if chrono::DateTime::parse_from_rfc3339(value).is_ok() {
+        preview_hub_text(value, 32)
+    } else {
+        "<unknown time>".into()
     }
 }
 
