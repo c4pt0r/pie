@@ -1127,21 +1127,189 @@ export class HubApp {
   private loginForm(reqRaw: string, stateRaw: string | null, errorMessage?: string, status = 200): Response {
     const req = escapeHtml(reqRaw);
     const state = escapeHtml(stateRaw ?? "");
+    const hiddenFields = `<input type="hidden" name="exchange_request_id" value="${req}">
+      <input type="hidden" name="state" value="${state}">`;
     const error = errorMessage
-      ? `<p role="alert">Could not complete sign-in: ${escapeHtml(errorMessage)}</p>`
+      ? `<div class="notice error" role="alert">Could not complete sign-in: ${escapeHtml(errorMessage)}</div>`
       : "";
     const body = `<!doctype html>
+<html lang="en">
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Join pie hub</title>
-${error}
-<form method="post" action="/login">
-  <input type="hidden" name="exchange_request_id" value="${req}">
-  <input type="hidden" name="state" value="${state}">
-  <label>Username <input name="username" autocomplete="username" required></label>
-  <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
-  <button type="submit" name="mode" value="login">Sign in</button>
-  <button type="submit" name="mode" value="register">Create account</button>
-</form>`;
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f6f7f9;
+    --fg: #15181d;
+    --muted: #5d6673;
+    --line: #d9dee7;
+    --panel: #ffffff;
+    --accent: #1868d8;
+    --accent-fg: #ffffff;
+    --error-bg: #fff1f1;
+    --error-fg: #9b1c1c;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    line-height: 1.45;
+  }
+  main {
+    width: min(960px, 100%);
+    margin: 0 auto;
+    padding: 40px 20px;
+  }
+  header {
+    max-width: 660px;
+    margin-bottom: 24px;
+  }
+  h1 {
+    margin: 0 0 8px;
+    font-size: 28px;
+    line-height: 1.15;
+  }
+  h2 {
+    margin: 0 0 6px;
+    font-size: 18px;
+  }
+  p {
+    margin: 0;
+    color: var(--muted);
+  }
+  .forms {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 16px;
+  }
+  form {
+    display: grid;
+    gap: 14px;
+    padding: 20px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--panel);
+  }
+  .form-copy {
+    min-height: 52px;
+  }
+  label {
+    display: grid;
+    gap: 6px;
+    font-size: 14px;
+    font-weight: 600;
+  }
+  input {
+    width: 100%;
+    min-height: 42px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 9px 11px;
+    background: transparent;
+    color: var(--fg);
+    font: inherit;
+  }
+  input:focus {
+    outline: 2px solid color-mix(in srgb, var(--accent) 35%, transparent);
+    border-color: var(--accent);
+  }
+  .hint {
+    color: var(--muted);
+    font-size: 13px;
+    font-weight: 400;
+  }
+  button {
+    min-height: 42px;
+    border: 0;
+    border-radius: 6px;
+    padding: 10px 14px;
+    background: var(--accent);
+    color: var(--accent-fg);
+    font: inherit;
+    font-weight: 650;
+    cursor: pointer;
+  }
+  .notice {
+    margin-bottom: 16px;
+    padding: 12px 14px;
+    border-radius: 8px;
+    border: 1px solid var(--line);
+    background: var(--panel);
+  }
+  .error {
+    border-color: color-mix(in srgb, var(--error-fg) 35%, var(--line));
+    background: var(--error-bg);
+    color: var(--error-fg);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #101215;
+      --fg: #eff2f5;
+      --muted: #a2aab5;
+      --line: #303844;
+      --panel: #181c22;
+      --accent: #6da2ff;
+      --accent-fg: #07111f;
+      --error-bg: #2b1719;
+      --error-fg: #ffb4b4;
+    }
+  }
+  @media (max-width: 720px) {
+    main { padding: 24px 14px; }
+    .forms { grid-template-columns: 1fr; }
+    .form-copy { min-height: 0; }
+  }
+</style>
+<main>
+  <header>
+    <h1>Join pie.0xfefe.me</h1>
+    <p>Sign in or create a hub account, then return to your pie terminal to finish connecting.</p>
+  </header>
+  ${error}
+  <section class="forms" aria-label="Hub account actions">
+    <form method="post" action="/login" autocomplete="on">
+      ${hiddenFields}
+      <input type="hidden" name="mode" value="login">
+      <div class="form-copy">
+        <h2>Sign in</h2>
+        <p>Use an existing hub account.</p>
+      </div>
+      <label>Username
+        <input name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+      </label>
+      <label>Password
+        <input name="password" type="password" autocomplete="current-password" required>
+      </label>
+      <button type="submit">Sign in</button>
+    </form>
+    <form method="post" action="/login" autocomplete="on">
+      ${hiddenFields}
+      <input type="hidden" name="mode" value="register">
+      <div class="form-copy">
+        <h2>Create account</h2>
+        <p>Your pie identity is shown as name@namespace.</p>
+      </div>
+      <label>Username
+        <input name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+        <span class="hint">2-32 lowercase letters, numbers, underscores, or hyphens.</span>
+      </label>
+      <label>Namespace
+        <input name="namespace" autocomplete="organization" autocapitalize="none" spellcheck="false" placeholder="same as username">
+        <span class="hint">Optional. Use a team or personal namespace; it must be unique.</span>
+      </label>
+      <label>Password
+        <input name="password" type="password" autocomplete="new-password" minlength="12" required>
+        <span class="hint">At least 12 characters.</span>
+      </label>
+      <button type="submit">Create account</button>
+    </form>
+  </section>
+</main>
+</html>`;
     return new Response(body, {
       status,
       headers: {

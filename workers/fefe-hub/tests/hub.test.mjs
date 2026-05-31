@@ -80,6 +80,29 @@ test("auth start plus exchange joins with one-time code and exact bounded shape"
   assert.doesNotMatch(JSON.stringify(await reused.json()), /hub_agent_|hub_code_/);
 });
 
+test("browser login page separates sign in from registration and explains namespace", async () => {
+  const app = createTestApp();
+  const start = await authStart(app, {
+    verifier: "u".repeat(64),
+    state: "state_login_page",
+    loopback: "http://127.0.0.1:49160/callback",
+  });
+
+  const response = await app.fetch(new Request(start.login_url));
+
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get("content-type"), /text\/html/);
+  const body = await response.text();
+  assert.match(body, /Join pie\.0xfefe\.me/);
+  assert.match(body, /name@namespace/);
+  assert.match(body, /name="mode" value="login"/);
+  assert.match(body, /name="mode" value="register"/);
+  assert.match(body, /name="namespace"/);
+  assert.match(body, /autocomplete="current-password"/);
+  assert.match(body, /autocomplete="new-password"/);
+  assert.doesNotMatch(body, /hub_agent_|hub_hs_|hub_code_|code_verifier|Authorization|pie-hub:default/);
+});
+
 test("browser login form errors are bounded HTML and do not crash worker", async () => {
   const app = createTestApp();
   const start = await authStart(app, {
@@ -101,6 +124,30 @@ test("browser login form errors are bounded HTML and do not crash worker", async
   assert.match(body, /Could not complete sign-in/);
   assert.match(body, /password must be at least 12 characters/);
   assert.doesNotMatch(body, /short|hub_agent_|hub_hs_|hub_code_|code_verifier/);
+});
+
+test("browser registration enforces unique namespaces with bounded HTML", async () => {
+  const app = createTestApp();
+  await registerUser(app, "takenname");
+  const start = await authStart(app, {
+    verifier: "n".repeat(64),
+    state: "state_namespace_taken",
+    loopback: "http://127.0.0.1:49164/callback",
+  });
+
+  const response = await browserLoginResponse(app, start.exchange_request_id, "state_namespace_taken", {
+    mode: "register",
+    username: "newperson",
+    namespace: "takenname",
+    password: "newperson-password-123",
+  });
+
+  assert.equal(response.status, 400);
+  assert.match(response.headers.get("content-type"), /text\/html/);
+  const body = await response.text();
+  assert.match(body, /namespace already exists/);
+  assert.match(body, /name@namespace/);
+  assert.doesNotMatch(body, /newperson-password-123|hub_agent_|hub_hs_|hub_code_|code_verifier|Authorization/);
 });
 
 test("browser login without auth start shows bounded HTML error", async () => {
