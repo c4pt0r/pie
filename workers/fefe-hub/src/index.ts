@@ -896,7 +896,7 @@ export class HubApp {
         return this.loginPage(url);
       }
       if (url.pathname === "/login" && request.method === "POST") {
-        return this.completeBrowserLogin(await readFormObject(request));
+        return await this.completeBrowserLoginForm(await readFormObject(request));
       }
       if (url.pathname === "/mcp" && request.method === "GET") {
         const principal = await this.authenticate(request, "agent");
@@ -1121,11 +1121,19 @@ export class HubApp {
   }
 
   private loginPage(url: URL): Response {
-    const req = escapeHtml(url.searchParams.get("req") ?? "");
-    const state = escapeHtml(url.searchParams.get("state") ?? "");
+    return this.loginForm(url.searchParams.get("req") ?? "", url.searchParams.get("state") ?? null);
+  }
+
+  private loginForm(reqRaw: string, stateRaw: string | null, errorMessage?: string, status = 200): Response {
+    const req = escapeHtml(reqRaw);
+    const state = escapeHtml(stateRaw ?? "");
+    const error = errorMessage
+      ? `<p role="alert">Could not complete sign-in: ${escapeHtml(errorMessage)}</p>`
+      : "";
     const body = `<!doctype html>
 <meta charset="utf-8">
 <title>Join pie hub</title>
+${error}
 <form method="post" action="/login">
   <input type="hidden" name="exchange_request_id" value="${req}">
   <input type="hidden" name="state" value="${state}">
@@ -1135,13 +1143,27 @@ export class HubApp {
   <button type="submit" name="mode" value="register">Create account</button>
 </form>`;
     return new Response(body, {
-      status: 200,
+      status,
       headers: {
         "content-type": "text/html; charset=utf-8",
         "cache-control": "no-store",
         "referrer-policy": "no-referrer",
       },
     });
+  }
+
+  private async completeBrowserLoginForm(args: Record<string, unknown>): Promise<Response> {
+    try {
+      return await this.completeBrowserLogin(args);
+    } catch (error) {
+      const publicError = coercePublicError(error);
+      return this.loginForm(
+        typeof args.exchange_request_id === "string" ? args.exchange_request_id : "",
+        typeof args.state === "string" ? args.state : "",
+        browserLoginErrorMessage(publicError, args),
+        publicError.code === -32009 || publicError.code === -32010 ? 401 : 400,
+      );
+    }
   }
 
   private async completeBrowserLogin(args: Record<string, unknown>): Promise<Response> {
@@ -1835,6 +1857,23 @@ function coercePublicError(error: unknown): PublicError {
   return new PublicError(-32603, "internal", "Hub is temporarily unavailable. Retry with backoff.");
 }
 
+function browserLoginErrorMessage(error: PublicError, args: Record<string, unknown>): string {
+  if (error.name === "auth_invalid" && typeof args.password === "string") {
+    return "Invalid username or password.";
+  }
+  const violations = error.data?.violations;
+  if (Array.isArray(violations)) {
+    const safeViolations = violations
+      .filter((violation): violation is string => typeof violation === "string")
+      .map((violation) => truncate(violation, 120))
+      .slice(0, 3);
+    if (safeViolations.length > 0) {
+      return safeViolations.join("; ");
+    }
+  }
+  return truncate(error.message, 160);
+}
+
 function httpError(error: unknown): Response {
   const publicError = coercePublicError(error);
   const status = publicError.code === -32009 || publicError.code === -32010 ? 401 : 400;
@@ -2185,6 +2224,10 @@ function escapeHtml(value: string): string {
         return "&#39;";
     }
   });
+}
+
+function truncate(value: string, maxChars: number): string {
+  return value.length <= maxChars ? value : `${value.slice(0, maxChars - 1)}…`;
 }
 
 function byteLength(value: string): number {

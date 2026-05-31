@@ -80,6 +80,90 @@ test("auth start plus exchange joins with one-time code and exact bounded shape"
   assert.doesNotMatch(JSON.stringify(await reused.json()), /hub_agent_|hub_code_/);
 });
 
+test("browser login form errors are bounded HTML and do not crash worker", async () => {
+  const app = createTestApp();
+  const start = await authStart(app, {
+    verifier: "e".repeat(64),
+    state: "state_form_error",
+    loopback: "http://127.0.0.1:49161/callback",
+  });
+
+  const response = await browserLoginResponse(app, start.exchange_request_id, "state_form_error", {
+    mode: "register",
+    username: "formerror",
+    namespace: "formerror",
+    password: "short",
+  });
+
+  assert.equal(response.status, 400);
+  assert.match(response.headers.get("content-type"), /text\/html/);
+  const body = await response.text();
+  assert.match(body, /Could not complete sign-in/);
+  assert.match(body, /password must be at least 12 characters/);
+  assert.doesNotMatch(body, /short|hub_agent_|hub_hs_|hub_code_|code_verifier/);
+});
+
+test("browser login without auth start shows bounded HTML error", async () => {
+  const app = createTestApp();
+
+  const response = await browserLoginResponse(app, "", "", {
+    mode: "register",
+    username: "directlogin",
+    namespace: "directlogin",
+    password: "directlogin-password-123",
+  });
+
+  assert.equal(response.status, 400);
+  assert.match(response.headers.get("content-type"), /text\/html/);
+  const body = await response.text();
+  assert.match(body, /exchange_request_id must be a non-empty string/);
+  assert.doesNotMatch(body, /directlogin-password-123|hub_agent_|hub_hs_|hub_code_|code_verifier/);
+});
+
+test("browser login form succeeds for existing user and redirects to loopback", async () => {
+  const app = createTestApp();
+  await registerUser(app, "browserlogin");
+  const start = await authStart(app, {
+    verifier: "l".repeat(64),
+    state: "state_browser_login",
+    loopback: "http://127.0.0.1:49162/callback",
+  });
+
+  const callback = await browserLogin(app, start.exchange_request_id, "state_browser_login", {
+    mode: "login",
+    username: "browserlogin",
+    password: "browserlogin-password-123",
+  });
+
+  assert.equal(callback.origin + callback.pathname, "http://127.0.0.1:49162/callback");
+  assert.equal(callback.searchParams.get("state"), "state_browser_login");
+  assert.match(callback.searchParams.get("code"), /^hub_code_/);
+}
+);
+
+test("browser login form wrong password returns bounded HTML error", async () => {
+  const app = createTestApp();
+  await registerUser(app, "browserwrong");
+  const start = await authStart(app, {
+    verifier: "p".repeat(64),
+    state: "state_browser_wrong_password",
+    loopback: "http://127.0.0.1:49163/callback",
+  });
+
+  const response = await browserLoginResponse(app, start.exchange_request_id, "state_browser_wrong_password", {
+    mode: "login",
+    username: "browserwrong",
+    password: "wrong-password-123",
+  });
+
+  assert.equal(response.status, 401);
+  assert.match(response.headers.get("content-type"), /text\/html/);
+  const body = await response.text();
+  assert.match(body, /Could not complete sign-in/);
+  assert.match(body, /Invalid username or password/);
+  assert.doesNotMatch(body, /wrong-password-123|browserwrong-password-123|hub_agent_|hub_hs_|hub_code_|code_verifier/);
+});
+
 test("auth exchange rejects swapped state before issuing a token", async () => {
   const app = createTestApp();
   const verifierA = "a".repeat(64);
@@ -419,6 +503,12 @@ async function authStart(app, { verifier, state, loopback }) {
 }
 
 async function browserLogin(app, exchangeRequestId, state, { mode, username, namespace, password }) {
+  const response = await browserLoginResponse(app, exchangeRequestId, state, { mode, username, namespace, password });
+  assert.equal(response.status, 302);
+  return new URL(response.headers.get("location"));
+}
+
+async function browserLoginResponse(app, exchangeRequestId, state, { mode, username, namespace, password }) {
   const form = new URLSearchParams({
     mode,
     username,
@@ -436,8 +526,7 @@ async function browserLogin(app, exchangeRequestId, state, { mode, username, nam
       body: form.toString(),
     }),
   );
-  assert.equal(response.status, 302);
-  return new URL(response.headers.get("location"));
+  return response;
 }
 
 async function exchangeJson(app, body) {
