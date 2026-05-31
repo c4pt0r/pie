@@ -14,9 +14,9 @@
 //! |---------------------------------------|--------------------------------------------------|------------------|
 //! | `notifications/tools/listChanged`     | `mcp:{server}:tools`                             | `LatestReplaces` |
 //! | `notifications/resources/listChanged` | `mcp:{server}:resources`                         | `LatestReplaces` |
-//! | `notifications/resources/updated`     | `mcp:{server}:resources:{uri}`                   | `LatestReplaces` |
+//! | `notifications/resources/updated`     | `mcp:{server}:resources:{safe-uri-or-hash}`      | `LatestReplaces` |
 //! | `notifications/prompts/listChanged`   | `mcp:{server}:prompts`                           | `LatestReplaces` |
-//! | custom `notifications/*`              | `mcp:{server}:custom:{user-supplied-key}`        | `Drop`           |
+//! | custom `notifications/*`              | `mcp:{server}:custom:{safe-key-or-hash}`         | `Drop`           |
 //!
 //! Two layers of namespacing:
 //!
@@ -39,8 +39,9 @@
 //! method-name-only for custom / unknown notifications (PR #56 QA blocker) — a sentinel
 //! secret tucked into a custom notification's params must never end up in the persisted
 //! `Custom { custom_type: "trigger" }` audit entry. Adapters that genuinely need
-//! human-readable per-event detail can opt in via `_meta.pie_summary: "<text>"`, capped at
-//! 200 chars; the server is asserting that string is safe to persist.
+//! human-readable per-event detail can opt in via `_meta.pie_summary: "<text>"`, capped and
+//! redacted before persistence. Unsafe resource URIs / custom dedup keys are hashed before
+//! they enter persisted trigger audit fields.
 
 use std::sync::Arc;
 
@@ -53,6 +54,7 @@ use pie_agent_core::{
     TriggerSource,
 };
 use pie_mcp::client::McpServerNotification;
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::UnboundedReceiver;
 use uuid::Uuid;
 
@@ -366,7 +368,7 @@ fn idempotency_for(
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
             Some((
-                format!("{prefix}resources:{uri}"),
+                format!("{prefix}resources:{}", safe_idempotency_segment(uri)),
                 ReplacementPolicy::LatestReplaces,
             ))
         }
@@ -382,8 +384,12 @@ fn idempotency_for(
             // `tools/listChanged` row. Built-in subsystems (`tools` / `resources` /
             // `prompts`) own the un-prefixed slot; everything user-provided lives under
             // `custom:`. PR #56 QA re-review blocker.
-            extract_dedup_key(params)
-                .map(|k| (format!("{prefix}custom:{k}"), ReplacementPolicy::Drop))
+            extract_dedup_key(params).map(|k| {
+                (
+                    format!("{prefix}custom:{}", safe_idempotency_segment(&k)),
+                    ReplacementPolicy::Drop,
+                )
+            })
         }
     }
 }
@@ -404,6 +410,18 @@ fn extract_dedup_key(params: &serde_json::Value) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+fn safe_idempotency_segment(value: &str) -> String {
+    let redacted = redact_notification_text(value);
+    let has_sensitive_text = redacted != value;
+    let is_unbounded = value.chars().count() > 200;
+    let has_control_chars = value.chars().any(|ch| ch.is_control());
+    if has_sensitive_text || is_unbounded || has_control_chars {
+        let digest = Sha256::digest(value.as_bytes());
+        return format!("hash:{}", hex::encode(&digest[..6]));
+    }
+    value.to_string()
+}
+
 /// Render a short human-readable summary for `payload_summary`. Capped well below the
 /// runtime 4 KiB persistence cap; the runtime will still re-truncate if a future caller
 /// emits more.
@@ -414,18 +432,18 @@ fn extract_dedup_key(params: &serde_json::Value) -> Option<String> {
 /// arbitrary params content — a sentinel secret in a custom notification's params field
 /// would otherwise persist into the trigger audit entry.
 ///
-/// The contract: only **method name** plus fields we already know are non-secret by the
-/// MCP spec (`uri` for `resources/updated`) appear in the summary. Adapters that need
-/// per-event detail must opt in via `_meta.pie_summary: "<human-safe text>"`, where the
-/// server explicitly declares the value is safe to persist; we still cap that string at
-/// 200 chars.
+/// The contract: only **method name** plus bounded/redacted display metadata (`uri` for
+/// `resources/updated`) appear in the summary. Adapters that need per-event detail must opt
+/// in via `_meta.pie_summary: "<human-safe text>"`; we still cap and redact that string
+/// because it is MCP-server-controlled input.
 fn render_summary(method: &str, params: &serde_json::Value) -> Option<String> {
     match method {
-        // `uri` is part of the MCP resource identity — explicitly part of the public
-        // address space and safe to surface.
+        // `uri` is part of the MCP resource identity, but an MCP server can still stuff
+        // token-like values into it. Keep useful display metadata while applying the same
+        // redaction as other user-visible/audit-visible strings.
         "notifications/resources/updated" => {
             if let Some(uri) = params.get("uri").and_then(|v| v.as_str()) {
-                Some(format!("{method} uri={uri}"))
+                Some(format!("{method} uri={}", safe_display(uri, 200)))
             } else {
                 Some(method.to_string())
             }
@@ -443,8 +461,7 @@ fn render_summary(method: &str, params: &serde_json::Value) -> Option<String> {
                 .and_then(|m| m.get("pie_summary"))
                 .and_then(|v| v.as_str())
             {
-                let trimmed: String = s.chars().take(200).collect();
-                Some(format!("{method} {trimmed}"))
+                Some(format!("{method} {}", safe_display(s, 200)))
             } else {
                 Some(method.to_string())
             }
@@ -580,6 +597,36 @@ mod tests {
         let t2 = rx.recv().await.unwrap();
         assert_eq!(t2.idempotency_key, "mcp:filesystem:custom:new-key");
 
+        drop(tx);
+        let _ = handle.await;
+    }
+
+    /// Dedup keys are persisted inside trigger audit records. A malicious MCP server must
+    /// not be able to smuggle token-like material into that audit via `_meta.pie_dedup_key`;
+    /// hash unsafe keys while preserving stable dedup semantics.
+    #[tokio::test]
+    async fn custom_dedup_key_redacts_secret_like_text_in_idempotency_key() {
+        let (tx, mut rx, _status, handle) = fixture();
+        tx.send(note(
+            "notifications/custom/payload",
+            json!({ "_meta": { "pie_dedup_key": "hub_agent_secret_should_not_persist" } }),
+        ))
+        .unwrap();
+        let trigger = rx.recv().await.unwrap();
+        assert!(
+            trigger
+                .idempotency_key
+                .starts_with("mcp:filesystem:custom:hash:"),
+            "{}",
+            trigger.idempotency_key
+        );
+        assert!(
+            !trigger
+                .idempotency_key
+                .contains("hub_agent_secret_should_not_persist"),
+            "{}",
+            trigger.idempotency_key
+        );
         drop(tx);
         let _ = handle.await;
     }
@@ -879,6 +926,32 @@ mod tests {
         let _ = handle.await;
     }
 
+    /// `_meta.pie_summary` is opt-in display text, but it is still MCP-server-controlled
+    /// input that becomes `trigger.payload_summary` and is persisted in trigger audit.
+    /// Redact token-like material before the runtime ever sees it.
+    #[tokio::test]
+    async fn custom_method_pie_summary_opt_in_redacts_secret_like_text() {
+        let (tx, mut rx, _status, handle) = fixture();
+        tx.send(note(
+            "notifications/custom/build-finished",
+            json!({
+                "_meta": {
+                    "pie_dedup_key": "build-100",
+                    "pie_summary": "build leaked hub_agent_secret_should_not_persist token=sk-secret",
+                },
+            }),
+        ))
+        .unwrap();
+        let trigger = rx.recv().await.unwrap();
+        let summary = trigger.payload_summary.unwrap_or_default();
+        assert!(summary.contains("notifications/custom/build-finished"));
+        assert!(summary.contains("[redacted]"), "{summary}");
+        assert!(!summary.contains("hub_agent_secret_should_not_persist"));
+        assert!(!summary.contains("sk-secret"));
+        drop(tx);
+        let _ = handle.await;
+    }
+
     #[tokio::test]
     async fn hub_agent_message_carries_only_first_contact_binding_envelope() {
         let trigger = map_notification(
@@ -954,6 +1027,40 @@ mod tests {
         assert!(
             !summary.contains("rev"),
             "non-spec params field leaked into summary: {summary}"
+        );
+        drop(tx);
+        let _ = handle.await;
+    }
+
+    /// Resource URIs are allowed display metadata, but they can still be hostile strings
+    /// from an MCP server. Keep legitimate paths while redacting token-like URI values.
+    #[tokio::test]
+    async fn resources_updated_summary_redacts_secret_like_uri() {
+        let (tx, mut rx, _status, handle) = fixture();
+        tx.send(note(
+            "notifications/resources/updated",
+            json!({ "uri": "file:///proj/README.md?token=hub_agent_secret_should_not_persist" }),
+        ))
+        .unwrap();
+        let trigger = rx.recv().await.unwrap();
+        let summary = trigger.payload_summary.unwrap_or_default();
+        assert!(
+            summary.contains("notifications/resources/updated"),
+            "{summary}"
+        );
+        assert!(summary.contains("uri=[redacted]"), "{summary}");
+        assert!(!summary.contains("hub_agent_secret_should_not_persist"));
+        assert!(
+            !trigger
+                .idempotency_key
+                .contains("hub_agent_secret_should_not_persist"),
+            "{}",
+            trigger.idempotency_key
+        );
+        assert!(
+            trigger.idempotency_key.contains("resources:hash:"),
+            "{}",
+            trigger.idempotency_key
         );
         drop(tx);
         let _ = handle.await;
