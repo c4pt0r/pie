@@ -1970,6 +1970,65 @@ async fn before_trigger_prompt_allow_admits_trigger_and_binds_hub_identity() {
 }
 
 #[tokio::test]
+async fn before_trigger_prompt_prefers_meta_binding_over_legacy_top_level_fields() {
+    use pie_agent_core::{
+        BeforeTriggerContext, BeforeTriggerDecision, BeforeTriggerHook, OnTriggerPromptHook,
+        TriggerPromptDecision,
+    };
+
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage.clone() as Arc<dyn SessionStorage>);
+    let mut opts = AgentHarnessOptions::new(faux_model(), session.clone());
+
+    let prompt_hook: BeforeTriggerHook = Arc::new(|_ctx: BeforeTriggerContext, _cancel| {
+        Box::pin(async move {
+            BeforeTriggerDecision::Prompt {
+                reason: "new hub sender requires first-contact approval".into(),
+            }
+        })
+    });
+    opts.before_trigger = Some(prompt_hook);
+
+    let seen_request = Arc::new(std::sync::Mutex::new(None));
+    let seen_request_sink = seen_request.clone();
+    let trigger_prompt: OnTriggerPromptHook = Arc::new(move |request, _cancel| {
+        *seen_request_sink.lock().unwrap() = Some(request);
+        Box::pin(async move { TriggerPromptDecision::Allow })
+    });
+    opts.on_trigger_prompt = Some(trigger_prompt);
+    let harness = AgentHarness::new(opts);
+
+    let mut trigger = sample_trigger("prompt-meta-precedence", "trace-meta-precedence");
+    trigger.payload = Some(serde_json::json!({
+        "receiver_agent_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "sender_agent_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        "action_class": "legacy.notification",
+        "_meta": {
+            "receiver_agent_id": "11111111-1111-4111-8111-111111111111",
+            "sender_agent_id": "22222222-2222-4222-8222-222222222222",
+            "action_class": "hub.notification"
+        }
+    }));
+
+    let _ = harness.handle_trigger(trigger).await;
+
+    let request = seen_request
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("on_trigger_prompt hook must receive request");
+    assert_eq!(
+        request.receiver_agent_id.as_deref(),
+        Some("11111111-1111-4111-8111-111111111111")
+    );
+    assert_eq!(
+        request.sender_agent_id,
+        "22222222-2222-4222-8222-222222222222"
+    );
+    assert_eq!(request.action_class, "hub.notification");
+}
+
+#[tokio::test]
 async fn before_trigger_prompt_rejects_untrusted_payload_identity_fields_and_caps_reasons() {
     use pie_agent_core::{
         BeforeTriggerContext, BeforeTriggerDecision, BeforeTriggerHook, OnTriggerPromptHook,

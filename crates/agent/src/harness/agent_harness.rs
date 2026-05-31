@@ -2239,14 +2239,14 @@ fn cap_control_plane_audit_label(label: &str) -> String {
 }
 
 fn build_trigger_prompt_request(trigger: &Trigger, reason: String) -> TriggerPromptRequest {
-    let receiver_agent_id = validated_payload_agent_id(trigger, &["receiver_agent_id"])
-        .or_else(|| validated_payload_agent_id(trigger, &["_meta", "receiver_agent_id"]));
-    let sender_agent_id = validated_payload_agent_id(trigger, &["sender_agent_id"])
-        .or_else(|| validated_payload_agent_id(trigger, &["_meta", "sender_agent_id"]))
+    let receiver_agent_id = validated_payload_agent_id(trigger, &["_meta", "receiver_agent_id"])
+        .or_else(|| validated_payload_agent_id(trigger, &["receiver_agent_id"]));
+    let sender_agent_id = validated_payload_agent_id(trigger, &["_meta", "sender_agent_id"])
+        .or_else(|| validated_payload_agent_id(trigger, &["sender_agent_id"]))
         .or_else(|| validated_payload_agent_id(trigger, &["agent_id"]))
         .unwrap_or_else(|| cap_control_plane_audit_label(&trigger.authority.principal_id));
-    let action_class = validated_payload_action_class(trigger, &["action_class"])
-        .or_else(|| validated_payload_action_class(trigger, &["_meta", "action_class"]))
+    let action_class = validated_payload_action_class(trigger, &["_meta", "action_class"])
+        .or_else(|| validated_payload_action_class(trigger, &["action_class"]))
         .unwrap_or_else(|| cap_control_plane_audit_label(&trigger.event_label));
     let trigger_summary = trigger
         .payload_summary
