@@ -121,7 +121,7 @@ async fn hub_join_browser_loopback_stores_token_without_rendering_auth_secrets()
     assert!(!exchange.code_verifier.is_empty());
 
     let visible = format!(
-        "Joined hub as @{}@{}; hub is connected; run /hub status or /hub send",
+        "Joined hub as {}@{}; hub is connected; run /hub status or /hub send",
         joined.handle, joined.namespace
     );
     let secrets = hub_auth::HubAuthSecretFragments {

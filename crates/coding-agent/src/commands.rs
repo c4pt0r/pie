@@ -1290,7 +1290,7 @@ fn hub_status(ctx: &CommandCtx<'_>) -> CommandOutcome {
 }
 
 async fn hub_send(argv: &[String]) -> CommandOutcome {
-    if argv.len() == 1 && argv[0].starts_with('@') {
+    if argv.len() == 1 && looks_like_hub_target_prefix(&argv[0]) {
         return hub_send_suggestions(&argv[0]).await;
     }
     let args = match parse_hub_send_args(argv) {
@@ -1347,7 +1347,7 @@ async fn hub_send_suggestions(prefix: &str) -> CommandOutcome {
 
     if agents.is_empty() {
         return CommandOutcome::Error(
-            "no matching public hub agent; use /hub send @handle@namespace \"message\"".into(),
+            "no matching public hub agent; use /hub send name@namespace \"message\"".into(),
         );
     }
     cprintln!("Matching hub agents:");
@@ -1358,7 +1358,7 @@ async fn hub_send_suggestions(prefix: &str) -> CommandOutcome {
             preview_agent_label(&agent)
         );
     }
-    cprintln!("use /hub send @handle@namespace \"message\"");
+    cprintln!("use /hub send name@namespace \"message\"");
     CommandOutcome::Handled
 }
 
@@ -1456,17 +1456,17 @@ struct HubSendArgs {
 
 fn parse_hub_send_args(argv: &[String]) -> Result<HubSendArgs, String> {
     if argv.len() < 2 {
-        return Err("usage: /hub send @handle@namespace \"message\"".into());
+        return Err("usage: /hub send name@namespace \"message\"".into());
     }
     if argv
         .iter()
         .any(|arg| arg == "--shared" || arg == "--payload")
     {
-        return Err("usage: /hub send @handle@namespace \"message\" (payload is Local-only in this client slice)".into());
+        return Err("usage: /hub send name@namespace \"message\" (payload is Local-only in this client slice)".into());
     }
     let target = argv[0].clone();
     if crate::hub_client::parse_mention(&target).is_none() {
-        return Err("hub send target must be @handle@namespace".into());
+        return Err("hub send target must be name@namespace".into());
     }
     let summary = argv[1..].join(" ").trim().to_string();
     if summary.is_empty() {
@@ -1476,6 +1476,17 @@ fn parse_hub_send_args(argv: &[String]) -> Result<HubSendArgs, String> {
         return Err("hub send message must be at most 240 characters".into());
     }
     Ok(HubSendArgs { target, summary })
+}
+
+fn looks_like_hub_target_prefix(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let candidate = trimmed.strip_prefix('@').unwrap_or(trimmed);
+    candidate
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '-' | '_' | '@'))
 }
 
 fn parse_hub_inbox_args(argv: &[String]) -> Result<usize, String> {
@@ -1521,17 +1532,17 @@ fn preview_agent_label(agent: &crate::hub_client::HubAgentSummary) -> String {
 }
 
 fn safe_joined_mention(handle: &str, namespace: &str) -> String {
-    let raw = format!("@{handle}@{namespace}");
+    let raw = format!("{handle}@{namespace}");
     let redacted = redact_hub_status_text(&raw);
     if redacted != raw {
-        return "@unknown@hub".into();
+        return "unknown@hub".into();
     }
-    crate::hub_client::parse_mention(&redacted).unwrap_or_else(|| "@unknown@hub".into())
+    crate::hub_client::display_mention(&redacted).unwrap_or_else(|| "unknown@hub".into())
 }
 
 fn preview_mention(sender: &str) -> String {
     let redacted = redact_hub_status_text(sender);
-    if let Some(sender) = crate::hub_client::parse_mention(&redacted) {
+    if let Some(sender) = crate::hub_client::display_mention(&redacted) {
         sender
     } else {
         "<hub sender>".into()
@@ -1540,7 +1551,7 @@ fn preview_mention(sender: &str) -> String {
 
 fn safe_agent_mention(agent: &crate::hub_client::HubAgentSummary) -> String {
     let redacted = redact_hub_status_text(&agent.mention());
-    crate::hub_client::parse_mention(&redacted).unwrap_or_else(|| "@unknown@hub".into())
+    crate::hub_client::display_mention(&redacted).unwrap_or_else(|| "unknown@hub".into())
 }
 
 fn render_inbox_flags(item: &crate::hub_client::HubInboxItem) -> String {

@@ -72,7 +72,7 @@ fn ui_surfaces_can_assert_auth_secret_absence() {
         login_url: Some("https://pie.0xfefe.me/login?req=req-1&state=state-1"),
     };
 
-    let safe = "Joined. You are @alice@dongxu. recovery -> /hub join";
+    let safe = "Joined. You are alice@dongxu. recovery -> /hub join";
     secrets.assert_absent_from("safe output", safe);
 
     let unsafe_output = "debug: hub_agent_secret_should_not_render";

@@ -353,17 +353,30 @@ async fn faux_hub_mcp_post(
                     "first_contact_required": true
                 }),
                 "list_my_inbox" => json!({
-                    "items": [{
-                        "notification_id": "018fe23a-5555-4a22-8b33-123456789abc",
-                        "sender_agent_id": "018fe23a-6666-4a22-8b33-123456789abc",
-                        "sender": "@hub_agent_sender_secret@dongxu",
-                        "summary": "hello from alice hub_agent_summary_secret 018fe23a-bbbb-4a22-8b33-123456789abc",
-                        "payload_visibility": "hub_hs_payload_secret",
-                        "first_contact_required": true,
-                        "status": "hub_agent_inbox_status_secret",
-                        "created_at": "hub_agent_time_secret",
-                        "delivered_at": null
-                    }],
+                    "items": [
+                        {
+                            "notification_id": "018fe23a-5555-4a22-8b33-123456789abc",
+                            "sender_agent_id": "018fe23a-6666-4a22-8b33-123456789abc",
+                            "sender": "@hub_agent_sender_secret@dongxu",
+                            "summary": "hello from alice hub_agent_summary_secret 018fe23a-bbbb-4a22-8b33-123456789abc",
+                            "payload_visibility": "hub_hs_payload_secret",
+                            "first_contact_required": true,
+                            "status": "hub_agent_inbox_status_secret",
+                            "created_at": "hub_agent_time_secret",
+                            "delivered_at": null
+                        },
+                        {
+                            "notification_id": "018fe23a-7777-4a22-8b33-123456789abc",
+                            "sender_agent_id": "018fe23a-8888-4a22-8b33-123456789abc",
+                            "sender": "@beth@research",
+                            "summary": "normal update",
+                            "payload_visibility": "Local",
+                            "first_contact_required": false,
+                            "status": "delivered",
+                            "created_at": "2026-05-31T10:00:00Z",
+                            "delivered_at": null
+                        }
+                    ],
                     "next_cursor": null
                 }),
                 other => panic!("unexpected tool {other}"),
@@ -475,7 +488,7 @@ async fn hub_join_command_success_outputs_safe_user_text_and_stores_credential()
         text.contains("Opening browser to join pie.0xfefe.me"),
         "{text}"
     );
-    assert!(text.contains("Joined hub as @alice@dongxu"), "{text}");
+    assert!(text.contains("Joined hub as alice@dongxu"), "{text}");
     assert!(text.contains("hub is connected"), "{text}");
     assert!(!text.contains("restart pie"), "{text}");
     let login_url = login_url_seen
@@ -596,7 +609,7 @@ async fn hub_join_command_browser_open_failure_prints_manual_login_and_keeps_wai
     );
     task.await.unwrap();
     let text = capture.text();
-    assert!(text.contains("Joined hub as @alice@dongxu"), "{text}");
+    assert!(text.contains("Joined hub as alice@dongxu"), "{text}");
     assert!(text.contains("hub is connected"), "{text}");
     assert!(!text.contains("redirect parameter"), "{text}");
     assert!(!text.contains("inside the login URL"), "{text}");
@@ -648,7 +661,7 @@ async fn hub_join_command_redacts_secret_like_join_identity() {
     await_background(outcome).await;
 
     let text = capture.text();
-    assert!(text.contains("Joined hub as @unknown@hub"), "{text}");
+    assert!(text.contains("Joined hub as unknown@hub"), "{text}");
     assert!(!text.contains("hub_agent_join_identity_secret"), "{text}");
     assert!(!text.contains("hub_agent_"), "{text}");
     assert!(!text.contains("pie-hub:default"), "{text}");
@@ -688,20 +701,21 @@ async fn hub_send_command_resolves_mentions_and_outputs_bounded_status() {
         cwd: &cwd,
     };
 
-    let outcome = commands::dispatch(
-        "/hub send @bob@dongxu \"hello from alice\"",
-        &registry,
-        &ctx,
-    )
-    .await;
+    let outcome =
+        commands::dispatch("/hub send bob@dongxu \"hello from alice\"", &registry, &ctx).await;
     assert!(matches!(outcome, commands::CommandOutcome::Handled));
+    let compat =
+        commands::dispatch("/hub send @bob@dongxu \"compat hello\"", &registry, &ctx).await;
+    assert!(matches!(compat, commands::CommandOutcome::Handled));
 
     let text = capture.text();
     assert!(
-        text.contains("sent hub notification to @unknown@hub"),
+        text.contains("sent hub notification to unknown@hub"),
         "{text}"
     );
+    assert!(!text.contains("@unknown@hub"), "{text}");
     assert!(text.contains("hello from alice"), "{text}");
+    assert!(text.contains("compat hello"), "{text}");
     assert!(text.contains("queued for first-contact review"), "{text}");
     assert!(text.contains("payload       Local (not sent)"), "{text}");
     assert!(!text.contains("hub_agent_command_secret"), "{text}");
@@ -714,6 +728,17 @@ async fn hub_send_command_resolves_mentions_and_outputs_bounded_status() {
     assert!(!text.contains("MCP"), "{text}");
 
     let calls = server.state.lock().await.calls.clone();
+    let profile_calls = calls
+        .iter()
+        .filter(|call| call["name"] == "get_agent_profile")
+        .collect::<Vec<_>>();
+    assert_eq!(profile_calls.len(), 2, "{profile_calls:?}");
+    for call in profile_calls {
+        assert_eq!(
+            call["arguments"]["agent_handle"].as_str(),
+            Some("@bob@dongxu")
+        );
+    }
     let send = calls
         .iter()
         .find(|call| call["name"] == "send_notification")
@@ -768,8 +793,12 @@ async fn hub_inbox_command_outputs_bounded_read_only_feed() {
     let text = capture.text();
     assert!(text.contains("Hub inbox:"), "{text}");
     assert!(text.contains("<hub sender>"), "{text}");
+    assert!(text.contains("beth@research"), "{text}");
+    assert!(!text.contains("@beth@research"), "{text}");
     assert!(text.contains("hello from alice"), "{text}");
+    assert!(text.contains("normal update"), "{text}");
     assert!(text.contains("first-contact · payload unknown"), "{text}");
+    assert!(text.contains("trusted · payload Local"), "{text}");
     assert!(text.contains("status unknown"), "{text}");
     assert!(text.contains("<unknown time>"), "{text}");
     assert!(!text.contains("hub_agent_command_secret"), "{text}");
@@ -817,15 +846,22 @@ async fn hub_send_prefix_lookup_lists_safe_mentions() {
         cwd: &cwd,
     };
 
-    let outcome = commands::dispatch("/hub send @hub_agent", &registry, &ctx).await;
+    let outcome = commands::dispatch("/hub send hub_agent", &registry, &ctx).await;
     assert!(matches!(outcome, commands::CommandOutcome::Handled));
+    let compat = commands::dispatch("/hub send @hub_agent", &registry, &ctx).await;
+    assert!(matches!(compat, commands::CommandOutcome::Handled));
+    let normal = commands::dispatch("/hub send beth", &registry, &ctx).await;
+    assert!(matches!(normal, commands::CommandOutcome::Handled));
 
     let text = capture.text();
     assert!(text.contains("Matching hub agents:"), "{text}");
-    assert!(text.contains("@unknown@hub"), "{text}");
+    assert!(text.contains("unknown@hub"), "{text}");
+    assert!(!text.contains("@unknown@hub"), "{text}");
+    assert!(text.contains("beth@research"), "{text}");
+    assert!(!text.contains("@beth@research"), "{text}");
     assert!(text.contains("Bob Cheng"), "{text}");
     assert!(
-        text.contains("use /hub send @handle@namespace \"message\""),
+        text.contains("use /hub send name@namespace \"message\""),
         "{text}"
     );
     assert!(!text.contains("hub_agent_command_secret"), "{text}");

@@ -498,11 +498,11 @@ fn sender_display_from_request(request: &TriggerPromptRequest) -> String {
     .filter_map(|value| value.as_str())
     {
         let redacted = crate::bug_report::redact(candidate);
-        if let Some(mention) = crate::hub_client::parse_mention(&redacted) {
+        if let Some(mention) = crate::hub_client::display_mention(&redacted) {
             return mention;
         }
     }
-    "@unknown@hub".into()
+    "unknown@hub".into()
 }
 
 #[cfg(test)]

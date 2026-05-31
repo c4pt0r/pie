@@ -114,7 +114,7 @@ impl HubClient {
                 .await?;
             return Ok(response.agent);
         }
-        bail!("target must be @handle@namespace");
+        bail!("target must be name@namespace");
     }
 
     pub async fn matching_agents(
@@ -203,8 +203,24 @@ fn parse_tool_json<T: for<'de> Deserialize<'de>>(
 }
 
 pub fn parse_mention(input: &str) -> Option<String> {
+    let mention = parse_mention_parts(input)?;
+    Some(format!("@{}@{}", mention.handle, mention.namespace))
+}
+
+pub fn display_mention(input: &str) -> Option<String> {
+    let mention = parse_mention_parts(input)?;
+    Some(format!("{}@{}", mention.handle, mention.namespace))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedMention<'a> {
+    handle: &'a str,
+    namespace: &'a str,
+}
+
+fn parse_mention_parts(input: &str) -> Option<ParsedMention<'_>> {
     let trimmed = input.trim();
-    let rest = trimmed.strip_prefix('@')?;
+    let rest = trimmed.strip_prefix('@').unwrap_or(trimmed);
     let (handle, namespace) = rest.split_once('@')?;
     if handle.is_empty() || namespace.is_empty() || namespace.contains('@') {
         return None;
@@ -215,7 +231,7 @@ pub fn parse_mention(input: &str) -> Option<String> {
     if !is_handle_part(handle) || !is_handle_part(namespace) {
         return None;
     }
-    Some(format!("@{handle}@{namespace}"))
+    Some(ParsedMention { handle, namespace })
 }
 
 fn is_handle_part(value: &str) -> bool {
@@ -271,7 +287,12 @@ mod tests {
             parse_mention("@alice-agent@dongxu"),
             Some("@alice-agent@dongxu".into())
         );
-        assert_eq!(parse_mention("alice@dongxu"), None);
+        assert_eq!(parse_mention("alice@dongxu"), Some("@alice@dongxu".into()));
+        assert_eq!(
+            display_mention("@alice-agent@dongxu"),
+            Some("alice-agent@dongxu".into())
+        );
+        assert_eq!(display_mention("alice@dongxu"), Some("alice@dongxu".into()));
         assert_eq!(parse_mention("@alice"), None);
         assert_eq!(parse_mention("@Alice@dongxu"), None);
     }

@@ -1930,7 +1930,7 @@ fn trigger_prompt_sender_label(request: &pie_agent_core::TriggerPromptRequest) -
     .flatten()
     {
         let redacted = safe_trigger_prompt_text(candidate, 96);
-        if let Some(mention) = crate::hub_client::parse_mention(&redacted) {
+        if let Some(mention) = crate::hub_client::display_mention(&redacted) {
             return mention;
         }
     }
@@ -3063,7 +3063,8 @@ mod tests {
         terminal.draw(|f| app.render(f)).unwrap();
         let rendered = buffer_text(terminal.backend().buffer());
         assert!(rendered.contains("Hub notification · first contact"));
-        assert!(rendered.contains("From   @alice@dongxu"), "{rendered}");
+        assert!(rendered.contains("From   alice@dongxu"), "{rendered}");
+        assert!(!rendered.contains("@alice@dongxu"), "{rendered}");
         assert!(rendered.contains("pair-programming"), "{rendered}");
         assert!(rendered.contains("Message preview"), "{rendered}");
         assert!(!rendered.contains("deferred_by_user"), "{rendered}");
@@ -3092,7 +3093,8 @@ mod tests {
         );
         terminal.draw(|f| app.render(f)).unwrap();
         let rendered = buffer_text(terminal.backend().buffer());
-        assert!(rendered.contains("skipped hub notification: @alice@dongxu"));
+        assert!(rendered.contains("skipped hub notification: alice@dongxu"));
+        assert!(!rendered.contains("@alice@dongxu"), "{rendered}");
         assert!(!rendered.contains("deferred_by_user"), "{rendered}");
     }
 
@@ -3123,9 +3125,10 @@ mod tests {
         terminal.draw(|f| app.render(f)).unwrap();
         let rendered = buffer_text(terminal.backend().buffer());
         assert!(
-            rendered.contains("hub notification summary: @alice@dongxu"),
+            rendered.contains("hub notification summary: alice@dongxu"),
             "{rendered}"
         );
+        assert!(!rendered.contains("@alice@dongxu"), "{rendered}");
         assert!(rendered.contains("token=[REDACTED]"), "{rendered}");
         assert!(!rendered.contains("raw Local payload"), "{rendered}");
         assert!(!rendered.contains("hub_agent_SECRET"), "{rendered}");
@@ -3219,13 +3222,14 @@ mod tests {
         terminal.draw(|f| app.render(f)).unwrap();
         let rendered = buffer_text(terminal.backend().buffer());
         assert!(
-            rendered.contains("trusted hub sender for future notifications: @alice@dongxu"),
+            rendered.contains("trusted hub sender for future notifications: alice@dongxu"),
             "{rendered}"
         );
         assert!(
-            rendered.contains("hub notification summary: @alice@dongxu"),
+            rendered.contains("hub notification summary: alice@dongxu"),
             "{rendered}"
         );
+        assert!(!rendered.contains("@alice@dongxu"), "{rendered}");
         assert!(!rendered.contains("raw Local payload"), "{rendered}");
         assert!(!rendered.contains("hub_agent_SECRET"), "{rendered}");
     }
