@@ -17,7 +17,7 @@ user cannot reach the moment where they message another pie user, and that is
 the only definition of "client done" that matters.**
 
 This doc fixes the gap. It pins the user-visible happy path, the auth wire
-contract that supports it, the Defer semantics inherited from issue #110, and
+contract that supports it, the Skip semantics inherited from issue #110, and
 the acceptance gate the team will use to decide when client work is complete.
 
 ## Goal
@@ -133,8 +133,10 @@ Fields shown:
   internal symbol like `#110`, `mcp:pie-hub:`, `prompt_id`, sender IP, or raw
   `agent_id` UUID appears here.
 
-The full prompt UI key map (Accept once / Always / Block / Deny / Defer) maps
-onto runtime semantics in [Defer semantics](#defer-semantics).
+The full prompt UI key map (Accept once / Always / Block / Deny / Skip) maps
+onto runtime semantics in [Skip semantics](#skip-semantics). `Skip` is the
+user-facing label for the Esc key; `deferred_by_user` is the internal audit
+reason, not a UI string.
 
 ### Screen 5 — accepted notification in feed
 
@@ -280,31 +282,37 @@ Worker-side test that exercises the same JSON shapes. Asserts:
   fail with bounded `auth_invalid` recovery; no token issued.
 - A reused code from a prior session is rejected.
 
-## Defer semantics
+## Skip semantics
 
-User chooses **Esc → Defer** on the first-contact prompt card. The runtime side
-of issue #110 does not need a new `Defer` decision variant. Map UI Defer onto
-the existing `TriggerPromptDecision::Timeout` shape with a bounded reason:
+User chooses **Esc → Skip** on the first-contact prompt card. The runtime side
+of issue #110 does not need a new decision variant. Map UI Skip onto the
+existing `TriggerPromptDecision::Timeout` shape with a bounded reason:
 
 - `decision = "timeout"`, `reason = "deferred_by_user"`.
-- Runtime writes `trigger_prompt` audit with the deferred reason.
+- Runtime writes `trigger_prompt` audit with the `deferred_by_user` reason.
 - Runtime writes **no** trust list entry, **no** block list entry.
 - Runtime **does not execute** the trigger.
 - Runtime **does not auto-refire** the prompt on session resume or reconnect.
 
-**Defer is terminal in v0.** Once the user picks Defer, the runtime treats the
+**Terminology.** *Skip* is the user-facing label on the Esc key (and the
+acceptance / e2e gate names). *`deferred_by_user`* is the internal audit
+reason string written to `trigger_prompt`. The two never mix: UI / status /
+feed / report uses Skip; runtime / audit / log keeps `deferred_by_user` so
+existing #110 mechanics keep working without a new decision variant.
+
+**Skip is terminal in v0.** Once the user picks Skip, the runtime treats the
 prompt as resolved (`Timeout`). The notification is not delivered and not
 retried. The receiver simply chose not to engage now.
 
-A future `/hub inbox` review path that resurrects deferred prompts is
+A future `/hub inbox` review path that resurrects skipped prompts is
 intentionally out of scope for v0 and tracked as a v1 follow-up — re-injecting
-a deferred prompt would require a new trigger envelope (the original is gone
+a skipped prompt would require a new trigger envelope (the original is gone
 from runtime's pipeline by the time Timeout audit fires) and a contract for
 how the embedder rebuilds it without violating the source-of-truth boundary
 in §5.7. v0 does not promise this.
 
 Sub-PR #142 already added the runtime-side trigger prompt resolution channel;
-no further runtime change is required for Defer in v0.
+no further runtime change is required for Skip in v0.
 
 ## Acceptance gates
 
@@ -334,10 +342,10 @@ Client work is **not done** until all of the following pass:
 - Choosing **Block** persists a block entry and silently drops future
   notifications from that sender to that receiver.
 - Choosing **Deny** writes only the `trigger_prompt` audit; no trust/block.
-- Choosing **Defer** writes only the `trigger_prompt` audit with
+- Choosing **Skip** writes only the `trigger_prompt` audit with
   `reason = "deferred_by_user"`, does not execute, does not write trust/block,
   and the prompt is terminal — it does not auto-refire and v0 has no retry
-  path (see Defer semantics).
+  path (see [Skip semantics](#skip-semantics)).
 
 ### Redaction (Provider/Auth + Tools-MCP + QA)
 
@@ -410,8 +418,8 @@ Owner: @CLI-TUI-Dev-Lead.
 `/hub send` autocomplete reads `discover_public_agents` listing schema +
 local trust state. `/hub inbox` provides a bounded read-only view of the
 hub-backlog (per §2.3 `list_my_inbox`) plus an audit list of recent
-`trigger_prompt` outcomes (Accept once / Always / Block / Deny / Defer with
-their bounded metadata). No retry-from-inbox in v0 — see Defer semantics.
+`trigger_prompt` outcomes (Accept once / Always / Block / Deny / Skip with
+their bounded metadata). No retry-from-inbox in v0 — see [Skip semantics](#skip-semantics).
 
 ### Phase 5: first-contact prompt card
 
@@ -421,10 +429,10 @@ hookup).
 Renders the `TriggerPromptRequest` event (from #110 sub-PR 4 / PR #142) as
 the trigger prompt card with the layout in Screen 4. The card preview field
 is the bounded `trigger_summary` (UI cap 120 chars) — never the raw Local
-payload, raw `_meta`, sender IP, or raw `agent_id` UUID. Defer maps to
-`TriggerPromptDecision::Timeout` with the `deferred_by_user` reason. Accept
-once / Always / Block / Deny map to their respective trust/audit semantics
-from §5.7.
+payload, raw `_meta`, sender IP, or raw `agent_id` UUID. Skip maps to
+`TriggerPromptDecision::Timeout` with the `deferred_by_user` audit reason.
+Accept once / Always / Block / Deny map to their respective trust/audit
+semantics from §5.7.
 
 ### Phase 6: live e2e
 
@@ -451,7 +459,7 @@ Two real pie clients exercise the full happy path against
 | #19.OQ-2      | If browser does not return within `expires_in_seconds`, what does the user see?                   | `pie` cancels the loopback, prints `Browser login timed out. Try /hub join again.`                          |
 | #19.OQ-3      | Handle auto-derivation: from username, or always prompt?                                          | Auto-derive at registration; user can change later via `/hub profile --handle`. Conflict → suffix.        |
 | #19.OQ-4      | Should `/hub send` permit free-text targets, or only autocompleted ones?                          | Allow both. Free-text triggers a `not_found` recovery if unresolved.                                      |
-| ~~#19.OQ-5~~  | ~~Defer TTL?~~                                                                                    | **Removed.** v0 Defer is terminal `Timeout`; no retry, no TTL. Retry-from-inbox is a deliberate v1 follow-up tracked outside this OQ table. |
+| ~~#19.OQ-5~~  | ~~Defer TTL?~~                                                                                    | **Removed.** v0 Skip (internally `Timeout` with `reason = "deferred_by_user"`) is terminal; no retry, no TTL. Retry-from-inbox is a deliberate v1 follow-up tracked outside this OQ table. |
 
 ## Change log
 
@@ -459,3 +467,4 @@ Two real pie clients exercise the full happy path against
 | ---------- | ------ | -------------------------------------------------------------------------------------------- |
 | 2026-05-30 | @alice | v0.1 draft: happy path sketch, auth wire contract (preflight + exchange + PKCE), Defer semantics over Timeout, acceptance gates, six implementation phases. |
 | 2026-05-30 | @alice | v0.2: locked-defaults follow-up — built-in default hub configuration model (no `mcp.toml` required, canonical `mcp:pie-hub:` source label, custom servers get independent trust scope); first-contact card preview is bounded `trigger_summary` capped at 120 chars (UI cap on top of hub's 240-char `_meta.pie_summary` bound), not raw Local payload; explicit redaction additions for bare PKCE `state`, raw `agent_id` UUID, sender IP. |
+| 2026-05-31 | @alice | v0.3: terminology cleanup after QA bug sweep (task #44). User-facing label is **Skip** everywhere (key map, acceptance bullets, feed/audit list, Phase 5 spec); `deferred_by_user` is internal audit reason only. Renamed `## Defer semantics` → `## Skip semantics` with an explicit terminology note so future readers don't mix the two. |
