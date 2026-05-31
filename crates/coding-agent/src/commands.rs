@@ -1300,7 +1300,7 @@ async fn hub_connect(argv: &[String]) -> CommandOutcome {
     if let Err(e) = tokio::fs::write(&path, text).await {
         return CommandOutcome::Error(format!("write mcp config: {e}"));
     }
-    cprintln!("hub configured: {} -> {}", HUB_SERVER_NAME, endpoint_host);
+    cprintln!("hub configured for {endpoint_host}");
     cprintln!("auth configured: yes");
     cprintln!("next: run /hub join, then restart pie to connect the MCP transport");
     CommandOutcome::Handled

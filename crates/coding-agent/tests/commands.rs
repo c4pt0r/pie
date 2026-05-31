@@ -1525,9 +1525,11 @@ async fn dispatch_hub_connect_writes_streamable_http_config_without_token_output
     let outcome = commands::dispatch("/hub connect", &registry, &ctx).await;
     assert!(matches!(outcome, commands::CommandOutcome::Handled));
     let text = capture.text();
-    assert!(text.contains("hub configured"), "{text}");
+    assert!(text.contains("hub configured for pie.0xfefe.me"), "{text}");
     assert!(text.contains("next: run /hub join"), "{text}");
     assert!(!text.contains("/hub login"), "{text}");
+    assert!(!text.contains("pie-hub ->"), "{text}");
+    assert!(!text.contains("hub configured: pie-hub"), "{text}");
     assert!(!text.contains("pie-hub:default"), "{text}");
     assert!(!text.contains("hub_agent_"), "{text}");
 
