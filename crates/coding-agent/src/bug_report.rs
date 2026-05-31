@@ -136,6 +136,12 @@ static REDACTORS: Lazy<Vec<(&'static str, Regex)>> = Lazy::new(|| {
         ("google_api_key", r"\bAIza[0-9A-Za-z_-]{35}\b"),
         // Generic Bearer tokens in HTTP-style strings.
         ("bearer_token", r"Bearer\s+[A-Za-z0-9._\-]{16,}"),
+        // Hub browser login and loopback callback URLs can carry auth state or one-time codes.
+        ("pie_hub_login_url", r"https?://[^\s]+/login\?[^\s]+"),
+        (
+            "pie_hub_callback_url",
+            r"http://127\.0\.0\.1:[0-9]+/callback(?:\?[^\s]+)?",
+        ),
         // pie hub session / agent credentials can appear as bare values in transport errors.
         ("pie_hub_token", r"\bhub_(?:agent|hs)_[A-Za-z0-9._\-]{8,}\b"),
         // Hub/user-visible diagnostics should not expose raw immutable IDs.
@@ -155,18 +161,28 @@ mod tests {
 
     #[test]
     fn redacts_known_patterns() {
-        let s = "key=sk-abcdefghij1234567890abcd , aws=AKIAEXAMPLEEXAMPLE1A, gh=gho_abcdefghijklmnopqrstuvwxyz0123456789, slack=xoxb-1234567890-abcdef, header=Authorization: Bearer eyJabc.defghijklmnopqr, hub=hub_agent_abcdefghijklmnopqrstuvwxyz, session=hub_hs_abcdefghijklmnopqrstuvwxyz, id=018fe23a-1111-4a22-8b33-123456789abc";
+        let s = "key=sk-abcdefghij1234567890abcd , aws=AKIAEXAMPLEEXAMPLE1A, gh=gho_abcdefghijklmnopqrstuvwxyz0123456789, slack=xoxb-1234567890-abcdef, header=Authorization: Bearer eyJabc.defghijklmnopqr, login=https://pie.0xfefe.me/login?req=018fe23a-1111-4a22-8b33-123456789abc&state=state_secret, callback=http://127.0.0.1:49152/callback?code=hub_code_secret&state=state_secret, hub=hub_agent_abcdefghijklmnopqrstuvwxyz, session=hub_hs_abcdefghijklmnopqrstuvwxyz, id=018fe23a-1111-4a22-8b33-123456789abc";
         let r = redact(s);
         assert!(!r.contains("sk-abcdefghij"), "openai key leaked: {r}");
         assert!(!r.contains("AKIAEXAMPLE"), "aws key leaked: {r}");
         assert!(!r.contains("gho_"), "github token leaked: {r}");
         assert!(!r.contains("xoxb-"), "slack token leaked: {r}");
         assert!(!r.contains("eyJabc.defghijklmnopqr"), "bearer leaked: {r}");
+        assert!(
+            !r.contains("pie.0xfefe.me/login"),
+            "hub login URL leaked: {r}"
+        );
+        assert!(
+            !r.contains("127.0.0.1:49152/callback"),
+            "hub callback URL leaked: {r}"
+        );
         assert!(!r.contains("hub_agent_"), "hub agent token leaked: {r}");
         assert!(!r.contains("hub_hs_"), "hub session token leaked: {r}");
         assert!(!r.contains("018fe23a-1111"), "uuid leaked: {r}");
         assert!(r.contains("[REDACTED:openai_anthropic_key]"));
         assert!(r.contains("[REDACTED:aws_access_key]"));
+        assert!(r.contains("[REDACTED:pie_hub_login_url]"));
+        assert!(r.contains("[REDACTED:pie_hub_callback_url]"));
         assert!(r.contains("[REDACTED:pie_hub_token]"));
         assert!(redact("id=018fe23a-1111-4a22-8b33-123456789abc").contains("[REDACTED:uuid]"));
     }

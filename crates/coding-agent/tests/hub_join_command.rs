@@ -95,6 +95,27 @@ impl Drop for OutputCapture {
     }
 }
 
+async fn await_background(outcome: commands::CommandOutcome) {
+    match outcome {
+        commands::CommandOutcome::BackgroundTask { task, .. } => {
+            tokio::time::timeout(std::time::Duration::from_secs(10), task)
+                .await
+                .expect("background command completed")
+        }
+        other => panic!("expected BackgroundTask outcome, got {other:?}"),
+    }
+}
+
+async fn wait_for_login_url(slot: &Arc<Mutex<Option<String>>>) -> String {
+    for _ in 0..100 {
+        if let Some(url) = slot.lock().unwrap().clone() {
+            return url;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("login URL was not captured");
+}
+
 fn faux_model() -> pie_ai::Model {
     pie_ai::Model {
         id: "faux".into(),
@@ -171,14 +192,11 @@ async fn faux_hub_join_auth_start(
     if redirect.path() != "/callback" {
         return Err(axum::http::StatusCode::BAD_REQUEST);
     }
-    let callback = format!(
-        "{}?code=hub_code_command_join_secret",
-        request.loopback_redirect_uri
-    );
+    let req = "command-exchange-request-1";
     state.lock().await.start = Some(request);
     Ok(axum::Json(hub_auth::HubAuthStartResponse {
-        exchange_request_id: "command-exchange-request-1".into(),
-        login_url: format!("http://127.0.0.1/login?redirect={callback}"),
+        exchange_request_id: req.into(),
+        login_url: format!("http://127.0.0.1/login?req={req}&state=state-public"),
         expires_in_seconds: 30,
     }))
 }
@@ -220,10 +238,17 @@ async fn drive_faux_hub_join_browser(
         format!("code=hub_code_command_join_secret&state={}", start.state)
     };
     let login = reqwest::Url::parse(login_url).unwrap();
-    let redirect_uri = login
-        .query_pairs()
-        .find_map(|(key, value)| (key == "redirect").then(|| value.into_owned()))
-        .expect("faux login URL includes redirect");
+    assert!(login.query_pairs().any(|(key, _)| key == "req"));
+    assert!(!login.query_pairs().any(|(key, _)| key == "redirect"));
+    let redirect_uri = {
+        let state = state.lock().await;
+        state
+            .start
+            .as_ref()
+            .expect("captured start request")
+            .loopback_redirect_uri
+            .clone()
+    };
     let mut callback = reqwest::Url::parse(&redirect_uri).unwrap();
     callback.set_query(Some(&callback_query));
     let response = reqwest::Client::builder()
@@ -409,10 +434,7 @@ async fn hub_join_command_success_outputs_safe_user_text_and_stores_credential()
     };
 
     let outcome = commands::dispatch("/hub join", &registry, &ctx).await;
-    assert!(
-        matches!(outcome, commands::CommandOutcome::Handled),
-        "{outcome:?}"
-    );
+    await_background(outcome).await;
     let callback_text = callback_rx.await.unwrap();
     assert!(
         callback_text.contains("Hub login complete"),
@@ -495,6 +517,92 @@ async fn hub_join_command_success_outputs_safe_user_text_and_stores_credential()
 }
 
 #[tokio::test]
+async fn hub_join_command_browser_open_failure_prints_manual_login_and_keeps_waiting() {
+    let _auth_guard = auth::ENV_LOCK.lock().unwrap();
+    let _pie_guard = PIE_DIR_ENV_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let _pie_dir = EnvGuard::set("PIE_DIR", temp.path());
+    auth::AuthStore::default().save().unwrap();
+
+    let server = FauxHubJoinServer::start().await;
+    let mcp_server = FauxHubMcpServer::start().await;
+    let _mcp_endpoint_guard =
+        mcp_loader::install_test_built_in_hub_endpoint(mcp_server.endpoint.clone());
+    let login_url_seen = Arc::new(Mutex::new(None::<String>));
+    let login_for_opener = login_url_seen.clone();
+    let _join_guard = hub_join::install_test_join_runtime(server.origin.clone(), move |url| {
+        *login_for_opener.lock().unwrap() = Some(url.to_string());
+        anyhow::bail!("no browser available")
+    });
+    let capture = OutputCapture::install();
+
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage as Arc<dyn SessionStorage>);
+    let opts = AgentHarnessOptions::new(faux_model(), session);
+    let harness = Arc::new(AgentHarness::new(opts));
+    let registry = commands::Registry::with_builtins();
+    let cwd = std::env::current_dir().unwrap();
+    let ctx = commands::CommandCtx {
+        harness: &harness,
+        session_id: "test-hub-join-command-browser-fallback",
+        log_path: None::<&PathBuf>,
+        tool_count: 0,
+        cwd: &cwd,
+    };
+
+    let outcome = commands::dispatch("/hub join", &registry, &ctx).await;
+    let task = match outcome {
+        commands::CommandOutcome::BackgroundTask { task, .. } => task,
+        other => panic!("expected BackgroundTask outcome, got {other:?}"),
+    };
+    let task = tokio::spawn(task);
+    let login_url = wait_for_login_url(&login_url_seen).await;
+    let text = capture.text();
+    assert!(text.contains("Browser auto-open unavailable"), "{text}");
+    assert!(
+        text.contains("Open this login link in a browser:"),
+        "{text}"
+    );
+    assert!(text.contains(&login_url), "{text}");
+    assert!(text.contains("SSH"), "{text}");
+    assert!(text.contains("callback port"), "{text}");
+    let callback_port = {
+        let state = server.state.lock().await;
+        let start = state.start.as_ref().expect("captured start request");
+        reqwest::Url::parse(&start.loopback_redirect_uri)
+            .unwrap()
+            .port()
+            .unwrap()
+            .to_string()
+    };
+    assert!(text.contains(&callback_port), "{text}");
+    assert!(!text.contains("hub_agent_"), "{text}");
+    assert!(!text.contains("hub_code_"), "{text}");
+    assert!(!text.contains("code_verifier"), "{text}");
+    assert!(!text.contains("/callback"), "{text}");
+    assert!(!text.contains("/callback?code="), "{text}");
+    assert!(!text.contains("MCP"), "{text}");
+    let bug_report_text = bug_report::redact(&text);
+    assert!(!bug_report_text.contains(&login_url), "{bug_report_text}");
+    assert!(
+        bug_report_text.contains("[REDACTED:pie_hub_login_url]"),
+        "{bug_report_text}"
+    );
+
+    let callback_text = drive_faux_hub_join_browser(&login_url, server.state.clone()).await;
+    assert!(
+        callback_text.contains("Hub login complete"),
+        "{callback_text}"
+    );
+    task.await.unwrap();
+    let text = capture.text();
+    assert!(text.contains("Joined hub as @alice@dongxu"), "{text}");
+    assert!(text.contains("hub is connected"), "{text}");
+    assert!(!text.contains("redirect parameter"), "{text}");
+    assert!(!text.contains("inside the login URL"), "{text}");
+}
+
+#[tokio::test]
 async fn hub_join_command_redacts_secret_like_join_identity() {
     let _auth_guard = auth::ENV_LOCK.lock().unwrap();
     let _pie_guard = PIE_DIR_ENV_LOCK.lock().unwrap();
@@ -537,10 +645,7 @@ async fn hub_join_command_redacts_secret_like_join_identity() {
     };
 
     let outcome = commands::dispatch("/hub join", &registry, &ctx).await;
-    assert!(
-        matches!(outcome, commands::CommandOutcome::Handled),
-        "{outcome:?}"
-    );
+    await_background(outcome).await;
 
     let text = capture.text();
     assert!(text.contains("Joined hub as @unknown@hub"), "{text}");

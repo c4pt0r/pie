@@ -63,7 +63,6 @@ pub const THINKING_LEVEL_USAGE: &str = "[off|minimal|low|medium|high|xhigh]";
 
 /// Outcome of running a command. Drives the REPL's next action.
 #[cfg_attr(test, allow(dead_code))]
-#[derive(Debug)]
 pub enum CommandOutcome {
     /// Continue the REPL loop normally.
     Handled,
@@ -100,6 +99,59 @@ pub enum CommandOutcome {
         storage_key: Option<String>,
         recovery_command: Option<String>,
     },
+    /// Run command-owned async work outside the TUI event loop.
+    ///
+    /// Long setup flows such as browser loopback auth report through the command output sink so
+    /// the input box remains responsive while the flow waits for external user action.
+    BackgroundTask {
+        label: &'static str,
+        task: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+    },
+}
+
+impl std::fmt::Debug for CommandOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Handled => f.write_str("Handled"),
+            Self::Quit => f.write_str("Quit"),
+            Self::ClearScreen => f.write_str("ClearScreen"),
+            Self::Error(message) => f.debug_tuple("Error").field(message).finish(),
+            Self::AttachSkill { name } => {
+                f.debug_struct("AttachSkill").field("name", name).finish()
+            }
+            Self::RunAgentPrompt {
+                prompt,
+                error_context,
+            } => f
+                .debug_struct("RunAgentPrompt")
+                .field("prompt", prompt)
+                .field("error_context", error_context)
+                .finish(),
+            Self::RunPromptTemplate { name, vars } => f
+                .debug_struct("RunPromptTemplate")
+                .field("name", name)
+                .field("vars", vars)
+                .finish(),
+            Self::RunCompaction { custom } => f
+                .debug_struct("RunCompaction")
+                .field("custom", custom)
+                .finish(),
+            Self::LoginSecret {
+                provider,
+                storage_key,
+                recovery_command,
+            } => f
+                .debug_struct("LoginSecret")
+                .field("provider", provider)
+                .field("storage_key", storage_key)
+                .field("recovery_command", recovery_command)
+                .finish(),
+            Self::BackgroundTask { label, .. } => f
+                .debug_struct("BackgroundTask")
+                .field("label", label)
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 /// Context handed to a command at runtime. Kept narrow so each command's dependencies are
@@ -1117,37 +1169,78 @@ async fn hub_join(argv: &[String], ctx: &CommandCtx<'_>) -> CommandOutcome {
     if argv.len() != 1 {
         return CommandOutcome::Error("usage: /hub join".into());
     }
-    cprintln!("Opening browser to join pie.0xfefe.me...");
-    match crate::hub_join::join_default_hub().await {
+    let harness = ctx.harness.clone();
+    CommandOutcome::BackgroundTask {
+        label: "hub join",
+        task: Box::pin(async move {
+            cprintln!("Opening browser to join pie.0xfefe.me...");
+            cprintln!("Waiting for browser login; you can keep using pie while this completes.");
+            if let Err(e) = run_hub_join_background(&harness).await {
+                cprintln!(
+                    "hub join failed: {}",
+                    redact_hub_status_text(&e.to_string())
+                );
+            }
+        }),
+    }
+}
+
+async fn run_hub_join_background(harness: &Arc<AgentHarness>) -> anyhow::Result<()> {
+    let manual_login_printed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let manual_login_flag = manual_login_printed.clone();
+    let options = crate::hub_join::HubJoinOptions {
+        manual_login: Some(std::sync::Arc::new(move |manual| {
+            manual_login_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            cprintln!(
+                "Browser auto-open unavailable: {}",
+                redact_hub_status_text(&manual.reason)
+            );
+            cprintln!("Open this login link in a browser:");
+            cprintln!("{}", manual.login_url);
+            cprintln!(
+                "Keep pie running until login completes. On SSH, forward local callback port {} to this machine, or run /hub join from a local terminal; paste-code/device-code fallback is not supported yet.",
+                manual.callback_port
+            );
+        })),
+        ..Default::default()
+    };
+    match crate::hub_join::join_default_hub_with_options(options).await {
         Ok(joined) => {
             cprintln!(
                 "Joined hub as {}",
                 safe_joined_mention(&joined.handle, &joined.namespace)
             );
-            if let Err(e) = ensure_hub_hook_connected(ctx).await {
-                return CommandOutcome::Error(format!(
-                    "hub join saved credential, but live connection failed: {}; run /hub status",
-                    redact_hub_status_text(&e.to_string())
-                ));
-            }
+            ensure_hub_hook_connected_for_harness(harness)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "hub join saved credential, but live connection failed: {}; run /hub status",
+                        redact_hub_status_text(&e.to_string())
+                    )
+                })?;
             cprintln!("hub is connected; run /hub status or /hub send");
-            CommandOutcome::Handled
+            Ok(())
         }
-        Err(e) => CommandOutcome::Error(format!(
-            "hub join failed: {}",
-            redact_hub_status_text(&e.to_string())
-        )),
+        Err(e) => {
+            if manual_login_printed.load(std::sync::atomic::Ordering::SeqCst) {
+                anyhow::bail!(
+                    "{}; recovery: keep pie running and complete the browser flow, retry from a local browser session, or SSH-forward the callback port printed above",
+                    redact_hub_status_text(&e.to_string())
+                );
+            }
+            Err(e)
+        }
     }
 }
 
-async fn ensure_hub_hook_connected(ctx: &CommandCtx<'_>) -> anyhow::Result<()> {
-    if has_live_hub_hook(ctx) {
+async fn ensure_hub_hook_connected_for_harness(harness: &Arc<AgentHarness>) -> anyhow::Result<()> {
+    if has_live_hub_hook_for_harness(harness) {
         return Ok(());
     }
     let hook = crate::mcp_loader::connect_built_in_hub_notification_hook().await?;
-    ctx.harness.register_notification_hook(hook);
+    harness.register_notification_hook(hook);
     for _ in 0..20 {
-        if has_live_hub_hook(ctx) {
+        if has_live_hub_hook_for_harness(harness) {
             return Ok(());
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -1155,8 +1248,8 @@ async fn ensure_hub_hook_connected(ctx: &CommandCtx<'_>) -> anyhow::Result<()> {
     anyhow::bail!("hub transport did not report connected");
 }
 
-fn has_live_hub_hook(ctx: &CommandCtx<'_>) -> bool {
-    ctx.harness
+fn has_live_hub_hook_for_harness(harness: &Arc<AgentHarness>) -> bool {
+    harness
         .notification_status_snapshot()
         .hooks
         .into_iter()

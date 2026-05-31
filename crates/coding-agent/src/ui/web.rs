@@ -240,6 +240,9 @@ impl App {
                     "web login is not implemented yet; run `{command}` from the terminal UI"
                 ));
             }
+            CommandOutcome::BackgroundTask { task, .. } => {
+                tokio::spawn(task);
+            }
             CommandOutcome::Handled => {}
         }
         if input.trim_start().starts_with("/goal") {

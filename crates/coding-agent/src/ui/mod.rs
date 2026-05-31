@@ -1008,6 +1008,10 @@ impl App {
                 self.login(&provider, storage_key.as_deref(), terminal)
                     .await;
             }
+            CommandOutcome::BackgroundTask { label, task } => {
+                self.system_line(format!("{label} started in the background"));
+                tokio::spawn(task);
+            }
             CommandOutcome::Handled => {}
         }
         if input.trim_start().starts_with("/goal") {
@@ -1858,6 +1862,9 @@ impl App {
                             Ok(false) => println!("nothing to compact"),
                             Err(e) => eprintln!("error: compaction failed: {e}"),
                         }
+                    }
+                    CommandOutcome::BackgroundTask { task, .. } => {
+                        task.await;
                     }
                     _ => {}
                 }

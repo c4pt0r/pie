@@ -1,6 +1,7 @@
 //! Browser + loopback onboarding for the built-in fefe hub.
 
 use std::io::{Read, Write};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -17,6 +18,7 @@ use crate::hub_auth::{
 
 const CALLBACK_PATH: &str = "/callback";
 const JOIN_TIMEOUT: Duration = Duration::from_secs(300);
+const BROWSER_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct JoinedHub {
     pub handle: String,
@@ -27,6 +29,14 @@ pub struct JoinedHub {
 pub struct HubJoinOptions {
     pub auth_origin: String,
     pub timeout: Duration,
+    pub manual_login: Option<Arc<dyn Fn(ManualLogin) + Send + Sync>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ManualLogin {
+    pub login_url: String,
+    pub reason: String,
+    pub callback_port: u16,
 }
 
 impl Default for HubJoinOptions {
@@ -34,10 +44,12 @@ impl Default for HubJoinOptions {
         Self {
             auth_origin: test_auth_origin().unwrap_or_else(|| HUB_DEFAULT_AUTH_ORIGIN.into()),
             timeout: JOIN_TIMEOUT,
+            manual_login: None,
         }
     }
 }
 
+#[allow(dead_code)]
 pub async fn join_default_hub() -> Result<JoinedHub> {
     join_default_hub_with_options(HubJoinOptions::default()).await
 }
@@ -48,7 +60,7 @@ pub(crate) async fn join_default_hub_for_test() -> Result<JoinedHub> {
     join_default_hub().await
 }
 
-async fn join_default_hub_with_options(options: HubJoinOptions) -> Result<JoinedHub> {
+pub(crate) async fn join_default_hub_with_options(options: HubJoinOptions) -> Result<JoinedHub> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .context("bind local callback listener")?;
@@ -78,7 +90,19 @@ async fn join_default_hub_with_options(options: HubJoinOptions) -> Result<Joined
     )
     .await?;
 
-    open_browser(&start.login_url).context("open browser for hub login")?;
+    if let Err(e) = open_browser(&start.login_url).await {
+        if options.manual_login.is_some() {
+            notify_manual_login(
+                &options,
+                &start.login_url,
+                listener.local_addr()?.port(),
+                format!("{e:#}"),
+            );
+        } else {
+            return Err(e).context("open browser for hub login");
+        }
+    }
+
     let code = tokio::time::timeout(
         options
             .timeout
@@ -230,13 +254,53 @@ fn pkce_challenge(verifier: &str) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
 }
 
-fn open_browser(url: &str) -> Result<()> {
+fn notify_manual_login(
+    options: &HubJoinOptions,
+    login_url: &str,
+    callback_port: u16,
+    reason: String,
+) {
+    if let Some(handler) = &options.manual_login {
+        handler(ManualLogin {
+            login_url: login_url.to_string(),
+            reason,
+            callback_port,
+        });
+    }
+}
+
+fn browser_unavailable_reason() -> Option<String> {
+    if std::env::var_os("PIE_HUB_JOIN_NO_BROWSER").is_some() {
+        return Some("browser auto-open disabled for this session".into());
+    }
+    if std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some() {
+        return Some("SSH session detected; browser auto-open may be unavailable".into());
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+            return Some("no desktop display detected".into());
+        }
+    }
+    None
+}
+
+async fn open_browser(url: &str) -> Result<()> {
     if let Some(opener) = test_browser_opener() {
         return opener(url);
     }
-    let status = open_browser_command(url)
-        .status()
-        .context("spawn system browser")?;
+    if let Some(reason) = browser_unavailable_reason() {
+        anyhow::bail!("{reason}");
+    }
+    let url = url.to_string();
+    let status = tokio::time::timeout(BROWSER_OPEN_TIMEOUT, async move {
+        tokio::task::spawn_blocking(move || open_browser_command(&url).status())
+            .await
+            .context("join system browser opener task")?
+            .context("spawn system browser")
+    })
+    .await
+    .context("system browser opener timed out")??;
     if !status.success() {
         anyhow::bail!("system browser opener exited unsuccessfully");
     }

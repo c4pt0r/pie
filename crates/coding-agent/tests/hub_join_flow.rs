@@ -168,10 +168,17 @@ async fn drive_login_callback(
         format!("code=hub_code_test_join_secret&state={}", start.state)
     };
     let login = reqwest::Url::parse(login_url).unwrap();
-    let redirect_uri = login
-        .query_pairs()
-        .find_map(|(key, value)| (key == "redirect").then(|| value.into_owned()))
-        .expect("faux login URL includes redirect");
+    assert!(login.query_pairs().any(|(key, _)| key == "req"));
+    assert!(!login.query_pairs().any(|(key, _)| key == "redirect"));
+    let redirect_uri = {
+        let state = state.lock().await;
+        state
+            .start
+            .as_ref()
+            .expect("captured start request")
+            .loopback_redirect_uri
+            .clone()
+    };
     let mut callback = reqwest::Url::parse(&redirect_uri).unwrap();
     callback.set_query(Some(&callback_query));
     let callback_response = reqwest::Client::builder()
@@ -196,14 +203,10 @@ async fn auth_start(
     if redirect.path() != "/callback" {
         return Err(axum::http::StatusCode::BAD_REQUEST);
     }
-    let callback = format!(
-        "{}?code=hub_code_test_join_secret",
-        request.loopback_redirect_uri
-    );
     state.lock().await.start = Some(request);
     Ok(axum::Json(HubAuthStartResponse {
         exchange_request_id: "exchange-request-1".into(),
-        login_url: format!("http://127.0.0.1/login?redirect={callback}"),
+        login_url: "http://127.0.0.1/login?req=exchange-request-1&state=state-public".into(),
         expires_in_seconds: 30,
     }))
 }
