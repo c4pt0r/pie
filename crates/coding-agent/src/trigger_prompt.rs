@@ -251,6 +251,10 @@ async fn hub_trust_gate_decision(path: &PathBuf, trigger: &Trigger) -> BeforeTri
         }
     }
 
+    if !binding.first_contact_required {
+        return BeforeTriggerDecision::Allow;
+    }
+
     BeforeTriggerDecision::Prompt {
         reason: "new hub sender requires first-contact approval".into(),
     }
@@ -261,6 +265,7 @@ struct HubTriggerBinding {
     receiver_agent_id: String,
     sender_agent_id: String,
     action_class: String,
+    first_contact_required: bool,
 }
 
 impl HubTriggerBinding {
@@ -278,6 +283,8 @@ impl HubTriggerBinding {
             action_class: trigger_payload_action_class(trigger, &["_meta", "action_class"])
                 .or_else(|| trigger_payload_action_class(trigger, &["action_class"]))
                 .ok_or("hub notification is missing a valid action binding")?,
+            first_contact_required: trigger_payload_bool(trigger, &["first_contact_required"])
+                .unwrap_or(true),
         }))
     }
 }
@@ -301,6 +308,14 @@ fn uuid_string(value: &str) -> Option<String> {
 fn trigger_payload_action_class(trigger: &Trigger, path: &[&str]) -> Option<String> {
     let value = trigger_payload_string(trigger, path)?;
     (value == "notification").then_some(value.to_string())
+}
+
+fn trigger_payload_bool(trigger: &Trigger, path: &[&str]) -> Option<bool> {
+    let mut value = trigger.payload.as_ref()?;
+    for key in path {
+        value = value.get(*key)?;
+    }
+    value.as_bool()
 }
 
 fn trigger_payload_string<'a>(trigger: &'a Trigger, path: &[&str]) -> Option<&'a str> {
@@ -769,6 +784,18 @@ mod tests {
             BeforeTriggerDecision::Prompt { reason }
                 if reason == "new hub sender requires first-contact approval"
         ));
+    }
+
+    #[tokio::test]
+    async fn hub_trust_gate_allows_when_hub_marks_no_first_contact_required() {
+        let dir = tempdir().unwrap();
+        let mut trigger = hub_message_trigger();
+        let payload = trigger.payload.as_mut().unwrap();
+        payload["first_contact_required"] = serde_json::Value::Bool(false);
+
+        let decision = hub_trust_gate_decision(&dir.path().join("hub-trust.json"), &trigger).await;
+
+        assert!(matches!(decision, BeforeTriggerDecision::Allow));
     }
 
     #[tokio::test]

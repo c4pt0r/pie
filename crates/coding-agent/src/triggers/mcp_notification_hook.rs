@@ -243,6 +243,7 @@ fn first_contact_prompt_payload(
             "handle": json_string(params, &["handle"]).map(|value| safe_display(value, 64)),
             "namespace": json_string(params, &["namespace"]).map(|value| safe_display(value, 64)),
         },
+        "first_contact_required": json_bool(params, &["first_contact_required"]).unwrap_or(true),
         "payload_summary": payload_summary,
         "payload_visibility": payload_visibility,
     }))
@@ -257,6 +258,14 @@ fn json_uuid(value: &serde_json::Value, path: &[&str]) -> Option<String> {
 fn json_action_class(value: &serde_json::Value, path: &[&str]) -> Option<String> {
     let candidate = json_string(value, path)?;
     (candidate == "notification").then_some(candidate.to_string())
+}
+
+fn json_bool(value: &serde_json::Value, path: &[&str]) -> Option<bool> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current.as_bool()
 }
 
 fn json_string<'a>(value: &'a serde_json::Value, path: &[&str]) -> Option<&'a str> {
@@ -928,8 +937,55 @@ mod tests {
             Some("notification")
         );
         assert_eq!(
+            payload
+                .get("first_contact_required")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
             payload.pointer("/sender/mention").and_then(|v| v.as_str()),
             Some("@alice@dongxu")
+        );
+        let rendered = payload.to_string();
+        assert!(!rendered.contains("hub_agent_secret_should_not_leave_local_payload"));
+        assert!(payload.get("payload").is_none(), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn hub_agent_message_preserves_first_contact_required_false() {
+        let trigger = map_notification(
+            "pie-hub",
+            &note(
+                "notifications/agent_message",
+                json!({
+                    "notification_id": "note-same-namespace",
+                    "agent_id": "22222222-2222-4222-8222-222222222222",
+                    "handle": "alice",
+                    "namespace": "dongxu",
+                    "sender": "@alice@dongxu",
+                    "payload_visibility": "Local",
+                    "first_contact_required": false,
+                    "payload": {
+                        "secret": "hub_agent_secret_should_not_leave_local_payload"
+                    },
+                    "_meta": {
+                        "pie_dedup_key": "note-same-namespace",
+                        "pie_summary": "same namespace hello",
+                        "receiver_agent_id": "11111111-1111-4111-8111-111111111111",
+                        "sender_agent_id": "22222222-2222-4222-8222-222222222222",
+                        "action_class": "notification"
+                    }
+                }),
+            ),
+        )
+        .expect("hub notification should map");
+
+        let payload = trigger.payload.expect("bounded envelope payload");
+        assert_eq!(
+            payload
+                .get("first_contact_required")
+                .and_then(|v| v.as_bool()),
+            Some(false)
         );
         let rendered = payload.to_string();
         assert!(!rendered.contains("hub_agent_secret_should_not_leave_local_payload"));
