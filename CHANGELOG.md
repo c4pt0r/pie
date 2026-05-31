@@ -444,6 +444,8 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
   instead of exposing the internal `pie-hub` server label in user-facing output.
 - Advanced `/hub connect` now uses the same product-facing host wording and no longer
   prints the internal `pie-hub` server label in its success output.
+- Hub recovery hints now point users back to `/hub join` without mentioning restarts or
+  MCP transport internals.
 - `find` tool results are now bounded more tightly by default to reduce token waste and
   oversized TUI previews. The default path limit is 200 instead of 1000, truncated results
   include a clear recovery hint, and structured details now report the limit and whether it

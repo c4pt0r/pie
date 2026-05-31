@@ -1528,6 +1528,9 @@ async fn dispatch_hub_connect_writes_streamable_http_config_without_token_output
     assert!(text.contains("hub configured for pie.0xfefe.me"), "{text}");
     assert!(text.contains("next: run /hub join"), "{text}");
     assert!(!text.contains("/hub login"), "{text}");
+    assert!(!text.contains("restart pie"), "{text}");
+    assert!(!text.contains("MCP"), "{text}");
+    assert!(!text.contains("mcp"), "{text}");
     assert!(!text.contains("pie-hub ->"), "{text}");
     assert!(!text.contains("hub configured: pie-hub"), "{text}");
     assert!(!text.contains("pie-hub:default"), "{text}");
@@ -1758,8 +1761,15 @@ auth = { kind = "bearer", token_keychain_ref = "pie-hub:default" }
     let text = capture.text();
     assert!(text.contains("hub           pie.0xfefe.me"), "{text}");
     assert!(text.contains("credential    stored"), "{text}");
+    assert!(
+        text.contains("recovery      run /hub join to reconnect"),
+        "{text}"
+    );
     assert!(!text.contains(secret), "{text}");
     assert!(!text.contains("server        pie-hub"), "{text}");
+    assert!(!text.contains("restart pie"), "{text}");
+    assert!(!text.contains("MCP"), "{text}");
+    assert!(!text.contains("mcp"), "{text}");
     assert!(!text.contains("pie-hub:default"), "{text}");
     assert!(!text.contains("Authorization"), "{text}");
 }

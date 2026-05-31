@@ -1334,7 +1334,7 @@ async fn hub_connect(argv: &[String]) -> CommandOutcome {
     }
     cprintln!("hub configured for {endpoint_host}");
     cprintln!("auth configured: yes");
-    cprintln!("next: run /hub join, then restart pie to connect the MCP transport");
+    cprintln!("next: run /hub join");
     CommandOutcome::Handled
 }
 
@@ -1711,7 +1711,7 @@ fn hub_recovery_hint(credential: &str, connection_state: &str) -> Option<&'stati
         return Some("fix ~/.pie/auth.json permissions, then run /hub join");
     }
     if connection_state == "not connected" {
-        return Some("restart pie to load the hub MCP transport");
+        return Some("run /hub join to reconnect");
     }
     None
 }
