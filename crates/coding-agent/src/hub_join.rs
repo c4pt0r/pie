@@ -19,7 +19,6 @@ use crate::hub_auth::{
 
 const CALLBACK_PATH: &str = "/callback";
 const JOIN_TIMEOUT: Duration = Duration::from_secs(300);
-const BROWSER_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct JoinedHub {
     pub handle: String,
@@ -366,18 +365,9 @@ async fn open_browser(url: &str) -> Result<()> {
     if let Some(opener) = test_browser_opener() {
         return opener(url);
     }
-    let url = url.to_string();
-    let status = tokio::time::timeout(BROWSER_OPEN_TIMEOUT, async move {
-        tokio::task::spawn_blocking(move || open_browser_command(&url).status())
-            .await
-            .context("join system browser opener task")?
-            .context("spawn system browser")
-    })
-    .await
-    .context("system browser opener timed out")??;
-    if !status.success() {
-        anyhow::bail!("system browser opener exited unsuccessfully");
-    }
+    open_browser_command(url)
+        .spawn()
+        .context("spawn system browser")?;
     Ok(())
 }
 
