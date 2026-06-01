@@ -464,6 +464,11 @@ async fn hub_join_command_success_outputs_safe_user_text_and_stores_credential()
         }
         other => panic!("unexpected credential kind: {other:?}"),
     }
+    let identity = hub_join::load_joined_hub_identity()
+        .unwrap()
+        .expect("stored hub identity");
+    assert_eq!(identity.handle, "alice");
+    assert_eq!(identity.namespace, "dongxu");
 
     let state = server.state.lock().await;
     let start = state.start.as_ref().expect("captured start request");

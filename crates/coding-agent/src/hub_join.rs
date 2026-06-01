@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
+use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
 use tokio::net::TcpListener;
 
@@ -21,6 +22,13 @@ const JOIN_TIMEOUT: Duration = Duration::from_secs(300);
 const BROWSER_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct JoinedHub {
+    pub handle: String,
+    pub namespace: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct JoinedHubIdentity {
     pub handle: String,
     pub namespace: String,
 }
@@ -129,10 +137,15 @@ pub(crate) async fn join_default_hub_with_options(options: HubJoinOptions) -> Re
     )
     .await?;
 
-    store_hub_token(&exchange.hub_token).context("save hub credential")?;
-    Ok(JoinedHub {
+    let identity = JoinedHubIdentity {
         handle: exchange.handle,
         namespace: exchange.namespace,
+    };
+    store_joined_hub_identity(&identity).context("save hub identity")?;
+    store_hub_token(&exchange.hub_token).context("save hub credential")?;
+    Ok(JoinedHub {
+        handle: identity.handle,
+        namespace: identity.namespace,
     })
 }
 
@@ -235,6 +248,52 @@ fn store_hub_token(token: &str) -> Result<()> {
         },
     );
     store.save()
+}
+
+fn hub_identity_path() -> std::path::PathBuf {
+    crate::config::base_dir().join("hub-identity.json")
+}
+
+pub(crate) fn store_joined_hub_identity(identity: &JoinedHubIdentity) -> Result<()> {
+    let path = hub_identity_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    let text = serde_json::to_string_pretty(identity)?;
+    std::fs::write(&tmp, text).with_context(|| format!("write {}", tmp.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(&tmp, perms).ok();
+    }
+    std::fs::rename(&tmp, &path).with_context(|| format!("rename {}", path.display()))?;
+    Ok(())
+}
+
+pub(crate) fn load_joined_hub_identity() -> Result<Option<JoinedHubIdentity>> {
+    let path = hub_identity_path();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    let identity =
+        serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+    Ok(Some(identity))
+}
+
+pub(crate) fn remove_joined_hub_identity() -> Result<()> {
+    let path = hub_identity_path();
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("remove {}", path.display())),
+    }
 }
 
 fn pkce_verifier() -> String {

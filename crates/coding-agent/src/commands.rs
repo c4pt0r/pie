@@ -1274,6 +1274,22 @@ fn hub_status(ctx: &CommandCtx<'_>) -> CommandOutcome {
 
     let credential = hub_credential_state();
     cprintln!("  credential    {credential}");
+    if credential == "stored" {
+        match hub_identity_state() {
+            HubIdentityView::Known(identity) => {
+                cprintln!("  identity      {identity}");
+                cprintln!(
+                    "  switching     run /hub join to replace this profile's active identity"
+                );
+            }
+            HubIdentityView::Unknown => {
+                cprintln!("  identity      unknown");
+                cprintln!(
+                    "  switching     run /hub join to refresh this profile's active identity"
+                );
+            }
+        }
+    }
 
     let hook = hub_hook_status(ctx);
     cprintln!("  connection    {}", hook.state);
@@ -1439,6 +1455,12 @@ fn hub_logout() -> CommandOutcome {
     let removed = store.remove(HUB_TOKEN_REF).is_some();
     if let Err(e) = store.save() {
         return CommandOutcome::Error(format!("save auth store: {e}"));
+    }
+    if let Err(e) = crate::hub_join::remove_joined_hub_identity() {
+        return CommandOutcome::Error(format!(
+            "clear hub identity: {}",
+            redact_hub_status_text(&e.to_string())
+        ));
     }
     if removed {
         cprintln!("hub credential removed");
@@ -1762,6 +1784,23 @@ fn hub_credential_state() -> String {
         Ok(store) if store.get(HUB_TOKEN_REF).is_some() => "stored".into(),
         Ok(_) => "missing".into(),
         Err(_) => "unreadable".into(),
+    }
+}
+
+enum HubIdentityView {
+    Known(String),
+    Unknown,
+}
+
+fn hub_identity_state() -> HubIdentityView {
+    let Ok(Some(identity)) = crate::hub_join::load_joined_hub_identity() else {
+        return HubIdentityView::Unknown;
+    };
+    let mention = safe_joined_mention(&identity.handle, &identity.namespace);
+    if mention == "unknown@hub" {
+        HubIdentityView::Unknown
+    } else {
+        HubIdentityView::Known(mention)
     }
 }
 

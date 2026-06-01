@@ -1675,6 +1675,8 @@ async fn dispatch_hub_status_uses_built_in_default_without_mcp_config() {
     );
     assert!(text.contains("hub           pie.0xfefe.me"), "{text}");
     assert!(text.contains("credential    missing"), "{text}");
+    assert!(!text.contains("identity"), "{text}");
+    assert!(!text.contains("switching"), "{text}");
     assert!(text.contains("recovery      run /hub join"), "{text}");
     assert!(!temp.path().join("mcp.toml").exists());
     assert!(!text.contains("mcp.toml"), "{text}");
@@ -1740,6 +1742,11 @@ auth = { kind = "bearer", token_keychain_ref = "pie-hub:default" }
         },
     );
     store.save().unwrap();
+    hub_join::store_joined_hub_identity(&hub_join::JoinedHubIdentity {
+        handle: "alice".into(),
+        namespace: "dongxu".into(),
+    })
+    .unwrap();
 
     let storage = Arc::new(MemorySessionStorage::new());
     let session = Session::new(storage as Arc<dyn SessionStorage>);
@@ -1761,6 +1768,11 @@ auth = { kind = "bearer", token_keychain_ref = "pie-hub:default" }
     let text = capture.text();
     assert!(text.contains("hub           pie.0xfefe.me"), "{text}");
     assert!(text.contains("credential    stored"), "{text}");
+    assert!(text.contains("identity      alice@dongxu"), "{text}");
+    assert!(
+        text.contains("switching     run /hub join to replace this profile's active identity"),
+        "{text}"
+    );
     assert!(
         text.contains("recovery      run /hub join to reconnect"),
         "{text}"
@@ -1771,7 +1783,60 @@ auth = { kind = "bearer", token_keychain_ref = "pie-hub:default" }
     assert!(!text.contains("MCP"), "{text}");
     assert!(!text.contains("mcp"), "{text}");
     assert!(!text.contains("pie-hub:default"), "{text}");
+    assert!(!text.contains("hub-identity"), "{text}");
     assert!(!text.contains("Authorization"), "{text}");
+}
+
+#[tokio::test]
+async fn dispatch_hub_status_redacts_secret_like_join_identity() {
+    let _auth_guard = auth::ENV_LOCK.lock().unwrap();
+    let _pie_guard = PIE_DIR_ENV_LOCK.lock().unwrap();
+    let _output_guard = COMMAND_OUTPUT_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let _pie_dir = EnvGuard::set("PIE_DIR", temp.path());
+    let capture = OutputCapture::install();
+
+    let mut store = auth::AuthStore::default();
+    store.set(
+        "pie-hub:default",
+        auth::ProviderCredential::ApiKey {
+            value: "hub_agent_status_secret_should_not_leak".into(),
+        },
+    );
+    store.save().unwrap();
+    hub_join::store_joined_hub_identity(&hub_join::JoinedHubIdentity {
+        handle: "hub_agent_identity_secret".into(),
+        namespace: "dongxu".into(),
+    })
+    .unwrap();
+
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage as Arc<dyn SessionStorage>);
+    let opts = AgentHarnessOptions::new(faux_model(), session);
+    let harness = Arc::new(AgentHarness::new(opts));
+
+    let registry = commands::Registry::with_builtins();
+    let cwd = std::env::current_dir().unwrap();
+    let ctx = commands::CommandCtx {
+        harness: &harness,
+        session_id: "test-hub-status-redacts-identity",
+        log_path: None,
+        tool_count: 0,
+        cwd: &cwd,
+    };
+
+    let outcome = commands::dispatch("/hub status", &registry, &ctx).await;
+    assert!(matches!(outcome, commands::CommandOutcome::Handled));
+    let text = capture.text();
+    assert!(text.contains("credential    stored"), "{text}");
+    assert!(text.contains("identity      unknown"), "{text}");
+    assert!(
+        text.contains("switching     run /hub join to refresh this profile's active identity"),
+        "{text}"
+    );
+    assert!(!text.contains("hub_agent_"), "{text}");
+    assert!(!text.contains("pie-hub:default"), "{text}");
+    assert!(!text.contains("hub-identity"), "{text}");
 }
 
 #[tokio::test]
