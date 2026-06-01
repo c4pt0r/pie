@@ -126,28 +126,77 @@ test("browser login form errors are bounded HTML and do not crash worker", async
   assert.doesNotMatch(body, /short|hub_agent_|hub_hs_|hub_code_|code_verifier/);
 });
 
-test("browser registration enforces unique namespaces with bounded HTML", async () => {
+test("browser registration allows multiple usernames in one namespace", async () => {
   const app = createTestApp();
-  await registerUser(app, "takenname");
+  await registerUser(app, "teammateone", { namespace: "sharedteam" });
   const start = await authStart(app, {
     verifier: "n".repeat(64),
-    state: "state_namespace_taken",
+    state: "state_namespace_shared",
     loopback: "http://127.0.0.1:49164/callback",
   });
 
-  const response = await browserLoginResponse(app, start.exchange_request_id, "state_namespace_taken", {
+  const callback = await browserLogin(app, start.exchange_request_id, "state_namespace_shared", {
     mode: "register",
-    username: "newperson",
-    namespace: "takenname",
+    username: "teammatetwo",
+    namespace: "sharedteam",
+    password: "teammatetwo-password-123",
+  });
+
+  assert.equal(callback.origin + callback.pathname, "http://127.0.0.1:49164/callback");
+  assert.equal(callback.searchParams.get("state"), "state_namespace_shared");
+  assert.match(callback.searchParams.get("code"), /^hub_code_/);
+});
+
+test("browser registration rejects duplicate username with bounded HTML", async () => {
+  const app = createTestApp();
+  await registerUser(app, "takenname", { namespace: "sharedteam" });
+  const start = await authStart(app, {
+    verifier: "n".repeat(64),
+    state: "state_username_taken",
+    loopback: "http://127.0.0.1:49164/callback",
+  });
+
+  const response = await browserLoginResponse(app, start.exchange_request_id, "state_username_taken", {
+    mode: "register",
+    username: "takenname",
+    namespace: "sharedteam",
     password: "newperson-password-123",
   });
 
   assert.equal(response.status, 400);
   assert.match(response.headers.get("content-type"), /text\/html/);
   const body = await response.text();
-  assert.match(body, /namespace already exists/);
+  assert.match(body, /username already exists/);
   assert.match(body, /name@namespace/);
   assert.doesNotMatch(body, /newperson-password-123|hub_agent_|hub_hs_|hub_code_|code_verifier|Authorization/);
+});
+
+test("browser registration allows same username in different namespaces", async () => {
+  const app = createTestApp();
+  await registerUser(app, "samehandle", {
+    namespace: "teamone",
+    password: "samehandle-teamone-password-123",
+  });
+  await registerUser(app, "samehandle", {
+    namespace: "teamtwo",
+    password: "samehandle-teamtwo-password-123",
+  });
+  const start = await authStart(app, {
+    verifier: "d".repeat(64),
+    state: "state_same_username_login",
+    loopback: "http://127.0.0.1:49165/callback",
+  });
+
+  const callback = await browserLogin(app, start.exchange_request_id, "state_same_username_login", {
+    mode: "login",
+    username: "samehandle",
+    namespace: "teamtwo",
+    password: "samehandle-teamtwo-password-123",
+  });
+
+  assert.equal(callback.origin + callback.pathname, "http://127.0.0.1:49165/callback");
+  assert.equal(callback.searchParams.get("state"), "state_same_username_login");
+  assert.match(callback.searchParams.get("code"), /^hub_code_/);
 });
 
 test("browser login without auth start shows bounded HTML error", async () => {
@@ -380,6 +429,45 @@ test("sends cross-namespace notification over SSE with canonical MCP metadata", 
   assert.doesNotMatch(JSON.stringify(backlog), /kept-local/);
 });
 
+test("same namespace different usernames can send without first-contact", async () => {
+  const store = new MemoryStore();
+  const app = createTestApp(store);
+  const alice = await registerUser(app, "samealice", { namespace: "sharedteam" });
+  const bob = await registerUser(app, "samebob", { namespace: "sharedteam" });
+  const sender = await callTool(app, alice.session_token, "register_agent", {
+    handle: "samealice",
+    display_name: "Same Alice",
+    description: "Same namespace sender",
+    capabilities: ["notify"],
+    inbox: "namespace",
+  });
+  const receiver = await callTool(app, bob.session_token, "register_agent", {
+    handle: "samebob",
+    display_name: "Same Bob",
+    description: "Same namespace receiver",
+    capabilities: ["inbox"],
+    inbox: "namespace",
+  });
+
+  const send = await callTool(app, sender.hub_token, "send_notification", {
+    target_agent_id: receiver.agent.agent_id,
+    summary: "same namespace hello",
+    payload: { secret: "kept-local" },
+  });
+
+  assert.equal(send.first_contact_required, false);
+  assert.equal(send.status, "queued");
+
+  const backlog = await store.listNotifications(receiver.agent.agent_id, 10, null);
+  assert.equal(backlog.length, 1);
+  assert.equal(backlog[0].sender_handle, "samealice");
+  assert.equal(backlog[0].sender_namespace, "sharedteam");
+  assert.equal(backlog[0].first_contact_required, 0);
+  assert.equal(backlog[0].payload_visibility, "Local");
+  assert.equal(backlog[0].payload_json, null);
+  assert.doesNotMatch(JSON.stringify(backlog), /kept-local|hub_agent_|hub_hs_/);
+});
+
 test("durable mailbox opens SSE before the heartbeat is drained", async () => {
   const mailbox = new AgentMailbox({ blockConcurrencyWhile: async (callback) => callback() });
   const response = await withTimeout(mailbox.fetch(new Request(`${BASE}/connect`)), 100);
@@ -517,13 +605,14 @@ test("oversize summary is rejected before delivery", async () => {
   assert.match(response.error.data.violations[0], /summary/);
 });
 
-async function registerUser(app, username) {
+async function registerUser(app, username, { namespace, password } = {}) {
   const response = await app.fetch(
     new Request(`${BASE}/auth/register`, {
       method: "POST",
       body: JSON.stringify({
         username,
-        password: `${username}-password-123`,
+        ...(namespace ? { namespace } : {}),
+        password: password ?? `${username}-password-123`,
       }),
     }),
   );

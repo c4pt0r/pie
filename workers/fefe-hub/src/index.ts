@@ -170,6 +170,8 @@ interface Store {
   createUser(user: UserRecord): Promise<void>;
   getUser(userId: string): Promise<UserRecord | null>;
   getUserByUsername(username: string): Promise<UserRecord | null>;
+  getUsersByUsername(username: string): Promise<UserRecord[]>;
+  getUserByIdentity(username: string, namespace: string): Promise<UserRecord | null>;
   getUserByNamespace(namespace: string): Promise<UserRecord | null>;
   createHumanSession(session: HumanSessionRecord): Promise<void>;
   getHumanSessionByHash(sessionHash: string): Promise<HumanSessionRecord | null>;
@@ -252,6 +254,18 @@ class D1Store implements Store {
 
   getUserByUsername(username: string): Promise<UserRecord | null> {
     return this.db.prepare("SELECT * FROM users WHERE username = ?").bind(username).first<UserRecord>();
+  }
+
+  async getUsersByUsername(username: string): Promise<UserRecord[]> {
+    const result = await this.db.prepare("SELECT * FROM users WHERE username = ? ORDER BY namespace").bind(username).all<UserRecord>();
+    return result.results ?? [];
+  }
+
+  getUserByIdentity(username: string, namespace: string): Promise<UserRecord | null> {
+    return this.db
+      .prepare("SELECT * FROM users WHERE username = ? AND namespace = ?")
+      .bind(username, namespace)
+      .first<UserRecord>();
   }
 
   getUser(userId: string): Promise<UserRecord | null> {
@@ -586,14 +600,22 @@ export class MemoryStore implements Store {
   private readonly notifications = new Map<string, NotificationRecord>();
 
   async createUser(user: UserRecord): Promise<void> {
-    if ([...this.users.values()].some((u) => u.username === user.username || u.namespace === user.namespace)) {
-      throw ERR.schemaInvalid(["username_or_namespace already exists"]);
+    if ([...this.users.values()].some((u) => u.username === user.username && u.namespace === user.namespace)) {
+      throw ERR.schemaInvalid(["username already exists in namespace"]);
     }
     this.users.set(user.user_id, { ...user });
   }
 
   async getUserByUsername(username: string): Promise<UserRecord | null> {
     return [...this.users.values()].find((u) => u.username === username) ?? null;
+  }
+
+  async getUsersByUsername(username: string): Promise<UserRecord[]> {
+    return [...this.users.values()].filter((u) => u.username === username).sort((a, b) => a.namespace.localeCompare(b.namespace));
+  }
+
+  async getUserByIdentity(username: string, namespace: string): Promise<UserRecord | null> {
+    return [...this.users.values()].find((u) => u.username === username && u.namespace === namespace) ?? null;
   }
 
   async getUser(userId: string): Promise<UserRecord | null> {
@@ -1281,6 +1303,10 @@ export class HubApp {
       <label>Username
         <input name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required>
       </label>
+      <label>Namespace
+        <input name="namespace" autocomplete="organization" autocapitalize="none" spellcheck="false" placeholder="team-name or your-handle">
+        <span class="hint">Use the namespace from your pie identity: name@namespace.</span>
+      </label>
       <label>Password
         <input name="password" type="password" autocomplete="current-password" required>
       </label>
@@ -1298,8 +1324,8 @@ export class HubApp {
         <span class="hint">2-32 lowercase letters, numbers, underscores, or hyphens.</span>
       </label>
       <label>Namespace
-        <input name="namespace" autocomplete="organization" autocapitalize="none" spellcheck="false" placeholder="same as username">
-        <span class="hint">Optional. Use a team or personal namespace; it must be unique.</span>
+        <input name="namespace" autocomplete="organization" autocapitalize="none" spellcheck="false" placeholder="team-name or your-handle">
+        <span class="hint">Optional; defaults to username. Members in one namespace can send hub messages directly.</span>
       </label>
       <label>Password
         <input name="password" type="password" autocomplete="new-password" minlength="12" required>
@@ -1344,7 +1370,7 @@ export class HubApp {
     if (mode === "register") {
       user = await this.createUserFromCredentials(username, password, optionalString(args.namespace, "namespace"));
     } else if (mode === "login") {
-      user = await this.requireUserPassword(username, password);
+      user = await this.requireUserPassword(username, password, optionalString(args.namespace, "namespace"));
     } else {
       throw ERR.schemaInvalid(["mode must be login or register"]);
     }
@@ -1420,8 +1446,12 @@ export class HubApp {
   }
 
   private async loginUser(args: Record<string, unknown>): Promise<unknown> {
-    ensureOnly(args, ["username", "password"]);
-    const user = await this.requireUserPassword(stringField(args, "username"), stringField(args, "password"));
+    ensureOnly(args, ["username", "password", "namespace"]);
+    const user = await this.requireUserPassword(
+      stringField(args, "username"),
+      stringField(args, "password"),
+      optionalString(args.namespace, "namespace"),
+    );
     return {
       user_id: user.user_id,
       username: user.username,
@@ -1439,12 +1469,8 @@ export class HubApp {
         throw ERR.schemaInvalid(["password must be at least 12 characters"]);
       }
       phase = "lookup_username";
-      if (await this.store.getUserByUsername(username)) {
-        throw ERR.schemaInvalid(["username already exists"]);
-      }
-      phase = "lookup_namespace";
-      if (await this.store.getUserByNamespace(namespace)) {
-        throw ERR.schemaInvalid(["namespace already exists"]);
+      if (await this.store.getUserByIdentity(username, namespace)) {
+        throw ERR.schemaInvalid(["username already exists in namespace"]);
       }
       phase = "hash_password";
       const salt = randomSecret(18);
@@ -1466,9 +1492,19 @@ export class HubApp {
     }
   }
 
-  private async requireUserPassword(usernameRaw: string, password: string): Promise<UserRecord> {
+  private async requireUserPassword(usernameRaw: string, password: string, namespaceRaw: string | null): Promise<UserRecord> {
     const username = normalizeName(usernameRaw, "username");
-    const user = await this.store.getUserByUsername(username);
+    const namespace = namespaceRaw ? normalizeName(namespaceRaw, "namespace") : null;
+    let user: UserRecord | null;
+    if (namespace) {
+      user = await this.store.getUserByIdentity(username, namespace);
+    } else {
+      const users = await this.store.getUsersByUsername(username);
+      if (users.length > 1) {
+        throw ERR.schemaInvalid(["namespace is required for this username"]);
+      }
+      user = users[0] ?? null;
+    }
     if (!user) {
       throw ERR.authInvalid();
     }

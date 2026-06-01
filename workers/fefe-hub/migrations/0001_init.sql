@@ -1,10 +1,11 @@
 CREATE TABLE IF NOT EXISTS users (
   user_id TEXT PRIMARY KEY,
-  username TEXT NOT NULL UNIQUE,
-  namespace TEXT NOT NULL UNIQUE,
+  username TEXT NOT NULL,
+  namespace TEXT NOT NULL,
   password_hash TEXT NOT NULL,
   password_salt TEXT NOT NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  UNIQUE(username, namespace)
 );
 
 CREATE TABLE IF NOT EXISTS human_sessions (
