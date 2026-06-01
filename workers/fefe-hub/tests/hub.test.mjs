@@ -605,6 +605,274 @@ test("oversize summary is rejected before delivery", async () => {
   assert.match(response.error.data.violations[0], /summary/);
 });
 
+test("web chat creates a session cookie without exposing credentials", async () => {
+  const app = createTestApp();
+
+  const response = await chatLoginResponse(app, {
+    mode: "register",
+    username: "websender",
+    namespace: "webteam",
+    password: "websender-password-123",
+  });
+
+  assert.equal(response.status, 303);
+  assert.equal(response.headers.get("location"), "/chat");
+  const cookie = response.headers.get("set-cookie");
+  assert.match(cookie, /^hub_session=hub_hs_/);
+  assert.match(cookie, /HttpOnly/);
+  assert.match(cookie, /SameSite=Lax/);
+  assert.match(cookie, /Path=\/chat/);
+  const body = await response.text();
+  assert.doesNotMatch(`${body}\n${cookie}`, /hub_agent_|Authorization|code_verifier|pie-hub:default/);
+
+  const page = await app.fetch(new Request(`${BASE}/chat`, { headers: { cookie } }));
+  assert.equal(page.status, 200);
+  const html = await page.text();
+  assert.match(html, /websender@webteam/);
+  assert.match(html, /name@namespace/);
+  assert.doesNotMatch(html, /hub_hs_|hub_agent_|Authorization|code_verifier|pie-hub:default/);
+});
+
+test("web chat rejects cross-origin login without exposing credentials", async () => {
+  const app = createTestApp();
+
+  const response = await chatLoginResponse(
+    app,
+    {
+      mode: "register",
+      username: "websender",
+      namespace: "webteam",
+      password: "websender-password-123",
+    },
+    { origin: "https://evil.test" },
+  );
+
+  assert.equal(response.status, 400);
+  assert.equal(response.headers.get("set-cookie"), null);
+  const body = await response.text();
+  assert.match(body, /Web chat form submission must come from this hub page/);
+  assert.doesNotMatch(body, /websender-password-123|hub_hs_|hub_agent_|Authorization|code_verifier|state=/);
+});
+
+test("web chat sends bounded same-namespace notification to TUI agent", async () => {
+  const store = new MemoryStore();
+  const app = createTestApp(store);
+  const receiverUser = await registerUser(app, "webreceiver", { namespace: "webteam" });
+  const receiver = await callTool(app, receiverUser.session_token, "register_agent", {
+    handle: "webreceiver",
+    display_name: "Web Receiver",
+    description: "Receives web notices",
+    capabilities: ["inbox"],
+    discoverable: "public",
+    inbox: "namespace",
+  });
+  const login = await chatLoginResponse(app, {
+    mode: "register",
+    username: "websender",
+    namespace: "webteam",
+    password: "websender-password-123",
+  });
+  const cookie = login.headers.get("set-cookie");
+
+  const response = await chatSendResponse(app, cookie, {
+    recipient: "webreceiver@webteam",
+    message: "hello from web chat",
+  });
+
+  assert.equal(response.status, 200);
+  const body = await response.text();
+  assert.match(body, /Message delivered to webreceiver@webteam|Message queued to webreceiver@webteam/);
+  assert.doesNotMatch(body, /hub_hs_|hub_agent_|Authorization|pie-hub:default|receiver_agent_id|sender_agent_id/);
+  const notifications = await store.listNotifications(receiver.agent.agent_id, 10, null);
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].summary, "hello from web chat");
+  assert.equal(notifications[0].sender_handle, "websender");
+  assert.equal(notifications[0].sender_namespace, "webteam");
+  assert.equal(notifications[0].payload_json, null);
+  assert.equal(notifications[0].payload_visibility, "Local");
+  assert.equal(notifications[0].first_contact_required, 0);
+});
+
+test("web chat target errors are actionable and bounded", async () => {
+  const app = createTestApp();
+  const login = await chatLoginResponse(app, {
+    mode: "register",
+    username: "websender",
+    namespace: "webteam",
+    password: "websender-password-123",
+  });
+  const cookie = login.headers.get("set-cookie");
+
+  const response = await chatSendResponse(app, cookie, {
+    recipient: "missing@webteam",
+    message: "secret local-only text",
+  });
+
+  assert.equal(response.status, 400);
+  const body = await response.text();
+  assert.match(body, /No reachable agent named missing@webteam/);
+  assert.doesNotMatch(body, /secret local-only text|hub_hs_|hub_agent_|Authorization|receiver_agent_id|sender_agent_id|raw MCP/i);
+});
+
+test("web chat rejects cross-origin send without creating notification", async () => {
+  const store = new MemoryStore();
+  const app = createTestApp(store);
+  const receiverUser = await registerUser(app, "webreceiver", { namespace: "webteam" });
+  const receiver = await callTool(app, receiverUser.session_token, "register_agent", {
+    handle: "webreceiver",
+    display_name: "Web Receiver",
+    description: "Receives web notices",
+    capabilities: ["inbox"],
+    discoverable: "public",
+    inbox: "namespace",
+  });
+  const login = await chatLoginResponse(app, {
+    mode: "register",
+    username: "websender",
+    namespace: "webteam",
+    password: "websender-password-123",
+  });
+  const cookie = login.headers.get("set-cookie");
+
+  const response = await chatSendResponse(
+    app,
+    cookie,
+    {
+      recipient: "webreceiver@webteam",
+      message: "secret local-only text",
+    },
+    { origin: "https://evil.test" },
+  );
+
+  assert.equal(response.status, 400);
+  const body = await response.text();
+  assert.match(body, /Web chat form submission must come from this hub page/);
+  assert.doesNotMatch(body, /secret local-only text|hub_hs_|hub_agent_|Authorization|code_verifier|receiver_agent_id|sender_agent_id|raw MCP/i);
+  const notifications = await store.listNotifications(receiver.agent.agent_id, 10, null);
+  assert.equal(notifications.length, 0);
+});
+
+test("web chat accepts same-origin send", async () => {
+  const store = new MemoryStore();
+  const app = createTestApp(store);
+  const receiverUser = await registerUser(app, "webreceiver", { namespace: "webteam" });
+  await callTool(app, receiverUser.session_token, "register_agent", {
+    handle: "webreceiver",
+    display_name: "Web Receiver",
+    description: "Receives web notices",
+    capabilities: ["inbox"],
+    discoverable: "public",
+    inbox: "namespace",
+  });
+  const login = await chatLoginResponse(app, {
+    mode: "register",
+    username: "websender",
+    namespace: "webteam",
+    password: "websender-password-123",
+  });
+  const cookie = login.headers.get("set-cookie");
+
+  const response = await chatSendResponse(app, cookie, {
+    recipient: "webreceiver@webteam",
+    message: "hello from same origin",
+  });
+
+  assert.equal(response.status, 200);
+  const body = await response.text();
+  assert.match(body, /Message delivered to webreceiver@webteam|Message queued to webreceiver@webteam/);
+});
+
+test("web chat redacts token-like recipient in not-found output", async () => {
+  const app = createTestApp();
+  const login = await chatLoginResponse(app, {
+    mode: "register",
+    username: "websender",
+    namespace: "webteam",
+    password: "websender-password-123",
+  });
+  const cookie = login.headers.get("set-cookie");
+
+  const handleResponse = await chatSendResponse(app, cookie, {
+    recipient: "hub_agent_missing@webteam",
+    message: "hello",
+  });
+  assert.equal(handleResponse.status, 400);
+  const handleBody = await handleResponse.text();
+  assert.match(handleBody, /No reachable agent named redacted-agent@webteam/);
+  assert.doesNotMatch(handleBody, /hub_agent_missing|hub_agent_/);
+
+  const namespaceResponse = await chatSendResponse(app, cookie, {
+    recipient: "missing@hub_hs_missing",
+    message: "hello",
+  });
+  assert.equal(namespaceResponse.status, 400);
+  const namespaceBody = await namespaceResponse.text();
+  assert.match(namespaceBody, /No reachable agent named missing@redacted-namespace/);
+  assert.doesNotMatch(namespaceBody, /hub_hs_missing|hub_hs_/);
+});
+
+test("web chat redacts token-like recipient in successful send output", async () => {
+  const store = new MemoryStore();
+  const app = createTestApp(store);
+  const handleReceiverUser = await registerUser(app, "handleowner", { namespace: "webteam" });
+  const handleReceiver = await callTool(app, handleReceiverUser.session_token, "register_agent", {
+    handle: "hub_agent_secret",
+    display_name: "Token-like handle receiver",
+    description: "Receives web notices",
+    capabilities: ["inbox"],
+    discoverable: "public",
+    inbox: "namespace",
+  });
+  const senderLogin = await chatLoginResponse(app, {
+    mode: "register",
+    username: "websender",
+    namespace: "webteam",
+    password: "websender-password-123",
+  });
+  const senderCookie = senderLogin.headers.get("set-cookie");
+
+  const handleResponse = await chatSendResponse(app, senderCookie, {
+    recipient: "hub_agent_secret@webteam",
+    message: "hello token-like handle",
+  });
+  assert.equal(handleResponse.status, 200);
+  const handleBody = await handleResponse.text();
+  assert.match(handleBody, /Message delivered to redacted-agent@webteam|Message queued to redacted-agent@webteam/);
+  assert.doesNotMatch(handleBody, /hub_agent_secret|hub_agent_|receiver_agent_id|sender_agent_id/);
+  const handleNotifications = await store.listNotifications(handleReceiver.agent.agent_id, 10, null);
+  assert.equal(handleNotifications.length, 1);
+  assert.equal(handleNotifications[0].summary, "hello token-like handle");
+
+  const namespaceReceiverUser = await registerUser(app, "namespaceowner", { namespace: "hub_hs_secret" });
+  const namespaceReceiver = await callTool(app, namespaceReceiverUser.session_token, "register_agent", {
+    handle: "namespaceowner",
+    display_name: "Token-like namespace receiver",
+    description: "Receives web notices",
+    capabilities: ["inbox"],
+    discoverable: "public",
+    inbox: "namespace",
+  });
+  const namespaceSenderLogin = await chatLoginResponse(app, {
+    mode: "register",
+    username: "namespacesender",
+    namespace: "hub_hs_secret",
+    password: "namespacesender-password-123",
+  });
+  const namespaceSenderCookie = namespaceSenderLogin.headers.get("set-cookie");
+
+  const namespaceResponse = await chatSendResponse(app, namespaceSenderCookie, {
+    recipient: "namespaceowner@hub_hs_secret",
+    message: "hello token-like namespace",
+  });
+  assert.equal(namespaceResponse.status, 200);
+  const namespaceBody = await namespaceResponse.text();
+  assert.match(namespaceBody, /Message delivered to namespaceowner@redacted-namespace|Message queued to namespaceowner@redacted-namespace/);
+  assert.doesNotMatch(namespaceBody, /hub_hs_secret|hub_hs_|receiver_agent_id|sender_agent_id/);
+  const namespaceNotifications = await store.listNotifications(namespaceReceiver.agent.agent_id, 10, null);
+  assert.equal(namespaceNotifications.length, 1);
+  assert.equal(namespaceNotifications[0].summary, "hello token-like namespace");
+});
+
 async function registerUser(app, username, { namespace, password } = {}) {
   const response = await app.fetch(
     new Request(`${BASE}/auth/register`, {
@@ -618,6 +886,28 @@ async function registerUser(app, username, { namespace, password } = {}) {
   );
   assert.equal(response.status, 200);
   return response.json();
+}
+
+async function chatLoginResponse(app, { mode, username, namespace, password }, { origin = BASE } = {}) {
+  const form = new URLSearchParams({ mode, username, namespace, password });
+  return app.fetch(
+    new Request(`${BASE}/chat/login`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", origin },
+      body: form.toString(),
+    }),
+  );
+}
+
+async function chatSendResponse(app, cookie, { recipient, message }, { origin = BASE } = {}) {
+  const form = new URLSearchParams({ recipient, message });
+  return app.fetch(
+    new Request(`${BASE}/chat/send`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", cookie, origin },
+      body: form.toString(),
+    }),
+  );
 }
 
 async function authStart(app, { verifier, state, loopback }) {

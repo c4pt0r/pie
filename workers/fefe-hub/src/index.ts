@@ -20,6 +20,8 @@ const SUMMARY_LIMIT_CHARS = 240;
 const LIST_DEFAULT_LIMIT = 50;
 const LIST_MAX_LIMIT = 100;
 const AUTH_EXCHANGE_TTL_SECONDS = 5 * 60;
+const WEB_SESSION_COOKIE = "hub_session";
+const WEB_SESSION_MAX_AGE_SECONDS = 30 * 24 * 60 * 60;
 
 type Discoverable = "public" | "namespace" | "none";
 type Inbox = "open" | "namespace" | "invited" | "closed";
@@ -920,6 +922,15 @@ export class HubApp {
       if (url.pathname === "/login" && request.method === "POST") {
         return await this.completeBrowserLoginForm(await readFormObject(request));
       }
+      if (url.pathname === "/chat" && request.method === "GET") {
+        return await this.chatPage(request);
+      }
+      if (url.pathname === "/chat/login" && request.method === "POST") {
+        return await this.completeChatLoginForm(request, await readFormObject(request));
+      }
+      if (url.pathname === "/chat/send" && request.method === "POST") {
+        return await this.completeChatSendForm(request, await readFormObject(request));
+      }
       if (url.pathname === "/mcp" && request.method === "GET") {
         const principal = await this.authenticate(request, "agent");
         return this.mailbox.connect(principal.agent_id);
@@ -1103,6 +1114,24 @@ export class HubApp {
     throw accepts === "agent" ? ERR.authRequired() : ERR.authInvalid();
   }
 
+  private async authenticateWebHuman(request: Request): Promise<Extract<Principal, { kind: "human" }> | null> {
+    const token = cookieValue(request, WEB_SESSION_COOKIE);
+    if (!token?.startsWith("hub_hs_")) {
+      return null;
+    }
+    const session = await this.store.getHumanSessionByHash(await sha256Hex(token));
+    const now = nowIso();
+    if (!session || session.revoked_at || session.expires_at <= now) {
+      return null;
+    }
+    return {
+      kind: "human",
+      user_id: session.user_id,
+      namespace: session.namespace,
+      session_id: session.session_id,
+    };
+  }
+
   private async startAuth(args: Record<string, unknown>, origin: string): Promise<unknown> {
     ensureOnly(args, ["client_kind", "client_version", "loopback_redirect_uri", "code_challenge", "code_challenge_method", "state"]);
     const clientKind = stringField(args, "client_kind");
@@ -1173,6 +1202,11 @@ export class HubApp {
     --error-fg: #9b1c1c;
   }
   * { box-sizing: border-box; }
+  html, body {
+    width: 100%;
+    max-width: 100%;
+    overflow-x: hidden;
+  }
   body {
     margin: 0;
     min-height: 100vh;
@@ -1387,6 +1421,184 @@ export class HubApp {
         "referrer-policy": "no-referrer",
       },
     });
+  }
+
+  private async chatPage(request: Request): Promise<Response> {
+    const principal = await this.authenticateWebHuman(request);
+    if (!principal) {
+      return this.chatLoginForm();
+    }
+    const user = await this.store.getUser(principal.user_id);
+    if (!user) {
+      return this.chatLoginForm("Session expired. Sign in again.", 401);
+    }
+    return this.chatComposePage(user);
+  }
+
+  private chatLoginForm(errorMessage?: string, status = 200): Response {
+    const error = errorMessage ? `<div class="notice error" role="alert">${escapeHtml(errorMessage)}</div>` : "";
+    return html(
+      `<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pie hub chat</title>
+${chatStyle()}
+<main>
+  <header>
+    <h1>Pie hub chat</h1>
+    <p>Sign in or create an account to send a short text message to a connected pie agent.</p>
+  </header>
+  ${error}
+  <section class="forms" aria-label="Hub account actions">
+    <form method="post" action="/chat/login" autocomplete="on">
+      <input type="hidden" name="mode" value="login">
+      <div class="form-copy">
+        <h2>Sign in</h2>
+        <p>Use an existing hub account.</p>
+      </div>
+      <label>Username
+        <input name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+      </label>
+      <label>Namespace
+        <input name="namespace" autocomplete="organization" autocapitalize="none" spellcheck="false" placeholder="team-name or your-handle">
+        <span class="hint">Use the namespace from your pie identity: name@namespace.</span>
+      </label>
+      <label>Password
+        <input name="password" type="password" autocomplete="current-password" required>
+      </label>
+      <button type="submit">Sign in</button>
+    </form>
+    <form method="post" action="/chat/login" autocomplete="on">
+      <input type="hidden" name="mode" value="register">
+      <div class="form-copy">
+        <h2>Create account</h2>
+        <p>Your pie identity is shown as name@namespace.</p>
+      </div>
+      <label>Username
+        <input name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+        <span class="hint">2-32 lowercase letters, numbers, underscores, or hyphens.</span>
+      </label>
+      <label>Namespace
+        <input name="namespace" autocomplete="organization" autocapitalize="none" spellcheck="false" placeholder="team-name or your-handle">
+        <span class="hint">Optional; defaults to username. Members in one namespace can send hub messages directly.</span>
+      </label>
+      <label>Password
+        <input name="password" type="password" autocomplete="new-password" minlength="12" required>
+        <span class="hint">At least 12 characters.</span>
+      </label>
+      <button type="submit">Create account</button>
+    </form>
+  </section>
+</main>
+</html>`,
+      status,
+    );
+  }
+
+  private async completeChatLoginForm(request: Request, args: Record<string, unknown>): Promise<Response> {
+    try {
+      enforceSameOrigin(request);
+      ensureOnly(args, ["mode", "username", "password", "namespace"]);
+      const mode = optionalString(args.mode, "mode") ?? "login";
+      const username = normalizeName(stringField(args, "username"), "username");
+      const password = stringField(args, "password");
+      let user: UserRecord;
+      if (mode === "register") {
+        user = await this.createUserFromCredentials(username, password, optionalString(args.namespace, "namespace"));
+      } else if (mode === "login") {
+        user = await this.requireUserPassword(username, password, optionalString(args.namespace, "namespace"));
+      } else {
+        throw ERR.schemaInvalid(["mode must be login or register"]);
+      }
+      const sessionToken = await this.issueHumanSession(user);
+      return new Response(null, {
+        status: 303,
+        headers: {
+          location: "/chat",
+          "set-cookie": webSessionCookie(sessionToken),
+          "cache-control": "no-store",
+          "referrer-policy": "no-referrer",
+        },
+      });
+    } catch (error) {
+      const publicError = coercePublicError(error);
+      return this.chatLoginForm(chatErrorMessage(publicError, args), publicError.code === -32009 || publicError.code === -32010 ? 401 : 400);
+    }
+  }
+
+  private chatComposePage(
+    user: UserRecord,
+    result?: { tone: "success" | "error"; message: string },
+    status = 200,
+  ): Response {
+    const signedInIdentity = safeDisplayMention({ handle: user.username, namespace: user.namespace });
+    const notice = result
+      ? `<div class="notice ${result.tone === "error" ? "error" : "success"}" role="status">${escapeHtml(result.message)}</div>`
+      : "";
+    return html(
+      `<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pie hub chat</title>
+${chatStyle()}
+<main>
+  <header>
+    <h1>Pie hub chat</h1>
+    <p>Signed in as <strong>${escapeHtml(signedInIdentity)}</strong>. Send a short text message to a connected TUI agent.</p>
+  </header>
+  ${notice}
+  <form method="post" action="/chat/send" autocomplete="off">
+    <label>Recipient
+      <input name="recipient" autocapitalize="none" spellcheck="false" placeholder="name@namespace" required>
+      <span class="hint">Use the agent's hub identity. Same-namespace recipients receive directly; cross-namespace recipients may see a first-contact prompt.</span>
+    </label>
+    <label>Message
+      <textarea name="message" maxlength="${SUMMARY_LIMIT_CHARS}" required></textarea>
+      <span class="hint">Plain text only, ${SUMMARY_LIMIT_CHARS} characters max. Attachments and local payloads are not sent from web chat.</span>
+    </label>
+    <button type="submit">Send message</button>
+  </form>
+</main>
+</html>`,
+      status,
+    );
+  }
+
+  private async completeChatSendForm(request: Request, args: Record<string, unknown>): Promise<Response> {
+    const principal = await this.authenticateWebHuman(request);
+    if (!principal) {
+      return this.chatLoginForm("Sign in before sending a hub message.", 401);
+    }
+    const user = await this.store.getUser(principal.user_id);
+    if (!user) {
+      return this.chatLoginForm("Session expired. Sign in again.", 401);
+    }
+    try {
+      enforceSameOrigin(request);
+      ensureOnly(args, ["recipient", "message"]);
+      const recipient = parseDisplayAgentHandle(stringField(args, "recipient"), "recipient");
+      const recipientDisplay = safeDisplayMention(recipient);
+      const summary = validateSummary(stringField(args, "message"));
+      const receiver = await this.store.getAgentByHandle(recipient.namespace, recipient.handle);
+      if (!receiver || receiver.deleted_at) {
+        throw ERR.notFound(`No reachable agent named ${recipientDisplay}. Check spelling or ask them to join hub.`);
+      }
+      const sender = await this.ensureDefaultAgent(user);
+      const receipt = await this.sendNotificationAsAgent(sender, {
+        target_agent_id: receiver.agent_id,
+        summary,
+        payload_visibility: "Local",
+      });
+      const statusText = isObject(receipt) && typeof receipt.status === "string" ? receipt.status : "accepted";
+      return this.chatComposePage(user, {
+        tone: "success",
+        message: `Message ${statusText} to ${recipientDisplay}.`,
+      });
+    } catch (error) {
+      return this.chatComposePage(user, { tone: "error", message: chatErrorMessage(coercePublicError(error), args) }, 400);
+    }
   }
 
   private async exchangeAuthCode(args: Record<string, unknown>): Promise<unknown> {
@@ -1710,6 +1922,11 @@ export class HubApp {
   private async sendNotification(principal: Principal, args: Record<string, unknown>): Promise<unknown> {
     assertAgent(principal);
     requirePermission(principal, "notification:send");
+    const sender = await this.requireSelfAgent(principal);
+    return this.sendNotificationAsAgent(sender, args);
+  }
+
+  private async sendNotificationAsAgent(sender: AgentRecord, args: Record<string, unknown>): Promise<unknown> {
     ensureOnly(args, ["target_agent_id", "summary", "payload", "payload_visibility"]);
     const targetId = uuidField(args, "target_agent_id");
     const summary = validateSummary(stringField(args, "summary"));
@@ -1721,7 +1938,6 @@ export class HubApp {
     const payloadVisibility = payloadVisibilityValue(optionalString(args.payload_visibility, "payload_visibility") ?? "Local");
     const persistedPayloadJson = payloadVisibility === "Shared" ? payloadJson : null;
     const receiver = await this.store.getAgent(targetId);
-    const sender = await this.requireSelfAgent(principal);
     if (!receiver || receiver.deleted_at) {
       throw ERR.notFound();
     }
@@ -2078,6 +2294,32 @@ function browserLoginErrorMessage(error: PublicError, args: Record<string, unkno
   return truncate(error.message, 160);
 }
 
+function chatErrorMessage(error: PublicError, args: Record<string, unknown>): string {
+  if (error.name === "auth_invalid" && typeof args.password === "string") {
+    return "Invalid username or password.";
+  }
+  if (error.name === "permission_denied") {
+    if (error.message.startsWith("Web chat form submission")) {
+      return error.message;
+    }
+    return "Could not send message: the recipient is not accepting hub messages from this sender.";
+  }
+  if (error.name === "not_found") {
+    return truncate(error.message, 160);
+  }
+  const violations = error.data?.violations;
+  if (Array.isArray(violations)) {
+    const safeViolations = violations
+      .filter((violation): violation is string => typeof violation === "string")
+      .map((violation) => truncate(violation, 120))
+      .slice(0, 3);
+    if (safeViolations.length > 0) {
+      return safeViolations.join("; ");
+    }
+  }
+  return truncate(error.message, 160);
+}
+
 function httpError(error: unknown): Response {
   const publicError = coercePublicError(error);
   const status = publicError.code === -32009 || publicError.code === -32010 ? 401 : 400;
@@ -2291,6 +2533,36 @@ function parseAgentHandle(value: string): { handle: string; namespace: string } 
   return { handle: match[1], namespace: match[2] };
 }
 
+function parseDisplayAgentHandle(value: string, field: string): { handle: string; namespace: string } {
+  const match = /^@?([a-z0-9_-]{2,32})@([a-z0-9_-]{2,32})$/.exec(value.trim().toLowerCase());
+  if (!match) {
+    throw ERR.schemaInvalid([`${field} must be name@namespace`]);
+  }
+  return { handle: match[1], namespace: match[2] };
+}
+
+function safeDisplayMention(identity: { handle: string; namespace: string }): string {
+  return `${safeDisplayMentionPart(identity.handle, "redacted-agent")}@${safeDisplayMentionPart(identity.namespace, "redacted-namespace")}`;
+}
+
+function safeDisplayMentionPart(value: string, fallback: string): string {
+  return isSecretLikeDisplayPart(value) ? fallback : value;
+}
+
+function isSecretLikeDisplayPart(value: string): boolean {
+  const lower = value.toLowerCase();
+  return (
+    lower.startsWith("hub_agent") ||
+    lower.startsWith("hub_hs") ||
+    lower.startsWith("hub_code") ||
+    lower.startsWith("sk-") ||
+    lower.startsWith("gho_") ||
+    lower.startsWith("xoxb-") ||
+    lower === "authorization" ||
+    lower === "bearer"
+  );
+}
+
 function parseJsonArray(jsonText: string): string[] {
   const value = JSON.parse(jsonText) as unknown;
   if (!Array.isArray(value)) return [];
@@ -2445,6 +2717,205 @@ function safeJsonParse(value: string | null): unknown {
   } catch {
     return undefined;
   }
+}
+
+function cookieValue(request: Request, name: string): string | null {
+  const cookie = request.headers.get("cookie");
+  if (!cookie) return null;
+  for (const part of cookie.split(";")) {
+    const [rawKey, ...rawValue] = part.trim().split("=");
+    if (rawKey === name) {
+      return rawValue.join("=");
+    }
+  }
+  return null;
+}
+
+function webSessionCookie(token: string): string {
+  return `${WEB_SESSION_COOKIE}=${token}; HttpOnly; Secure; SameSite=Lax; Path=/chat; Max-Age=${WEB_SESSION_MAX_AGE_SECONDS}`;
+}
+
+function enforceSameOrigin(request: Request): void {
+  const origin = request.headers.get("origin");
+  if (!origin || origin !== new URL(request.url).origin) {
+    throw ERR.permissionDenied("Web chat form submission must come from this hub page.");
+  }
+}
+
+function html(body: string, status = 200): Response {
+  return new Response(body, {
+    status,
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "no-store",
+      "referrer-policy": "no-referrer",
+    },
+  });
+}
+
+function chatStyle(): string {
+  return `<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f6f7f9;
+    --fg: #15181d;
+    --muted: #5d6673;
+    --line: #d9dee7;
+    --panel: #ffffff;
+    --accent: #1868d8;
+    --accent-fg: #ffffff;
+    --error-bg: #fff1f1;
+    --error-fg: #9b1c1c;
+    --success-bg: #eef9f1;
+    --success-fg: #17692f;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    line-height: 1.45;
+  }
+  main {
+    width: min(880px, 100%);
+    max-width: 100%;
+    margin: 0 auto;
+    padding: 40px 20px;
+    overflow-x: hidden;
+  }
+  header {
+    width: 100%;
+    max-width: 680px;
+    margin-bottom: 24px;
+  }
+  h1 {
+    margin: 0 0 8px;
+    font-size: 28px;
+    line-height: 1.15;
+  }
+  h2 {
+    margin: 0 0 6px;
+    font-size: 18px;
+  }
+  p {
+    margin: 0;
+    color: var(--muted);
+  }
+  h1, h2, p, label, .hint, .notice {
+    overflow-wrap: anywhere;
+  }
+  .forms {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 16px;
+    min-width: 0;
+  }
+  form {
+    display: grid;
+    gap: 14px;
+    padding: 20px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--panel);
+    min-width: 0;
+  }
+  .form-copy {
+    min-height: 52px;
+  }
+  label {
+    display: grid;
+    gap: 6px;
+    font-size: 14px;
+    font-weight: 600;
+  }
+  input, textarea {
+    width: 100%;
+    min-width: 0;
+    min-height: 42px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 9px 11px;
+    background: transparent;
+    color: var(--fg);
+    font: inherit;
+  }
+  textarea {
+    min-height: 116px;
+    resize: vertical;
+  }
+  input:focus, textarea:focus {
+    outline: 2px solid color-mix(in srgb, var(--accent) 35%, transparent);
+    border-color: var(--accent);
+  }
+  .hint {
+    color: var(--muted);
+    font-size: 13px;
+    font-weight: 400;
+  }
+  button {
+    min-height: 42px;
+    border: 0;
+    border-radius: 6px;
+    padding: 10px 14px;
+    background: var(--accent);
+    color: var(--accent-fg);
+    font: inherit;
+    font-weight: 650;
+    cursor: pointer;
+  }
+  .notice {
+    margin-bottom: 16px;
+    padding: 12px 14px;
+    border-radius: 8px;
+    border: 1px solid var(--line);
+    background: var(--panel);
+  }
+  .error {
+    border-color: color-mix(in srgb, var(--error-fg) 35%, var(--line));
+    background: var(--error-bg);
+    color: var(--error-fg);
+  }
+  .success {
+    border-color: color-mix(in srgb, var(--success-fg) 35%, var(--line));
+    background: var(--success-bg);
+    color: var(--success-fg);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #101215;
+      --fg: #eff2f5;
+      --muted: #a2aab5;
+      --line: #303844;
+      --panel: #181c22;
+      --accent: #6da2ff;
+      --accent-fg: #07111f;
+      --error-bg: #2b1719;
+      --error-fg: #ffb4b4;
+      --success-bg: #12251a;
+      --success-fg: #8de5a5;
+    }
+  }
+  @media (max-width: 900px) {
+    main {
+      width: min(100%, 390px);
+      max-width: min(100%, 390px);
+      margin: 0;
+      padding: 24px 14px;
+    }
+    .forms { grid-template-columns: 1fr; }
+    .form-copy { min-height: 0; }
+    form {
+      width: 100%;
+      max-width: 100%;
+      padding: 16px;
+    }
+    input, textarea, button {
+      max-width: 100%;
+    }
+  }
+</style>`;
 }
 
 function json(body: unknown, status = 200): Response {
