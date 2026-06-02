@@ -1863,8 +1863,16 @@ impl App {
                             Err(e) => eprintln!("error: compaction failed: {e}"),
                         }
                     }
-                    CommandOutcome::BackgroundTask { task, .. } => {
-                        task.await;
+                    CommandOutcome::BackgroundTask { label, task } => {
+                        let mut handle = tokio::spawn(task);
+                        if tokio::time::timeout(std::time::Duration::from_secs(3), &mut handle)
+                            .await
+                            .is_err()
+                        {
+                            eprintln!(
+                                "{label} is still waiting in the background; keep pie running in an interactive terminal, or retry after completing the printed recovery steps"
+                            );
+                        }
                     }
                     _ => {}
                 }
