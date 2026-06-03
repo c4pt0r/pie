@@ -47,6 +47,7 @@ enum WebCommand {
 struct WebSnapshot {
     session_id: String,
     model: String,
+    cwd: String,
     busy: bool,
     queued_count: usize,
     latest_trigger_poll: Option<super::feed::TriggerPollStatus>,
@@ -396,6 +397,7 @@ impl App {
         WebSnapshot {
             session_id: self.session_id.clone(),
             model,
+            cwd: self.cwd.display().to_string(),
             busy: self.busy,
             queued_count: self.queued_turns.len(),
             latest_trigger_poll: self.latest_trigger_poll.clone(),
@@ -727,6 +729,19 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     .brand { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
     .brand strong { font-size: 15px; font-weight: 650; letter-spacing: 0; }
+    .cwd-chip {
+      min-width: 0;
+      max-width: min(320px, 34vw);
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 1px 8px;
+      color: var(--muted);
+      background: var(--field);
+      font-size: 12px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
     .meta {
       min-width: 0;
       color: var(--muted);
@@ -1178,6 +1193,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     <header>
       <div class="brand">
         <strong>pie web</strong>
+        <span id="cwd" class="cwd-chip"></span>
         <span id="model" class="meta"></span>
       </div>
       <div class="header-actions">
@@ -1249,6 +1265,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
 <script>
 const feed = document.getElementById('feed');
 const model = document.getElementById('model');
+const cwd = document.getElementById('cwd');
 const status = document.getElementById('status');
 const statusText = document.getElementById('statusText');
 const poll = document.getElementById('poll');
@@ -1788,6 +1805,9 @@ function renderFeedBlocks(blocks) {
 
 function render(snapshot) {
   model.textContent = snapshot.model;
+  const cwdText = String(snapshot.cwd || '');
+  cwd.textContent = cwdText.split(/[\\/]/).filter(Boolean).pop() || cwdText || '.';
+  cwd.title = cwdText;
   session.textContent = snapshot.session_id;
   const stateText = snapshot.busy
     ? ('working' + (snapshot.queued_count ? ' / ' + snapshot.queued_count + ' queued' : ''))
@@ -1957,6 +1977,7 @@ mod tests {
         let latest = Arc::new(Mutex::new(WebSnapshot {
             session_id: "sess-1".into(),
             model: "provider:model".into(),
+            cwd: "/tmp/pie".into(),
             busy: false,
             queued_count: 0,
             latest_trigger_poll: None,
@@ -1991,6 +2012,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(state["session_id"], "sess-1");
+        assert_eq!(state["cwd"], "/tmp/pie");
         assert_eq!(state["feed_lines"][0], "ready");
 
         let accepted: serde_json::Value = client
@@ -2060,6 +2082,7 @@ mod tests {
             .send(WebSnapshot {
                 session_id: "sess-1".into(),
                 model: "provider:model".into(),
+                cwd: "/tmp/pie".into(),
                 busy: true,
                 queued_count: 1,
                 latest_trigger_poll: None,
