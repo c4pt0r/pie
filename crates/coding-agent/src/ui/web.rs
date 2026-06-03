@@ -200,7 +200,11 @@ impl App {
 
         let server = axum::serve(listener, router.into_make_service());
         let mut server_task = tokio::spawn(async move { server.await });
-        println!("pie web listening on http://{actual}");
+        let url = format!("http://{actual}");
+        println!("pie web listening on {url}");
+        if let Err(e) = open_web_browser(&url) {
+            eprintln!("web browser auto-open skipped: {e}");
+        }
 
         let mut feed_rx = self.feed_rx.take().expect("feed_rx taken once");
         let mut main_run_rx = self.main_run_rx.take().expect("main_run_rx taken once");
@@ -638,6 +642,40 @@ fn bind_addr(options: &WebOptions) -> Result<SocketAddr> {
         bail!("refusing non-loopback web bind {ip}; Web UI is loopback-only");
     }
     Ok(SocketAddr::new(ip, options.port))
+}
+
+fn open_web_browser(url: &str) -> Result<()> {
+    if !crate::hub_join::browser_auto_open_available() {
+        bail!("browser auto-open unavailable in this session");
+    }
+    let mut command = open_browser_command(url);
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    command.spawn().context("spawn system browser")?;
+    Ok(())
+}
+
+fn open_browser_command(url: &str) -> std::process::Command {
+    #[cfg(target_os = "macos")]
+    {
+        let mut cmd = std::process::Command::new("open");
+        cmd.arg(url);
+        cmd
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/C", "start", "", url]);
+        cmd
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let mut cmd = std::process::Command::new("xdg-open");
+        cmd.arg(url);
+        cmd
+    }
 }
 
 const INDEX_HTML: &str = r#"<!doctype html>
