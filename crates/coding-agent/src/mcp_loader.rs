@@ -173,14 +173,21 @@ pub async fn connect_built_in_hub_notification_hook() -> Result<Arc<McpNotificat
 }
 
 fn add_built_in_hub_if_ready(configs: &mut Vec<ServerConfig>) {
+    let store = AuthStore::load().ok();
+    add_built_in_hub_if_ready_from_store(configs, store.as_ref());
+}
+
+fn add_built_in_hub_if_ready_from_store(
+    configs: &mut Vec<ServerConfig>,
+    store: Option<&AuthStore>,
+) {
     if configs
         .iter()
         .any(|server| server.name == BUILT_IN_HUB_SERVER_NAME)
     {
         return;
     }
-    if AuthStore::load()
-        .ok()
+    if store
         .and_then(|store| store.resolve_for_provider(BUILT_IN_HUB_TOKEN_REF))
         .is_some()
     {
@@ -421,6 +428,19 @@ fn is_official_hub_endpoint(endpoint: &str) -> bool {
 }
 
 fn resolve_http_auth(auth: Option<&HttpAuthConfig>) -> Result<HttpMcpAuth> {
+    let Some(auth_cfg) = auth else {
+        return Ok(HttpMcpAuth::None);
+    };
+    let recovery = http_auth_recovery(auth_cfg);
+    let store = AuthStore::load()
+        .map_err(|e| anyhow::anyhow!("failed to load local credential store: {e}; {recovery}"))?;
+    resolve_http_auth_from_store(Some(auth_cfg), &store)
+}
+
+fn resolve_http_auth_from_store(
+    auth: Option<&HttpAuthConfig>,
+    store: &AuthStore,
+) -> Result<HttpMcpAuth> {
     let Some(auth) = auth else {
         return Ok(HttpMcpAuth::None);
     };
@@ -431,17 +451,19 @@ fn resolve_http_auth(auth: Option<&HttpAuthConfig>) -> Result<HttpMcpAuth> {
         .token_keychain_ref
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("bearer auth requires token_keychain_ref"))?;
-    let recovery = if token_ref == BUILT_IN_HUB_TOKEN_REF {
-        "run /hub join"
-    } else {
-        "run /login <configured-token-ref>"
-    };
-    let store = AuthStore::load()
-        .map_err(|e| anyhow::anyhow!("failed to load local credential store: {e}; {recovery}"))?;
+    let recovery = http_auth_recovery(auth);
     let token = store
         .resolve_for_provider(token_ref)
         .ok_or_else(|| anyhow::anyhow!("configured bearer credential was not found; {recovery}"))?;
     Ok(HttpMcpAuth::Bearer { token })
+}
+
+fn http_auth_recovery(auth: &HttpAuthConfig) -> &'static str {
+    if auth.token_keychain_ref.as_deref() == Some(BUILT_IN_HUB_TOKEN_REF) {
+        "run /hub join"
+    } else {
+        "run /login <configured-token-ref>"
+    }
 }
 
 #[cfg(test)]
@@ -552,29 +574,22 @@ body_cap_bytes = 1048576
 
     #[test]
     fn built_in_hub_added_only_after_credential_exists() {
-        let _guard = crate::auth::ENV_LOCK.lock().unwrap();
-        let dir = tempfile::TempDir::new().unwrap();
-        let original = std::env::var_os("PIE_DIR");
-        unsafe { std::env::set_var("PIE_DIR", dir.path()) };
-        crate::auth::AuthStore::default().save().unwrap();
-
         let mut configs = Vec::new();
-        add_built_in_hub_if_ready(&mut configs);
+        let mut store = crate::auth::AuthStore::default();
+        add_built_in_hub_if_ready_from_store(&mut configs, Some(&store));
         assert!(
             configs.is_empty(),
             "clean installs should not emit a missing-token startup diagnostic"
         );
 
-        let mut store = crate::auth::AuthStore::default();
         store.set(
             BUILT_IN_HUB_TOKEN_REF,
             crate::auth::ProviderCredential::ApiKey {
                 value: "hub_agent_test_token_should_not_leak".into(),
             },
         );
-        store.save().unwrap();
 
-        add_built_in_hub_if_ready(&mut configs);
+        add_built_in_hub_if_ready_from_store(&mut configs, Some(&store));
         assert_eq!(configs.len(), 1);
         let server = &configs[0];
         assert_eq!(server.name, BUILT_IN_HUB_SERVER_NAME);
@@ -587,19 +602,10 @@ body_cap_bytes = 1048576
                 .and_then(|auth| auth.token_keychain_ref.as_deref()),
             Some(BUILT_IN_HUB_TOKEN_REF)
         );
-
-        match original {
-            Some(value) => unsafe { std::env::set_var("PIE_DIR", value) },
-            None => unsafe { std::env::remove_var("PIE_DIR") },
-        }
     }
 
     #[test]
     fn official_hub_config_prevents_built_in_duplicate() {
-        let _guard = crate::auth::ENV_LOCK.lock().unwrap();
-        let dir = tempfile::TempDir::new().unwrap();
-        let original = std::env::var_os("PIE_DIR");
-        unsafe { std::env::set_var("PIE_DIR", dir.path()) };
         let mut store = crate::auth::AuthStore::default();
         store.set(
             BUILT_IN_HUB_TOKEN_REF,
@@ -607,7 +613,6 @@ body_cap_bytes = 1048576
                 value: "hub_agent_test_token_should_not_leak".into(),
             },
         );
-        store.save().unwrap();
 
         let mut configs = vec![ServerConfig {
             name: BUILT_IN_HUB_SERVER_NAME.into(),
@@ -626,14 +631,9 @@ body_cap_bytes = 1048576
             inject_summary: false,
             inject_and_run: false,
         }];
-        add_built_in_hub_if_ready(&mut configs);
+        add_built_in_hub_if_ready_from_store(&mut configs, Some(&store));
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].endpoint.as_deref(), Some(BUILT_IN_HUB_ENDPOINT));
-
-        match original {
-            Some(value) => unsafe { std::env::set_var("PIE_DIR", value) },
-            None => unsafe { std::env::remove_var("PIE_DIR") },
-        }
     }
 
     #[tokio::test]
@@ -732,10 +732,6 @@ body_cap_bytes = 1048576
 
     #[test]
     fn streamable_http_auth_resolves_from_auth_store_without_debug_leak() {
-        let _guard = crate::auth::ENV_LOCK.lock().unwrap();
-        let dir = tempfile::TempDir::new().unwrap();
-        let original = std::env::var_os("PIE_DIR");
-        unsafe { std::env::set_var("PIE_DIR", dir.path()) };
         let token = "hub_agent_should_not_leak";
         let mut store = crate::auth::AuthStore::default();
         store.set(
@@ -744,44 +740,35 @@ body_cap_bytes = 1048576
                 value: token.into(),
             },
         );
-        store.save().unwrap();
 
-        let auth = resolve_http_auth(Some(&HttpAuthConfig {
-            kind: "bearer".into(),
-            token_keychain_ref: Some("pie-hub:default".into()),
-        }))
+        let auth = resolve_http_auth_from_store(
+            Some(&HttpAuthConfig {
+                kind: "bearer".into(),
+                token_keychain_ref: Some("pie-hub:default".into()),
+            }),
+            &store,
+        )
         .unwrap();
         let debug = format!("{auth:?}");
         assert!(!debug.contains(token), "{debug}");
         assert!(debug.contains("<redacted>"), "{debug}");
-
-        match original {
-            Some(value) => unsafe { std::env::set_var("PIE_DIR", value) },
-            None => unsafe { std::env::remove_var("PIE_DIR") },
-        }
     }
 
     #[test]
     fn streamable_http_missing_auth_diagnostic_does_not_echo_token_ref() {
-        let _guard = crate::auth::ENV_LOCK.lock().unwrap();
-        let dir = tempfile::TempDir::new().unwrap();
-        let original = std::env::var_os("PIE_DIR");
-        unsafe { std::env::set_var("PIE_DIR", dir.path()) };
-        crate::auth::AuthStore::default().save().unwrap();
+        let store = crate::auth::AuthStore::default();
 
         let secret_like_ref = "hub_agent_should_not_leak";
-        let err = resolve_http_auth(Some(&HttpAuthConfig {
-            kind: "bearer".into(),
-            token_keychain_ref: Some(secret_like_ref.into()),
-        }))
+        let err = resolve_http_auth_from_store(
+            Some(&HttpAuthConfig {
+                kind: "bearer".into(),
+                token_keychain_ref: Some(secret_like_ref.into()),
+            }),
+            &store,
+        )
         .unwrap_err()
         .to_string();
         assert!(!err.contains(secret_like_ref), "{err}");
         assert!(err.contains("<configured-token-ref>"), "{err}");
-
-        match original {
-            Some(value) => unsafe { std::env::set_var("PIE_DIR", value) },
-            None => unsafe { std::env::remove_var("PIE_DIR") },
-        }
     }
 }

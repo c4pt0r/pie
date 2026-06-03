@@ -2375,11 +2375,8 @@ mod tests {
             "feed user line missing:\n{text}"
         );
         let user_row = text.lines().find(|line| line.contains("you ▸ hello world"));
-        assert_eq!(
-            user_row.and_then(|line| line.chars().nth(2)),
-            Some(':'),
-            "feed user line should include a short timestamp prefix:\n{text}"
-        );
+        let user_row = user_row.expect("feed user row");
+        assert_full_timestamp_prefix(user_row, &text);
         assert!(
             text.contains("ai ▸ hi there, the box is pinned"),
             "assistant line missing:\n{text}"
@@ -3459,7 +3456,14 @@ mod tests {
             .find(|line| line.contains("ai ▸ historical answer"))
             .expect("assistant row");
 
-        assert_eq!(user_row.chars().nth(2), Some(':'), "{rendered}");
-        assert_eq!(assistant_row.chars().nth(2), Some(':'), "{rendered}");
+        assert_full_timestamp_prefix(user_row, &rendered);
+        assert_full_timestamp_prefix(assistant_row, &rendered);
+    }
+
+    fn assert_full_timestamp_prefix(row: &str, rendered: &str) {
+        assert_eq!(row.chars().nth(4), Some('-'), "{rendered}");
+        assert_eq!(row.chars().nth(7), Some('-'), "{rendered}");
+        assert_eq!(row.chars().nth(10), Some(' '), "{rendered}");
+        assert_eq!(row.chars().nth(13), Some(':'), "{rendered}");
     }
 }
