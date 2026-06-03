@@ -751,6 +751,15 @@ const INDEX_HTML: &str = r#"<!doctype html>
       background: var(--panel);
       overflow: hidden;
     }
+    .app[data-sidebar="hidden"] {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .app[data-sidebar="hidden"] aside {
+      display: none;
+    }
+    .app[data-sidebar="hidden"] .workspace {
+      border-right: 0;
+    }
     .workspace {
       min-width: 0;
       min-height: 0;
@@ -999,6 +1008,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
       background: var(--field);
       color: var(--ink);
     }
+    .sidebar-toggle {
+      min-width: 86px;
+      border-color: var(--line-strong);
+      background: var(--field);
+      color: var(--ink);
+    }
     button:hover { filter: contrast(0.92); }
     .form-hint {
       margin-top: 8px;
@@ -1219,6 +1234,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     @media (max-width: 860px) {
       .app { grid-template-columns: 1fr; grid-template-rows: minmax(0, 1fr) minmax(260px, 38vh); }
+      .app[data-sidebar="hidden"] { grid-template-rows: minmax(0, 1fr); }
       .workspace { border-right: 0; }
       aside { border-top: 1px solid var(--line); }
       form { grid-template-columns: 1fr; }
@@ -1228,7 +1244,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
   </style>
 </head>
 <body>
-<main class="app">
+<main id="app" class="app">
   <section class="workspace">
     <header>
       <div class="brand">
@@ -1238,6 +1254,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       </div>
       <div class="header-actions">
         <span id="status" class="run-state"><span class="dot"></span><span id="statusText">ready</span></span>
+        <button type="button" class="sidebar-toggle" id="sidebarToggle">Hide sidebar</button>
         <button type="button" class="theme-toggle" id="themeToggle">Dark</button>
       </div>
     </header>
@@ -1304,6 +1321,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
 </section>
 <script>
 const feed = document.getElementById('feed');
+const app = document.getElementById('app');
 const model = document.getElementById('model');
 const cwd = document.getElementById('cwd');
 const status = document.getElementById('status');
@@ -1313,6 +1331,7 @@ const input = document.getElementById('input');
 const form = document.getElementById('form');
 const abortButton = document.getElementById('abort');
 const themeToggle = document.getElementById('themeToggle');
+const sidebarToggle = document.getElementById('sidebarToggle');
 const sidebar = document.getElementById('sidebar');
 const session = document.getElementById('session');
 const completionPopup = document.getElementById('completionPopup');
@@ -1329,6 +1348,7 @@ const approvalPayload = document.getElementById('approvalPayload');
 const approveApproval = document.getElementById('approveApproval');
 const denyApproval = document.getElementById('denyApproval');
 const THEME_KEY = 'pie-web-theme';
+const SIDEBAR_KEY = 'pie-web-sidebar';
 let completionItems = [];
 let completionIndex = 0;
 let completionRequestSeq = 0;
@@ -1346,6 +1366,30 @@ function applyTheme(theme) {
 applyTheme(currentTheme());
 themeToggle.addEventListener('click', () => {
   applyTheme(currentTheme() === 'dark' ? 'light' : 'dark');
+});
+
+function currentSidebarHidden() {
+  return app.dataset.sidebar === 'hidden';
+}
+
+function applySidebarHidden(hidden) {
+  if (hidden) {
+    app.dataset.sidebar = 'hidden';
+    sidebarToggle.textContent = 'Show sidebar';
+    sidebarToggle.setAttribute('aria-pressed', 'true');
+  } else {
+    delete app.dataset.sidebar;
+    sidebarToggle.textContent = 'Hide sidebar';
+    sidebarToggle.setAttribute('aria-pressed', 'false');
+  }
+  try { localStorage.setItem(SIDEBAR_KEY, hidden ? 'hidden' : 'visible'); } catch (_) {}
+}
+
+let savedSidebar = 'visible';
+try { savedSidebar = localStorage.getItem(SIDEBAR_KEY) || 'visible'; } catch (_) {}
+applySidebarHidden(savedSidebar === 'hidden');
+sidebarToggle.addEventListener('click', () => {
+  applySidebarHidden(!currentSidebarHidden());
 });
 
 function node(tag, attrs = {}, children = []) {
