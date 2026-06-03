@@ -42,6 +42,20 @@ pub struct HubAuthExchangeCodeRequest {
     pub code_verifier: String,
 }
 
+/// Manual paste-code completion for the `/auth/exchange_manual_code` Worker route.
+///
+/// Used when the loopback callback cannot reach the running pie (SSH / remote TTY):
+/// the human signs in on their own browser, the hub shows a short one-time code, and
+/// the user pastes it back into pie.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HubAuthExchangeManualCodeRequest {
+    pub exchange_request_id: String,
+    pub manual_code: String,
+    pub state: String,
+    pub code_verifier: String,
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HubAuthExchangeCodeResponse {
@@ -86,10 +100,11 @@ pub enum HubInbox {
     Closed,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct HubAuthSecretFragments<'a> {
     pub hub_token: Option<&'a str>,
     pub code: Option<&'a str>,
+    pub manual_code: Option<&'a str>,
     pub state: Option<&'a str>,
     pub code_verifier: Option<&'a str>,
     pub loopback_redirect_uri: Option<&'a str>,
@@ -101,6 +116,7 @@ impl<'a> HubAuthSecretFragments<'a> {
         [
             self.hub_token,
             self.code,
+            self.manual_code,
             self.state,
             self.code_verifier,
             self.loopback_redirect_uri,

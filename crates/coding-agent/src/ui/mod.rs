@@ -1012,10 +1012,41 @@ impl App {
                 self.system_line(format!("{label} started in the background"));
                 tokio::spawn(task);
             }
+            CommandOutcome::HubJoinManual { login_url, pending } => {
+                self.hub_join_manual(login_url, pending, terminal).await;
+            }
             CommandOutcome::Handled => {}
         }
         if input.trim_start().starts_with("/goal") {
             self.refresh_goal_state().await;
+        }
+    }
+
+    /// SSH / remote hub join: drop out of the TUI to show the login link, read the pasted
+    /// one-time code in a cooked terminal, then complete the exchange. The agent loop is
+    /// never driven by this flow.
+    async fn hub_join_manual(
+        &mut self,
+        login_url: String,
+        pending: Box<crate::hub_join::PendingHubJoin>,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    ) {
+        leave_tui().ok();
+        let result = crate::prompt_for_hub_code(&login_url).await;
+        let _ = enter_tui();
+        let _ = terminal.clear();
+        match result {
+            Ok(code) if code.is_empty() => {
+                self.error_line("no code entered; hub join cancelled");
+            }
+            Ok(code) => {
+                if let Err(e) =
+                    commands::complete_hub_join_manual(self.kernel.harness(), pending, &code).await
+                {
+                    self.error_line(e.to_string());
+                }
+            }
+            Err(e) => self.error_line(e.to_string()),
         }
     }
 
@@ -1872,6 +1903,28 @@ impl App {
                             eprintln!(
                                 "{label} is still waiting in the background; keep pie running in an interactive terminal, or retry after completing the printed recovery steps"
                             );
+                        }
+                    }
+                    CommandOutcome::HubJoinManual { login_url, pending } => {
+                        println!(
+                            "SSH / remote session detected; finish hub login in a browser, then paste the one-time code:"
+                        );
+                        println!("  {login_url}");
+                        print!("paste hub code: ");
+                        std::io::Write::flush(&mut std::io::stdout()).ok();
+                        match lines.next_line().await {
+                            Ok(Some(code)) => {
+                                if let Err(e) = commands::complete_hub_join_manual(
+                                    self.kernel.harness(),
+                                    pending,
+                                    code.trim(),
+                                )
+                                .await
+                                {
+                                    eprintln!("error: {e}");
+                                }
+                            }
+                            _ => eprintln!("error: no code entered; run /hub join again"),
                         }
                     }
                     _ => {}

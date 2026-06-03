@@ -127,6 +127,7 @@ async fn hub_join_browser_loopback_stores_token_without_rendering_auth_secrets()
     let secrets = hub_auth::HubAuthSecretFragments {
         hub_token: Some("hub_agent_test_join_secret"),
         code: Some(&exchange.code),
+        manual_code: None,
         state: Some(&exchange.state),
         code_verifier: Some(&exchange.code_verifier),
         loopback_redirect_uri: Some(&start.loopback_redirect_uri),

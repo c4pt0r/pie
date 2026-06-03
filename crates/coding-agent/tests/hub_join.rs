@@ -66,6 +66,7 @@ fn ui_surfaces_can_assert_auth_secret_absence() {
     let secrets = HubAuthSecretFragments {
         hub_token: Some("hub_agent_secret_should_not_render"),
         code: Some("hub_code_secret_should_not_render"),
+        manual_code: None,
         state: Some("state_secret_should_not_render"),
         code_verifier: Some("pkce_verifier_should_not_render"),
         loopback_redirect_uri: Some("http://127.0.0.1:49152/callback"),

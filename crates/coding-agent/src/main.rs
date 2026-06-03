@@ -801,6 +801,35 @@ pub(crate) async fn prompt_for_api_key(provider: &str) -> Result<String> {
     .context("login prompt task")?
 }
 
+/// Print the SSH/remote hub login link and read the one-time paste code from a cooked
+/// terminal. The caller drops out of the full-screen TUI first so the link and prompt are
+/// visible. The code is one-time and tied to the exchange, so it is echoed for paste
+/// verification.
+pub(crate) async fn prompt_for_hub_code(login_url: &str) -> Result<String> {
+    let login_url = login_url.to_string();
+    tokio::task::spawn_blocking(move || {
+        if !std::io::stdin().is_terminal() {
+            anyhow::bail!(
+                "pasting a hub code needs an interactive terminal; run pie in a TTY, then /hub join"
+            );
+        }
+        println!("SSH / remote session detected; finishing hub login with a paste code.");
+        println!(
+            "Open this link in a browser on your local machine, sign in, then paste the one-time code:"
+        );
+        println!("  {login_url}");
+        print!("paste hub code: ");
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+        let mut line = String::new();
+        std::io::stdin()
+            .read_line(&mut line)
+            .context("read hub code")?;
+        Ok(line.trim().to_string())
+    })
+    .await
+    .context("hub code prompt task")?
+}
+
 pub(crate) fn login_requires_tty_message(provider: &str, recovery_command: Option<&str>) -> String {
     let command = recovery_command
         .map(ToString::to_string)

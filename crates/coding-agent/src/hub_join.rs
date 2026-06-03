@@ -13,8 +13,8 @@ use tokio::net::TcpListener;
 use crate::auth::{AuthStore, ProviderCredential};
 use crate::hub_auth::{
     HUB_AUTH_CLIENT_KIND, HUB_AUTH_CODE_CHALLENGE_METHOD, HUB_DEFAULT_AUTH_ORIGIN, HUB_TOKEN_REF,
-    HubAuthExchangeCodeRequest, HubAuthExchangeCodeResponse, HubAuthStartRequest,
-    HubAuthStartResponse,
+    HubAuthExchangeCodeRequest, HubAuthExchangeCodeResponse, HubAuthExchangeManualCodeRequest,
+    HubAuthStartRequest, HubAuthStartResponse,
 };
 
 const CALLBACK_PATH: &str = "/callback";
@@ -43,8 +43,6 @@ pub struct HubJoinOptions {
 #[derive(Clone, Debug)]
 pub struct ManualLogin {
     pub login_url: String,
-    pub reason: String,
-    pub callback_port: u16,
 }
 
 impl Default for HubJoinOptions {
@@ -69,7 +67,31 @@ pub(crate) async fn join_default_hub_for_test() -> Result<JoinedHub> {
     join_default_hub().await
 }
 
-pub(crate) async fn join_default_hub_with_options(options: HubJoinOptions) -> Result<JoinedHub> {
+/// State captured after `/auth/start`, ready to be completed by either the loopback
+/// callback (desktop) or a pasted one-time code (SSH / remote TTY).
+pub(crate) struct PendingHubJoin {
+    client: reqwest::Client,
+    auth_origin: String,
+    exchange_request_id: String,
+    state: String,
+    verifier: String,
+    /// Hub-issued login URL (loopback variant). Safe to print to the user.
+    pub login_url: String,
+    expires_in_seconds: u64,
+    /// Loopback listener; present so the desktop path can await the browser redirect.
+    listener: Option<TcpListener>,
+}
+
+impl PendingHubJoin {
+    /// The login URL annotated so the hub shows a one-time paste code instead of
+    /// redirecting to the (unreachable) loopback callback.
+    pub fn manual_login_url(&self) -> String {
+        manual_login_url(&self.login_url)
+    }
+}
+
+/// Bind the loopback listener, run `/auth/start`, and return the resumable join state.
+pub(crate) async fn start_hub_join(options: &HubJoinOptions) -> Result<PendingHubJoin> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .context("bind local callback listener")?;
@@ -83,14 +105,15 @@ pub(crate) async fn join_default_hub_with_options(options: HubJoinOptions) -> Re
         .build()
         .context("create hub auth client")?;
 
-    let start_url = format!("{}/auth/start", options.auth_origin.trim_end_matches('/'));
+    let auth_origin = options.auth_origin.trim_end_matches('/').to_string();
+    let start_url = format!("{auth_origin}/auth/start");
     let start = post_json::<HubAuthStartResponse>(
         &client,
         &start_url,
         &HubAuthStartRequest {
             client_kind: HUB_AUTH_CLIENT_KIND.into(),
             client_version: env!("CARGO_PKG_VERSION").into(),
-            loopback_redirect_uri: redirect_uri.clone(),
+            loopback_redirect_uri: redirect_uri,
             code_challenge: challenge,
             code_challenge_method: HUB_AUTH_CODE_CHALLENGE_METHOD.into(),
             state: state.clone(),
@@ -99,52 +122,93 @@ pub(crate) async fn join_default_hub_with_options(options: HubJoinOptions) -> Re
     )
     .await?;
 
-    let callback_port = listener.local_addr()?.port();
-    if options.show_manual_login {
-        notify_manual_login(
-            &options,
-            &start.login_url,
-            callback_port,
-            "copy this link to complete hub login".into(),
-        );
-    }
+    Ok(PendingHubJoin {
+        client,
+        auth_origin,
+        exchange_request_id: start.exchange_request_id,
+        state,
+        verifier,
+        login_url: start.login_url,
+        expires_in_seconds: start.expires_in_seconds,
+        listener: Some(listener),
+    })
+}
 
-    if !options.show_manual_login {
-        if let Err(e) = open_browser(&start.login_url).await {
-            if options.manual_login.is_some() {
-                notify_manual_login(&options, &start.login_url, callback_port, format!("{e:#}"));
-            } else {
-                return Err(e).context("open browser for hub login");
-            }
+/// Desktop path: open the browser (or print the manual fallback link) and await the
+/// loopback redirect, then exchange the callback code for a hub credential.
+pub(crate) async fn join_default_hub_with_options(options: HubJoinOptions) -> Result<JoinedHub> {
+    let pending = start_hub_join(&options).await?;
+
+    if options.show_manual_login {
+        notify_manual_login(&options, &pending.login_url);
+    } else if let Err(e) = open_browser(&pending.login_url).await {
+        if options.manual_login.is_some() {
+            notify_manual_login(&options, &pending.login_url);
+        } else {
+            return Err(e).context("open browser for hub login");
         }
     }
 
+    finish_with_loopback(pending, options.timeout).await
+}
+
+/// Await the loopback callback and exchange the returned code for a hub credential.
+pub(crate) async fn finish_with_loopback(
+    pending: PendingHubJoin,
+    timeout: Duration,
+) -> Result<JoinedHub> {
+    let listener = pending
+        .listener
+        .expect("loopback listener present for loopback completion");
     let code = tokio::time::timeout(
-        options
-            .timeout
-            .min(Duration::from_secs(start.expires_in_seconds)),
-        wait_for_callback(listener, state.clone()),
+        timeout.min(Duration::from_secs(pending.expires_in_seconds)),
+        wait_for_callback(listener, pending.state.clone()),
     )
     .await
     .context("browser login timed out; try /hub join again")??;
 
-    let exchange_url = format!(
-        "{}/auth/exchange_code",
-        options.auth_origin.trim_end_matches('/')
-    );
+    let exchange_url = format!("{}/auth/exchange_code", pending.auth_origin);
     let exchange = post_json::<HubAuthExchangeCodeResponse>(
-        &client,
+        &pending.client,
         &exchange_url,
         &HubAuthExchangeCodeRequest {
-            exchange_request_id: start.exchange_request_id,
+            exchange_request_id: pending.exchange_request_id,
             code,
-            state,
-            code_verifier: verifier,
+            state: pending.state,
+            code_verifier: pending.verifier,
         },
         "exchange hub auth code",
     )
     .await?;
+    store_credential(exchange)
+}
 
+/// SSH / remote path: exchange a pasted one-time code for a hub credential.
+pub(crate) async fn finish_with_manual_code(
+    pending: PendingHubJoin,
+    manual_code: &str,
+) -> Result<JoinedHub> {
+    let manual_code = manual_code.trim();
+    if manual_code.is_empty() {
+        anyhow::bail!("no code entered; run /hub join again to retry");
+    }
+    let exchange_url = format!("{}/auth/exchange_manual_code", pending.auth_origin);
+    let exchange = post_json::<HubAuthExchangeCodeResponse>(
+        &pending.client,
+        &exchange_url,
+        &HubAuthExchangeManualCodeRequest {
+            exchange_request_id: pending.exchange_request_id,
+            manual_code: manual_code.to_string(),
+            state: pending.state,
+            code_verifier: pending.verifier,
+        },
+        "exchange hub manual code",
+    )
+    .await?;
+    store_credential(exchange)
+}
+
+fn store_credential(exchange: HubAuthExchangeCodeResponse) -> Result<JoinedHub> {
     let identity = JoinedHubIdentity {
         handle: exchange.handle,
         namespace: exchange.namespace,
@@ -155,6 +219,24 @@ pub(crate) async fn join_default_hub_with_options(options: HubJoinOptions) -> Re
         handle: identity.handle,
         namespace: identity.namespace,
     })
+}
+
+/// Append `manual=1` so the hub login page issues a one-time paste code instead of
+/// redirecting to the loopback callback.
+fn manual_login_url(login_url: &str) -> String {
+    if let Ok(mut url) = reqwest::Url::parse(login_url) {
+        if !url.query_pairs().any(|(k, v)| k == "manual" && v == "1") {
+            url.query_pairs_mut().append_pair("manual", "1");
+        }
+        return url.to_string();
+    }
+    if login_url.contains("manual=1") {
+        login_url.to_string()
+    } else if login_url.contains('?') {
+        format!("{login_url}&manual=1")
+    } else {
+        format!("{login_url}?manual=1")
+    }
 }
 
 async fn post_json<T: serde::de::DeserializeOwned>(
@@ -321,19 +403,23 @@ fn pkce_challenge(verifier: &str) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
 }
 
-fn notify_manual_login(
-    options: &HubJoinOptions,
-    login_url: &str,
-    callback_port: u16,
-    reason: String,
-) {
+fn notify_manual_login(options: &HubJoinOptions, login_url: &str) {
     if let Some(handler) = &options.manual_login {
         handler(ManualLogin {
             login_url: login_url.to_string(),
-            reason,
-            callback_port,
         });
     }
+}
+
+/// Whether pie should open a browser itself for `/hub join`. False on SSH / headless
+/// sessions, where the loopback callback can't reach this process and the user should
+/// paste a one-time code instead.
+pub(crate) fn browser_auto_open_available() -> bool {
+    #[cfg(test)]
+    if std::env::var_os("PIE_HUB_JOIN_TEST_RESPECT_HEADLESS").is_none() {
+        return true;
+    }
+    browser_unavailable_reason().is_none()
 }
 
 fn browser_unavailable_reason() -> Option<String> {

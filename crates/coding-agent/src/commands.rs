@@ -107,6 +107,16 @@ pub enum CommandOutcome {
         label: &'static str,
         task: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
     },
+    /// Complete `/hub join` via a pasted one-time code (SSH / remote TTY).
+    ///
+    /// `/auth/start` already ran, so `login_url` is the user-facing link (annotated to
+    /// request a paste code) and `pending` carries the resumable exchange state. The UI
+    /// prints the link, prompts for the code without driving the agent loop, and calls
+    /// [`complete_hub_join_manual`].
+    HubJoinManual {
+        login_url: String,
+        pending: Box<crate::hub_join::PendingHubJoin>,
+    },
 }
 
 impl std::fmt::Debug for CommandOutcome {
@@ -150,6 +160,7 @@ impl std::fmt::Debug for CommandOutcome {
                 .debug_struct("BackgroundTask")
                 .field("label", label)
                 .finish_non_exhaustive(),
+            Self::HubJoinManual { .. } => f.debug_struct("HubJoinManual").finish_non_exhaustive(),
         }
     }
 }
@@ -1170,70 +1181,92 @@ async fn hub_join(argv: &[String], ctx: &CommandCtx<'_>) -> CommandOutcome {
         return CommandOutcome::Error("usage: /hub join".into());
     }
     let harness = ctx.harness.clone();
-    CommandOutcome::BackgroundTask {
-        label: "hub join",
-        task: Box::pin(async move {
-            cprintln!("Starting hub join for pie.0xfefe.me...");
-            cprintln!("Waiting for hub login; you can keep using pie while this completes.");
-            if let Err(e) = run_hub_join_background(&harness).await {
-                cprintln!(
-                    "hub join failed: {}",
-                    redact_hub_status_text(&e.to_string())
-                );
-            }
-        }),
+    if crate::hub_join::browser_auto_open_available() {
+        // Desktop: open the browser ourselves and let the loopback callback finish login.
+        return CommandOutcome::BackgroundTask {
+            label: "hub join",
+            task: Box::pin(async move {
+                cprintln!("Starting hub join for pie.0xfefe.me...");
+                cprintln!("Opening your browser to finish hub login; you can keep using pie.");
+                if let Err(e) = run_hub_join_desktop(&harness).await {
+                    cprintln!(
+                        "hub join failed: {}",
+                        redact_hub_status_text(&e.to_string())
+                    );
+                }
+            }),
+        };
+    }
+
+    // SSH / headless: the loopback callback can't reach this process. Run `/auth/start`
+    // now, then hand the URL + paste-code prompt to the UI (the agent loop is untouched).
+    match crate::hub_join::start_hub_join(&crate::hub_join::HubJoinOptions::default()).await {
+        Ok(pending) => CommandOutcome::HubJoinManual {
+            login_url: pending.manual_login_url(),
+            pending: Box::new(pending),
+        },
+        Err(e) => CommandOutcome::Error(format!(
+            "hub join failed to start: {}",
+            redact_hub_status_text(&e.to_string())
+        )),
     }
 }
 
-async fn run_hub_join_background(harness: &Arc<AgentHarness>) -> anyhow::Result<()> {
-    let manual_login_printed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let manual_login_flag = manual_login_printed.clone();
+/// Desktop flow: auto-open the browser, fall back to printing the link if that fails,
+/// and complete via the loopback callback.
+async fn run_hub_join_desktop(harness: &Arc<AgentHarness>) -> anyhow::Result<()> {
+    let fallback_printed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let fallback_flag = fallback_printed.clone();
     let options = crate::hub_join::HubJoinOptions {
         manual_login: Some(std::sync::Arc::new(move |manual| {
-            if manual_login_flag.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            if fallback_flag.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 return;
             }
-            cprintln!(
-                "Hub login fallback: {}",
-                redact_hub_status_text(&manual.reason)
-            );
-            cprintln!("Open this login link in a browser:");
+            cprintln!("If your browser did not open, finish hub login here:");
             cprintln!("{}", manual.login_url);
-            cprintln!(
-                "Keep pie running until login completes. On SSH, forward local callback port {} to this machine, or run /hub join from a local terminal; paste-code/device-code fallback is not supported yet.",
-                manual.callback_port
-            );
+            cprintln!("Keep pie running until login completes.");
         })),
-        show_manual_login: true,
+        show_manual_login: false,
         ..Default::default()
     };
-    match crate::hub_join::join_default_hub_with_options(options).await {
-        Ok(joined) => {
-            cprintln!(
-                "Joined hub as {}",
-                safe_joined_mention(&joined.handle, &joined.namespace)
-            );
-            ensure_hub_hook_connected_for_harness(harness)
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "hub join saved credential, but live connection failed: {}; run /hub status",
-                        redact_hub_status_text(&e.to_string())
-                    )
-                })?;
-            cprintln!("hub is connected; run /hub status or /hub send");
-            Ok(())
-        }
-        Err(e) => {
-            if manual_login_printed.load(std::sync::atomic::Ordering::SeqCst) {
-                anyhow::bail!(
-                    "{}; recovery: keep pie running and complete the browser flow, retry from a local browser session, or SSH-forward the callback port printed above",
-                    redact_hub_status_text(&e.to_string())
-                );
-            }
-            Err(e)
-        }
-    }
+    let joined = crate::hub_join::join_default_hub_with_options(options).await?;
+    finalize_hub_join(harness, joined).await
+}
+
+/// Complete `/hub join` from a pasted one-time code (SSH / remote TTY). Called by the UI
+/// after it collects the code without driving the agent loop.
+// Used by the binary (ui/mod.rs); unreferenced in test targets that include only commands.rs.
+#[allow(dead_code)]
+pub(crate) async fn complete_hub_join_manual(
+    harness: &Arc<AgentHarness>,
+    pending: Box<crate::hub_join::PendingHubJoin>,
+    code: &str,
+) -> anyhow::Result<()> {
+    let joined = crate::hub_join::finish_with_manual_code(*pending, code)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", redact_hub_status_text(&e.to_string())))?;
+    finalize_hub_join(harness, joined).await
+}
+
+/// Shared success tail: announce the joined identity and bring the live hub hook up.
+async fn finalize_hub_join(
+    harness: &Arc<AgentHarness>,
+    joined: crate::hub_join::JoinedHub,
+) -> anyhow::Result<()> {
+    cprintln!(
+        "Joined hub as {}",
+        safe_joined_mention(&joined.handle, &joined.namespace)
+    );
+    ensure_hub_hook_connected_for_harness(harness)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "hub join saved credential, but live connection failed: {}; run /hub status",
+                redact_hub_status_text(&e.to_string())
+            )
+        })?;
+    cprintln!("hub is connected; run /hub status or /hub send");
+    Ok(())
 }
 
 async fn ensure_hub_hook_connected_for_harness(harness: &Arc<AgentHarness>) -> anyhow::Result<()> {
