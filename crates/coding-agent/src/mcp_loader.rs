@@ -89,6 +89,7 @@ pub struct LoadedMcp {
     pub tools: Vec<Arc<dyn AgentTool>>,
     pub diagnostics: Vec<String>,
     pub client_count: usize,
+    pub server_names: Vec<String>,
     pub notification_hooks: Vec<Arc<McpNotificationHook>>,
     /// Names of servers configured with `inject_summary = true`. The caller wires these into
     /// `triggers::direct_inject_action_hook` so their pushes bypass the sub-agent.
@@ -130,13 +131,14 @@ pub async fn load_all(cwd: &Path) -> LoadedMcp {
         .map(|c| c.name.clone())
         .collect();
 
-    let (tools, notification_hooks, connect_diagnostics, client_count) =
+    let (tools, notification_hooks, connect_diagnostics, client_count, server_names) =
         connect_all(&configs).await;
     diagnostics.extend(connect_diagnostics);
     LoadedMcp {
         tools,
         diagnostics,
         client_count,
+        server_names,
         notification_hooks,
         inject_summary_servers,
         inject_and_run_servers,
@@ -236,24 +238,33 @@ async fn connect_all(
     Vec<Arc<McpNotificationHook>>,
     Vec<String>,
     usize,
+    Vec<String>,
 ) {
     let mut tools: Vec<Arc<dyn AgentTool>> = Vec::new();
     let mut notification_hooks: Vec<Arc<McpNotificationHook>> = Vec::new();
     let mut diagnostics: Vec<String> = Vec::new();
     let mut client_count = 0usize;
+    let mut server_names = Vec::new();
     for s in configs.iter() {
         match connect_one(s).await {
             Ok((server_tools, hook)) => {
                 tools.extend(server_tools);
                 notification_hooks.push(hook);
                 client_count += 1;
+                server_names.push(s.name.clone());
             }
             Err(e) => {
                 diagnostics.push(format!("mcp server '{}' failed: {e}", s.name));
             }
         }
     }
-    (tools, notification_hooks, diagnostics, client_count)
+    (
+        tools,
+        notification_hooks,
+        diagnostics,
+        client_count,
+        server_names,
+    )
 }
 
 async fn read_config(path: &Path, diagnostics: &mut Vec<String>, label: &str) -> Option<McpConfig> {
@@ -472,8 +483,9 @@ mod tests {
                 inject_and_run: false,
             },
         ];
-        let (tools, hooks, diagnostics, client_count) = connect_all(&configs).await;
+        let (tools, hooks, diagnostics, client_count, server_names) = connect_all(&configs).await;
         assert_eq!(client_count, 0, "no server should be reported as connected");
+        assert!(server_names.is_empty());
         assert!(tools.is_empty(), "no tools should load from failed servers");
         assert!(
             hooks.is_empty(),
@@ -498,11 +510,12 @@ mod tests {
     /// the helper doesn't crash on the empty path.
     #[tokio::test]
     async fn empty_configs_reports_zero() {
-        let (tools, hooks, diagnostics, client_count) = connect_all(&[]).await;
+        let (tools, hooks, diagnostics, client_count, server_names) = connect_all(&[]).await;
         assert!(tools.is_empty());
         assert!(hooks.is_empty());
         assert!(diagnostics.is_empty());
         assert_eq!(client_count, 0);
+        assert!(server_names.is_empty());
     }
 
     #[test]

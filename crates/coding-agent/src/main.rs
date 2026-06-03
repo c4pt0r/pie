@@ -122,10 +122,14 @@ struct Cli {
     #[arg(long)]
     debug: bool,
 
-    /// Auto-approve control-plane prompts in non-interactive runs. The Web UI still
-    /// fails closed until it has a prompt surface.
+    /// Auto-approve control-plane prompts.
     #[arg(long)]
     yes: bool,
+
+    /// Auto-approve every approval prompt, including control-plane writes and trigger
+    /// first-contact prompts.
+    #[arg(long = "always-allow")]
+    always_allow: bool,
 
     /// Hidden e2e driver for hub first-contact decisions. This lets live tests exercise the
     /// runtime prompt path without brittle PTY key timing.
@@ -138,8 +142,11 @@ struct Cli {
     hub_first_contact_decision: Option<String>,
 
     /// Run the local browser UI instead of the terminal UI. Defaults to loopback-only.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "tui")]
     web: bool,
+    /// Run the terminal UI even when local defaults would open the Web UI.
+    #[arg(long, conflicts_with = "web")]
+    tui: bool,
     /// Host for `--web`. Must be a loopback address.
     #[arg(long = "web-host", default_value = "127.0.0.1", value_name = "HOST")]
     web_host: String,
@@ -252,6 +259,7 @@ async fn delete_session_cmd(repo: &JsonlSessionRepo, id: &str) -> Result<()> {
 }
 
 async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo) -> Result<()> {
+    let run_web = should_run_web(&cli);
     let cli_base_url = cli.base_url.clone();
     validate_base_url_override(&cli)?;
     let local_models = local_models::load_all(&cwd, cli_base_url.as_deref()).await?;
@@ -340,6 +348,12 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
     // registered as trigger sources a few lines below, once we have an `Arc<AgentHarness>`.
     let mcp = mcp_loader::load_all(&cwd).await;
     let mcp_tool_count = mcp.tools.len();
+    let mcp_tool_names = mcp
+        .tools
+        .iter()
+        .map(|tool| tool.definition().name.clone())
+        .collect::<Vec<_>>();
+    let mcp_server_names = mcp.server_names.clone();
     let mcp_notification_hooks = mcp.notification_hooks;
     let mcp_notification_hook_count = mcp_notification_hooks.len();
     let mcp_inject_summary_servers = mcp.inject_summary_servers;
@@ -427,19 +441,14 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
     opts.before_tool_call =
         Some(PermissionPolicy::default_for_coding_agent().as_before_tool_call());
     let interactive_tui =
-        !cli.web && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    let control_plane_prompt_rx = if interactive_tui {
+        !run_web && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let control_plane_prompt_rx = if cli.always_allow || cli.yes {
+        opts.on_control_plane_prompt = Some(control_plane_prompt::allow_hook());
+        None
+    } else if interactive_tui || run_web {
         let (hook, rx) = control_plane_prompt::interactive_hook();
         opts.on_control_plane_prompt = Some(hook);
         Some(rx)
-    } else if cli.web {
-        opts.on_control_plane_prompt = Some(control_plane_prompt::deny_hook(
-            "control-plane prompts are not available in the Web UI yet; run pie in the terminal UI to approve this action",
-        ));
-        None
-    } else if cli.yes {
-        opts.on_control_plane_prompt = Some(control_plane_prompt::allow_hook());
-        None
     } else {
         opts.on_control_plane_prompt = Some(control_plane_prompt::deny_hook(
             "control-plane prompt requires an interactive terminal; run pie in a TTY to approve this action",
@@ -453,7 +462,13 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
             trigger_prompt::TriggerPromptDriverDecision::parse(value).map_err(anyhow::Error::msg)
         })
         .transpose()?;
-    let trigger_prompt_rx = if interactive_tui {
+    let trigger_prompt_rx = if cli.always_allow {
+        opts.on_trigger_prompt = Some(trigger_prompt::decision_driver_hook(
+            session.clone(),
+            trigger_prompt::TriggerPromptDriverDecision::Always,
+        ));
+        None
+    } else if interactive_tui {
         let (hook, rx) = trigger_prompt::interactive_hook(session.clone());
         opts.on_trigger_prompt = Some(hook);
         Some(rx)
@@ -463,7 +478,7 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
             decision,
         ));
         None
-    } else if cli.web {
+    } else if run_web {
         opts.on_trigger_prompt = Some(trigger_prompt::deny_hook(
             "hub first-contact prompts are not available in the Web UI yet; run pie in the terminal UI to review this notification",
         ));
@@ -584,6 +599,9 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
         panel_status: ui::PanelStatus {
             mcp_servers: mcp.client_count,
             mcp_tools: mcp_tool_count,
+            mcp_server_names,
+            mcp_tool_names,
+            tool_names: tool_names.clone(),
             mcp_notification_hooks: mcp_notification_hook_count,
             hook_points: active_hook_registrations(lsp_lang_count, !hooks.runner.is_empty()),
             trigger_features: active_trigger_features(),
@@ -745,7 +763,7 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
 
     // Hand off to the full-screen UI. It owns the terminal, the input box, the scrolling feed,
     // and the serialized run slot (user prompts + inject-and-run triggered turns) until quit.
-    if cli.web {
+    if run_web {
         app.run_web(ui::web::WebOptions {
             host: cli.web_host.clone(),
             port: cli.web_port,
@@ -754,6 +772,41 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
     } else {
         app.run().await
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UiMode {
+    Web,
+    Tui,
+    Headless,
+}
+
+fn should_run_web(cli: &Cli) -> bool {
+    resolve_ui_mode(
+        cli.web,
+        cli.tui,
+        std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
+        is_remote_tty_env(|name| std::env::var_os(name).is_some()),
+    ) == UiMode::Web
+}
+
+fn resolve_ui_mode(web: bool, tui: bool, interactive_tty: bool, remote_tty: bool) -> UiMode {
+    if web {
+        return UiMode::Web;
+    }
+    if tui {
+        return UiMode::Tui;
+    }
+    if !interactive_tty {
+        return UiMode::Headless;
+    }
+    if remote_tty { UiMode::Tui } else { UiMode::Web }
+}
+
+fn is_remote_tty_env(mut has_env: impl FnMut(&str) -> bool) -> bool {
+    ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY", "MOSH_CONNECTION"]
+        .into_iter()
+        .any(&mut has_env)
 }
 
 /// Real `*Hook` trait registrations active in this binary. Only names that map to an actual
@@ -1053,8 +1106,10 @@ mod tests {
             trigger_poll_secs: None,
             debug: false,
             yes: false,
+            always_allow: false,
             hub_first_contact_decision: None,
             web: false,
+            tui: false,
             web_host: "127.0.0.1".into(),
             web_port: 0,
         };
@@ -1071,6 +1126,37 @@ mod tests {
 
         cli.provider = Some("ds4".into());
         validate_base_url_override(&cli).unwrap();
+    }
+
+    #[test]
+    fn ui_mode_defaults_to_web_for_local_tty() {
+        assert_eq!(resolve_ui_mode(false, false, true, false), UiMode::Web);
+    }
+
+    #[test]
+    fn ui_mode_defaults_to_tui_for_remote_tty() {
+        assert_eq!(resolve_ui_mode(false, false, true, true), UiMode::Tui);
+    }
+
+    #[test]
+    fn ui_mode_keeps_headless_for_non_tty() {
+        assert_eq!(
+            resolve_ui_mode(false, false, false, false),
+            UiMode::Headless
+        );
+    }
+
+    #[test]
+    fn explicit_ui_flags_override_default() {
+        assert_eq!(resolve_ui_mode(true, false, true, true), UiMode::Web);
+        assert_eq!(resolve_ui_mode(false, true, true, false), UiMode::Tui);
+    }
+
+    #[test]
+    fn remote_tty_env_detects_ssh_and_mosh() {
+        assert!(is_remote_tty_env(|name| name == "SSH_CONNECTION"));
+        assert!(is_remote_tty_env(|name| name == "MOSH_CONNECTION"));
+        assert!(!is_remote_tty_env(|_| false));
     }
 
     #[tokio::test]

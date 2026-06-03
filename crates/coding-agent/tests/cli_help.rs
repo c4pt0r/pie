@@ -49,6 +49,27 @@ fn help_lists_control_plane_yes_flag() {
         stdout.contains("Auto-approve control-plane prompts"),
         "{stdout}"
     );
+    assert!(stdout.contains("--always-allow"), "{stdout}");
+    assert!(
+        stdout.contains("Auto-approve every approval prompt"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn help_lists_web_and_tui_mode_flags() {
+    let output = Command::new(env!("CARGO_BIN_EXE_pie"))
+        .arg("--help")
+        .output()
+        .expect("run pie --help");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--web"), "{stdout}");
+    assert!(stdout.contains("--tui"), "{stdout}");
+    assert!(
+        stdout.contains("Run the terminal UI even when local defaults would open the Web UI"),
+        "{stdout}"
+    );
 }
 
 #[test]

@@ -62,6 +62,38 @@ pub enum FeedUpdate {
     TriggerPollStatus(TriggerPollStatus),
 }
 
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WebFeedBlock {
+    User {
+        text: String,
+        timestamp: Option<String>,
+    },
+    Assistant {
+        text: String,
+        timestamp: Option<String>,
+    },
+    Thinking {
+        text: String,
+        timestamp: Option<String>,
+    },
+    Tool {
+        name: String,
+        args: String,
+        timestamp: Option<String>,
+    },
+    ToolResult {
+        lines: Vec<String>,
+        is_error: bool,
+        timestamp: Option<String>,
+    },
+    Plain {
+        text: String,
+        level: Level,
+        timestamp: Option<String>,
+    },
+}
+
 /// Bounded, display-only status for periodic trigger checks that should stay visible in the
 /// main UI without appending a line to the conversation feed.
 #[derive(Clone, Debug, serde::Serialize)]
@@ -439,6 +471,54 @@ impl Feed {
             previous = Some(block);
         }
         out
+    }
+
+    pub fn web_blocks(&self) -> Vec<WebFeedBlock> {
+        self.blocks
+            .iter()
+            .map(|block| match block {
+                Block::User { text, timestamp } => WebFeedBlock::User {
+                    text: text.clone(),
+                    timestamp: timestamp.clone(),
+                },
+                Block::Assistant { text, timestamp } => WebFeedBlock::Assistant {
+                    text: text.clone(),
+                    timestamp: timestamp.clone(),
+                },
+                Block::Thinking { text, timestamp } => WebFeedBlock::Thinking {
+                    text: text.clone(),
+                    timestamp: timestamp.clone(),
+                },
+                Block::Tool {
+                    name,
+                    args,
+                    timestamp,
+                } => WebFeedBlock::Tool {
+                    name: name.clone(),
+                    args: args.clone(),
+                    timestamp: timestamp.clone(),
+                },
+                Block::ToolResult {
+                    lines,
+                    is_error,
+                    timestamp,
+                    ..
+                } => WebFeedBlock::ToolResult {
+                    lines: lines.clone(),
+                    is_error: *is_error,
+                    timestamp: timestamp.clone(),
+                },
+                Block::Plain {
+                    text,
+                    level,
+                    timestamp,
+                } => WebFeedBlock::Plain {
+                    text: text.clone(),
+                    level: *level,
+                    timestamp: timestamp.clone(),
+                },
+            })
+            .collect()
     }
 }
 

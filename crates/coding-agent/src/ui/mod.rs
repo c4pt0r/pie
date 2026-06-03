@@ -86,6 +86,9 @@ const TRIGGER_PROMPT_SUMMARY_CHARS: usize = 120;
 pub struct PanelStatus {
     pub mcp_servers: usize,
     pub mcp_tools: usize,
+    pub mcp_server_names: Vec<String>,
+    pub mcp_tool_names: Vec<String>,
+    pub tool_names: Vec<String>,
     /// Count of `McpNotificationHook` instances (RFC 1 §4.2.3) — server-pushed notification
     /// adapters fanning MCP frames into the trigger runtime. Distinct from `hook_points`,
     /// which lists `*Hook` trait registrations (e.g. `before_tool_call`).
@@ -2426,6 +2429,9 @@ mod tests {
         app.panel_status = PanelStatus {
             mcp_servers: 1,
             mcp_tools: 2,
+            mcp_server_names: Vec::new(),
+            mcp_tool_names: Vec::new(),
+            tool_names: Vec::new(),
             mcp_notification_hooks: 1,
             hook_points: vec!["before_tool_call".into(), "after_tool_call".into()],
             trigger_features: vec!["dedup".into(), "cycle suppress".into()],
@@ -2491,6 +2497,9 @@ mod tests {
         app.panel_status = PanelStatus {
             mcp_servers: 0,
             mcp_tools: 0,
+            mcp_server_names: Vec::new(),
+            mcp_tool_names: Vec::new(),
+            tool_names: Vec::new(),
             mcp_notification_hooks: 0,
             hook_points: vec!["before_tool_call".into(), "after_tool_call".into()],
             trigger_features: vec!["dedup".into(), "cycle suppress".into()],
