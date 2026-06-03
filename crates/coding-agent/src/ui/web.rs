@@ -843,10 +843,31 @@ const INDEX_HTML: &str = r#"<!doctype html>
       margin: 0 0 14px;
       overflow-wrap: anywhere;
     }
+    .feed-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 3px;
+    }
     .feed-meta {
       color: var(--muted);
       font-size: 12px;
-      margin-bottom: 3px;
+      min-width: 0;
+    }
+    .copy-button {
+      flex: 0 0 auto;
+      height: 24px;
+      min-width: 54px;
+      border-color: var(--line-strong);
+      background: var(--field);
+      color: var(--muted);
+      padding: 0 8px;
+      font-size: 11px;
+    }
+    .copy-button:hover {
+      color: var(--ink);
+      filter: none;
     }
     .feed-user .feed-body {
       color: var(--ink);
@@ -917,6 +938,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
       cursor: pointer;
       min-height: 1.5em;
       outline: none;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
     }
     .tool-details summary:hover { color: var(--ink); }
     .tool-output {
@@ -1753,9 +1778,13 @@ function renderFeedLines(lines) {
   let tool = null;
   function flushTool() {
     if (!tool) return;
+    const output = tool.output.join('\n');
     const details = node('details', { class: 'tool-details' }, [
-      node('summary', { text: tool.summary }),
-      node('pre', { class: 'tool-output', text: tool.output.join('\n') || 'no output' })
+      node('summary', {}, [
+        node('span', { text: tool.summary }),
+        copyButton(output)
+      ]),
+      node('pre', { class: 'tool-output', text: output || 'no output' })
     ]);
     nodes.push(details);
     tool = null;
@@ -1782,9 +1811,51 @@ function metaLabel(timestamp, label) {
   return (timestamp ? timestamp + ' ' : '') + label;
 }
 
+async function copyText(text) {
+  const value = String(text ?? '');
+  if (navigator.clipboard && window.isSecureContext) {
+    await navigator.clipboard.writeText(value);
+    return;
+  }
+  const scratch = document.createElement('textarea');
+  scratch.value = value;
+  scratch.setAttribute('readonly', '');
+  scratch.style.position = 'fixed';
+  scratch.style.top = '-1000px';
+  scratch.style.opacity = '0';
+  document.body.append(scratch);
+  scratch.select();
+  document.execCommand('copy');
+  scratch.remove();
+}
+
+function copyButton(text) {
+  const button = node('button', { class: 'copy-button', type: 'button', text: 'Copy' });
+  button.addEventListener('click', async (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    try {
+      await copyText(text);
+      button.textContent = 'Copied';
+      setTimeout(() => { button.textContent = 'Copy'; }, 1200);
+    } catch (_) {
+      button.textContent = 'Failed';
+      setTimeout(() => { button.textContent = 'Copy'; }, 1200);
+    }
+  });
+  return button;
+}
+
+function feedHead(label, textToCopy) {
+  return node('div', { class: 'feed-head' }, [
+    node('div', { class: 'feed-meta', text: label }),
+    copyButton(textToCopy)
+  ]);
+}
+
 function renderMarkdownBlock(block, className, label) {
   const outer = node('article', { class: 'feed-block ' + className }, [
-    node('div', { class: 'feed-meta', text: metaLabel(block.timestamp, label) })
+    feedHead(metaLabel(block.timestamp, label), block.text || '')
   ]);
   const body = node('div', { class: 'feed-body markdown' });
   body.innerHTML = markdownToHtml(block.text);
@@ -1798,9 +1869,13 @@ function renderFeedBlocks(blocks) {
   let pendingTool = null;
   function flushTool() {
     if (!pendingTool) return;
+    const output = pendingTool.output.join('\n');
     const details = node('details', { class: 'tool-details feed-block' }, [
-      node('summary', { text: metaLabel(pendingTool.timestamp, '⚙ ' + pendingTool.name + pendingTool.args) }),
-      node('pre', { class: 'tool-output', text: pendingTool.output.join('\n') || 'no output' })
+      node('summary', {}, [
+        node('span', { text: metaLabel(pendingTool.timestamp, '⚙ ' + pendingTool.name + pendingTool.args) }),
+        copyButton(output)
+      ]),
+      node('pre', { class: 'tool-output', text: output || 'no output' })
     ]);
     nodes.push(details);
     pendingTool = null;
@@ -1831,12 +1906,12 @@ function renderFeedBlocks(blocks) {
       nodes.push(renderMarkdownBlock(block, 'feed-plain level_' + block.level, ''));
     } else if (block.kind === 'user') {
       nodes.push(node('article', { class: 'feed-block feed-user' }, [
-        node('div', { class: 'feed-meta', text: metaLabel(block.timestamp, 'you ▸') }),
+        feedHead(metaLabel(block.timestamp, 'you ▸'), block.text || ''),
         node('div', { class: 'feed-body', text: block.text || '' })
       ]));
     } else if (block.kind === 'thinking') {
       nodes.push(node('article', { class: 'feed-block feed-thinking' }, [
-        node('div', { class: 'feed-meta', text: metaLabel(block.timestamp, '[thinking]') }),
+        feedHead(metaLabel(block.timestamp, '[thinking]'), block.text || ''),
         node('div', { class: 'feed-body', text: block.text || '' })
       ]));
     }
