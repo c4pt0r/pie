@@ -1806,7 +1806,7 @@ function renderFeedBlocks(blocks) {
 function render(snapshot) {
   model.textContent = snapshot.model;
   const cwdText = String(snapshot.cwd || '');
-  cwd.textContent = cwdText.split(/[\\/]/).filter(Boolean).pop() || cwdText || '.';
+  cwd.textContent = cwdText || '.';
   cwd.title = cwdText;
   session.textContent = snapshot.session_id;
   const stateText = snapshot.busy
