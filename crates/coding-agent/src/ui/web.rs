@@ -43,6 +43,9 @@ enum WebCommand {
         text: String,
         images: Vec<WebPromptImage>,
     },
+    TriggerRuleNow {
+        id: String,
+    },
     Abort,
     ResolveControlPlane {
         approve: bool,
@@ -122,6 +125,7 @@ struct WebTriggersSnapshot {
 #[derive(Clone, Debug, Serialize)]
 struct WebTriggerRuleSnapshot {
     id: String,
+    full_id: String,
     enabled: bool,
     mode: String,
     condition: String,
@@ -192,6 +196,11 @@ struct CommandAccepted {
 #[derive(Debug, Deserialize)]
 struct ControlPlaneDecisionRequest {
     approve: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct TriggerRuleRequest {
+    id: String,
 }
 
 impl App {
@@ -281,6 +290,7 @@ impl App {
     async fn handle_web_command(&mut self, command: WebCommand, turn: &mut TurnState) {
         match command {
             WebCommand::Submit { text, images } => self.submit_web_text(text, images, turn).await,
+            WebCommand::TriggerRuleNow { id } => self.trigger_web_rule_now(id, turn),
             WebCommand::Abort => self.request_abort(turn),
             WebCommand::ResolveControlPlane { approve } => {
                 let decision = if approve {
@@ -292,6 +302,36 @@ impl App {
                 };
                 self.resolve_control_plane_prompt(decision);
             }
+        }
+    }
+
+    fn trigger_web_rule_now(&mut self, id: String, turn: &mut TurnState) {
+        let id = id.trim();
+        if id.is_empty() {
+            self.error_line("trigger: missing rule id");
+            return;
+        }
+
+        let Some(rule) = crate::triggers::global_registry()
+            .list()
+            .into_iter()
+            .find(|rule| rule.id == id)
+        else {
+            self.error_line(format!("trigger: no dynamic trigger rule with id `{id}`"));
+            return;
+        };
+
+        let display = format!(
+            "trigger now {}: {}",
+            feed::truncate_chars(&rule.id, 18),
+            web_preview(&rule.action)
+        );
+        self.follow = true;
+        if turn.fut.is_some() {
+            self.queue_user_prompt(display, rule.action, Vec::new());
+        } else {
+            self.feed.push_user(display);
+            self.start_user_prompt_turn(rule.action, Vec::new(), turn);
         }
     }
 
@@ -479,6 +519,7 @@ impl App {
             .take(ITEM_LIMIT)
             .map(|rule| WebTriggerRuleSnapshot {
                 id: feed::truncate_chars(&rule.id, 18),
+                full_id: rule.id.clone(),
                 enabled: rule.enabled,
                 mode: if rule.fire_once { "once" } else { "repeat" }.to_string(),
                 condition: web_preview(&rule.condition),
@@ -566,6 +607,7 @@ fn web_router(state: HttpState) -> Router {
         .route("/prompt", post(prompt))
         .route("/complete", post(complete))
         .route("/abort", post(abort))
+        .route("/trigger/immediate", post(trigger_immediate))
         .route("/control-plane/resolve", post(resolve_control_plane))
         .with_state(state)
 }
@@ -623,6 +665,17 @@ async fn complete(
 
 async fn abort(State(state): State<HttpState>) -> impl IntoResponse {
     let accepted = state.commands.send(WebCommand::Abort).is_ok();
+    Json(CommandAccepted { accepted })
+}
+
+async fn trigger_immediate(
+    State(state): State<HttpState>,
+    Json(req): Json<TriggerRuleRequest>,
+) -> impl IntoResponse {
+    let accepted = state
+        .commands
+        .send(WebCommand::TriggerRuleNow { id: req.id })
+        .is_ok();
     Json(CommandAccepted { accepted })
 }
 
@@ -1317,6 +1370,23 @@ const INDEX_HTML: &str = r#"<!doctype html>
       white-space: nowrap;
       font-weight: 600;
     }
+    .row-actions {
+      flex: 0 0 auto;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .row-action {
+      width: 28px;
+      min-width: 28px;
+      height: 24px;
+      padding: 0;
+      border-color: var(--line-strong);
+      background: var(--field);
+      color: var(--ink);
+      font-size: 12px;
+      line-height: 1;
+    }
     .row-text {
       color: var(--muted);
       font-size: 12px;
@@ -1710,12 +1780,40 @@ function pill(label, on) {
   return node('span', { class: on ? 'pill on' : 'pill', text: label });
 }
 
+function triggerNowButton(rule) {
+  const button = node('button', {
+    class: 'row-action icon-button',
+    type: 'button',
+    title: 'Trigger immediately',
+    'aria-label': 'Trigger immediately',
+    text: '▶'
+  });
+  button.addEventListener('click', async (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    button.disabled = true;
+    try {
+      await fetch('/trigger/immediate', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ id: rule.full_id || rule.id })
+      });
+    } finally {
+      button.disabled = false;
+    }
+  });
+  return button;
+}
+
 function renderRules(rules) {
   if (!rules.length) return empty();
   return node('div', { class: 'rows' }, rules.map((rule) => node('div', { class: 'row' }, [
     node('div', { class: 'row-top' }, [
       node('span', { class: 'row-id', text: rule.id }),
-      pill((rule.enabled ? 'enabled' : 'disabled') + ' / ' + rule.mode, rule.enabled)
+      node('span', { class: 'row-actions' }, [
+        pill((rule.enabled ? 'enabled' : 'disabled') + ' / ' + rule.mode, rule.enabled),
+        triggerNowButton(rule)
+      ])
     ]),
     node('div', { class: 'row-text', text: 'when ' + rule.condition }),
     node('div', { class: 'row-text', text: 'do ' + rule.action })
@@ -2549,6 +2647,21 @@ mod tests {
         assert_eq!(accepted["accepted"], true);
         match command_rx.recv().await.unwrap() {
             WebCommand::Abort => {}
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let accepted: serde_json::Value = client
+            .post(format!("{base}/trigger/immediate"))
+            .json(&json!({ "id": "rule-123" }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(accepted["accepted"], true);
+        match command_rx.recv().await.unwrap() {
+            WebCommand::TriggerRuleNow { id } => assert_eq!(id, "rule-123"),
             other => panic!("unexpected command: {other:?}"),
         }
 
