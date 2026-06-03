@@ -13,6 +13,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::Engine as _;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, broadcast, mpsc};
@@ -38,9 +39,14 @@ struct HttpState {
 
 #[derive(Debug)]
 enum WebCommand {
-    Submit { text: String },
+    Submit {
+        text: String,
+        images: Vec<WebPromptImage>,
+    },
     Abort,
-    ResolveControlPlane { approve: bool },
+    ResolveControlPlane {
+        approve: bool,
+    },
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -158,6 +164,14 @@ struct WebToolsSnapshot {
 #[derive(Debug, Deserialize)]
 struct PromptRequest {
     text: String,
+    #[serde(default)]
+    images: Vec<WebPromptImage>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct WebPromptImage {
+    data: String,
+    name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -266,7 +280,7 @@ impl App {
 
     async fn handle_web_command(&mut self, command: WebCommand, turn: &mut TurnState) {
         match command {
-            WebCommand::Submit { text } => self.submit_web_text(text, turn).await,
+            WebCommand::Submit { text, images } => self.submit_web_text(text, images, turn).await,
             WebCommand::Abort => self.request_abort(turn),
             WebCommand::ResolveControlPlane { approve } => {
                 let decision = if approve {
@@ -281,29 +295,54 @@ impl App {
         }
     }
 
-    async fn submit_web_text(&mut self, text: String, turn: &mut TurnState) {
+    async fn submit_web_text(
+        &mut self,
+        text: String,
+        images: Vec<WebPromptImage>,
+        turn: &mut TurnState,
+    ) {
         let trimmed = text.trim().to_string();
-        if trimmed.is_empty() {
+        if trimmed.is_empty() && images.is_empty() {
             return;
         }
-        self.history.append(&trimmed);
+        let loaded_images = match load_web_prompt_images(&images) {
+            Ok(images) => images,
+            Err(e) => {
+                self.error_line(format!("pasted image: {e}"));
+                return;
+            }
+        };
+        if !loaded_images.is_empty() && !self.current_model_accepts_images() {
+            self.error_line(format!(
+                "current model does not support image input; switch to a vision-capable model before sending {} image attachment(s)",
+                loaded_images.len()
+            ));
+            return;
+        }
+        if !trimmed.is_empty() {
+            self.history.append(&trimmed);
+        }
         self.follow = true;
 
-        if trimmed.starts_with('/') {
+        if trimmed.starts_with('/') && loaded_images.is_empty() {
             self.feed.push_user(&trimmed);
             self.dispatch_web_slash(&trimmed, turn).await;
             return;
         }
 
-        let expanded = mentions::expand(&trimmed, &self.cwd).await.0;
+        let expanded = if trimmed.is_empty() {
+            String::new()
+        } else {
+            mentions::expand(&trimmed, &self.cwd).await.0
+        };
         let prompt_text =
             crate::commands::attach_skill_prompt(expanded, self.pending_skill.take().as_deref());
-        let display = trimmed;
+        let display = super::prompt_display(&trimmed, loaded_images.len());
         if turn.fut.is_some() {
-            self.queue_user_prompt(display, prompt_text, Vec::new());
+            self.queue_user_prompt(display, prompt_text, loaded_images);
         } else {
             self.feed.push_user(display);
-            self.start_user_prompt_turn(prompt_text, Vec::new(), turn);
+            self.start_user_prompt_turn(prompt_text, loaded_images, turn);
         }
     }
 
@@ -565,7 +604,10 @@ async fn prompt(
 ) -> impl IntoResponse {
     let accepted = state
         .commands
-        .send(WebCommand::Submit { text: req.text })
+        .send(WebCommand::Submit {
+            text: req.text,
+            images: req.images,
+        })
         .is_ok();
     Json(CommandAccepted { accepted })
 }
@@ -629,6 +671,35 @@ fn web_control_plane_prompt_snapshot(
 
 fn web_prompt_text(text: &str, cap: usize) -> String {
     feed::truncate_chars(&crate::bug_report::redact(text), cap)
+}
+
+fn load_web_prompt_images(images: &[WebPromptImage]) -> Result<Vec<pie_ai::ImageContent>> {
+    if images.len() > crate::images::MAX_IMAGES_PER_MESSAGE {
+        bail!(
+            "{} images exceeds per-message cap of {}",
+            images.len(),
+            crate::images::MAX_IMAGES_PER_MESSAGE
+        );
+    }
+    let mut out = Vec::with_capacity(images.len());
+    for (idx, image) in images.iter().enumerate() {
+        let label = image
+            .name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+            .map(|name| format!("clipboard image `{name}`"))
+            .unwrap_or_else(|| format!("clipboard image #{}", idx + 1));
+        let data = image
+            .data
+            .rsplit_once(',')
+            .map(|(_, data)| data)
+            .unwrap_or(image.data.as_str());
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .with_context(|| format!("decode {label}"))?;
+        out.push(crate::images::load_bytes(&label, &bytes)?);
+    }
+    Ok(out)
 }
 
 fn bind_addr(options: &WebOptions) -> Result<SocketAddr> {
@@ -852,10 +923,47 @@ const INDEX_HTML: &str = r#"<!doctype html>
       margin: 0 0 14px;
       overflow-wrap: anywhere;
     }
+    .feed-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 3px;
+    }
     .feed-meta {
       color: var(--muted);
       font-size: 12px;
-      margin-bottom: 3px;
+      min-width: 0;
+    }
+    .copy-button {
+      flex: 0 0 auto;
+      width: 44px;
+      height: 24px;
+      padding: 0;
+      border-color: var(--line-strong);
+      background: var(--field);
+      color: var(--muted);
+      font-size: 11px;
+      opacity: 0;
+    }
+    .feed-block:hover .copy-button,
+    .feed-block:focus-within .copy-button,
+    .copy-button.copied,
+    .copy-button.copy-error {
+      opacity: 1;
+    }
+    .copy-button:hover {
+      color: var(--ink);
+      filter: none;
+      background: var(--soft);
+    }
+    .copy-button.copied {
+      border-color: var(--ink);
+      color: var(--ink);
+    }
+    .copy-button.copy-error {
+      border-color: var(--ink);
+      color: var(--ink);
     }
     .feed-user .feed-body {
       color: var(--ink);
@@ -924,8 +1032,16 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     .tool-details summary {
       cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
       min-height: 1.5em;
       outline: none;
+    }
+    .tool-details summary span {
+      min-width: 0;
+      overflow-wrap: anywhere;
     }
     .tool-details summary:hover { color: var(--ink); }
     .tool-output {
@@ -971,7 +1087,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     form {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto auto;
+      grid-template-columns: minmax(0, 1fr) auto auto auto;
       gap: 8px;
       align-items: start;
     }
@@ -1002,14 +1118,63 @@ const INDEX_HTML: &str = r#"<!doctype html>
       background: var(--field);
       color: var(--ink);
     }
+    button.icon-button {
+      width: 40px;
+      min-width: 40px;
+      padding: 0;
+      display: inline-grid;
+      place-items: center;
+      font-size: 16px;
+      line-height: 1;
+    }
+    .attachment-strip {
+      display: none;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-bottom: 8px;
+    }
+    .attachment-strip.visible { display: flex; }
+    .attachment-chip {
+      min-width: 0;
+      max-width: 260px;
+      height: 28px;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border: 1px solid var(--line-strong);
+      border-radius: 6px;
+      background: var(--field);
+      color: var(--muted);
+      padding: 0 5px 0 8px;
+      font-size: 12px;
+    }
+    .attachment-chip span {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .attachment-chip button {
+      width: 20px;
+      min-width: 20px;
+      height: 20px;
+      border-color: var(--line-strong);
+      background: transparent;
+      color: var(--muted);
+      padding: 0;
+    }
+    .attachment-chip button:hover {
+      color: var(--ink);
+      filter: none;
+      background: var(--soft);
+    }
+    .hidden-input { display: none; }
     .theme-toggle {
-      min-width: 72px;
       border-color: var(--line-strong);
       background: var(--field);
       color: var(--ink);
     }
     .sidebar-toggle {
-      min-width: 86px;
       border-color: var(--line-strong);
       background: var(--field);
       color: var(--ink);
@@ -1237,8 +1402,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       .app[data-sidebar="hidden"] { grid-template-rows: minmax(0, 1fr); }
       .workspace { border-right: 0; }
       aside { border-top: 1px solid var(--line); }
-      form { grid-template-columns: 1fr; }
-      form button { width: 100%; }
+      form { grid-template-columns: minmax(0, 1fr) auto auto auto; }
       header { align-items: flex-start; flex-direction: column; }
     }
   </style>
@@ -1254,8 +1418,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
       </div>
       <div class="header-actions">
         <span id="status" class="run-state"><span class="dot"></span><span id="statusText">ready</span></span>
-        <button type="button" class="sidebar-toggle" id="sidebarToggle">Hide sidebar</button>
-        <button type="button" class="theme-toggle" id="themeToggle">Dark</button>
+        <button type="button" class="sidebar-toggle icon-button" id="sidebarToggle" title="Hide sidebar" aria-label="Hide sidebar">◨</button>
+        <button type="button" class="theme-toggle icon-button" id="themeToggle" title="Switch to dark theme" aria-label="Switch to dark theme">◐</button>
       </div>
     </header>
     <div class="content">
@@ -1264,12 +1428,15 @@ const INDEX_HTML: &str = r#"<!doctype html>
     </div>
     <footer>
       <div id="completionPopup" class="completion-popup"></div>
+      <div id="attachmentStrip" class="attachment-strip"></div>
       <form id="form">
         <textarea id="input" placeholder="Message pie, or type /help"></textarea>
-        <button type="submit">Send</button>
-        <button type="button" class="secondary" id="abort">Abort</button>
+        <button type="button" class="secondary icon-button" id="attachImage" title="Attach images" aria-label="Attach images">📎</button>
+        <button type="submit" class="icon-button" title="Send" aria-label="Send">↑</button>
+        <button type="button" class="secondary icon-button" id="abort" title="Abort" aria-label="Abort">■</button>
+        <input id="imageInput" class="hidden-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple>
       </form>
-      <div class="form-hint">Cmd+Enter send · Enter newline</div>
+      <div class="form-hint">Enter send · Cmd+Enter newline · paste or attach images</div>
     </footer>
   </section>
   <aside aria-label="Automation status">
@@ -1284,7 +1451,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
   <div class="detail-panel" role="dialog" aria-modal="true" aria-labelledby="detailTitle">
     <div class="detail-head">
       <h2 id="detailTitle">Details</h2>
-      <button type="button" class="detail-close" id="closeDetail" aria-label="Close details">x</button>
+      <button type="button" class="detail-close icon-button" id="closeDetail" title="Close details" aria-label="Close details">×</button>
     </div>
     <div id="detailBody" class="detail-body"></div>
   </div>
@@ -1314,8 +1481,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
       </div>
     </div>
     <div class="approval-actions">
-      <button type="button" class="secondary" id="denyApproval">Deny</button>
-      <button type="button" id="approveApproval">Approve</button>
+      <button type="button" class="secondary icon-button" id="denyApproval" title="Deny" aria-label="Deny">×</button>
+      <button type="button" class="icon-button" id="approveApproval" title="Approve" aria-label="Approve">✓</button>
     </div>
   </div>
 </section>
@@ -1330,6 +1497,9 @@ const poll = document.getElementById('poll');
 const input = document.getElementById('input');
 const form = document.getElementById('form');
 const abortButton = document.getElementById('abort');
+const attachImageButton = document.getElementById('attachImage');
+const imageInput = document.getElementById('imageInput');
+const attachmentStrip = document.getElementById('attachmentStrip');
 const themeToggle = document.getElementById('themeToggle');
 const sidebarToggle = document.getElementById('sidebarToggle');
 const sidebar = document.getElementById('sidebar');
@@ -1349,9 +1519,13 @@ const approveApproval = document.getElementById('approveApproval');
 const denyApproval = document.getElementById('denyApproval');
 const THEME_KEY = 'pie-web-theme';
 const SIDEBAR_KEY = 'pie-web-sidebar';
+const MAX_IMAGE_ATTACHMENTS = 10;
 let completionItems = [];
 let completionIndex = 0;
 let completionRequestSeq = 0;
+let inputComposing = false;
+let inputCompositionEndedAt = 0;
+let pendingImages = [];
 
 function currentTheme() {
   return document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light';
@@ -1359,7 +1533,10 @@ function currentTheme() {
 
 function applyTheme(theme) {
   document.documentElement.dataset.theme = theme;
-  themeToggle.textContent = theme === 'dark' ? 'Light' : 'Dark';
+  const next = theme === 'dark' ? 'light' : 'dark';
+  themeToggle.textContent = theme === 'dark' ? '☀' : '◐';
+  themeToggle.title = 'Switch to ' + next + ' theme';
+  themeToggle.setAttribute('aria-label', 'Switch to ' + next + ' theme');
   try { localStorage.setItem(THEME_KEY, theme); } catch (_) {}
 }
 
@@ -1375,11 +1552,15 @@ function currentSidebarHidden() {
 function applySidebarHidden(hidden) {
   if (hidden) {
     app.dataset.sidebar = 'hidden';
-    sidebarToggle.textContent = 'Show sidebar';
+    sidebarToggle.textContent = '◧';
+    sidebarToggle.title = 'Show sidebar';
+    sidebarToggle.setAttribute('aria-label', 'Show sidebar');
     sidebarToggle.setAttribute('aria-pressed', 'true');
   } else {
     delete app.dataset.sidebar;
-    sidebarToggle.textContent = 'Hide sidebar';
+    sidebarToggle.textContent = '◨';
+    sidebarToggle.title = 'Hide sidebar';
+    sidebarToggle.setAttribute('aria-label', 'Hide sidebar');
     sidebarToggle.setAttribute('aria-pressed', 'false');
   }
   try { localStorage.setItem(SIDEBAR_KEY, hidden ? 'hidden' : 'visible'); } catch (_) {}
@@ -1826,9 +2007,72 @@ function metaLabel(timestamp, label) {
   return (timestamp ? timestamp + ' ' : '') + label;
 }
 
+async function copyText(text) {
+  const value = String(text ?? '');
+  if (navigator.clipboard && window.isSecureContext) {
+    await navigator.clipboard.writeText(value);
+    return;
+  }
+  const textarea = node('textarea', { 'aria-hidden': 'true' });
+  textarea.value = value;
+  textarea.style.position = 'fixed';
+  textarea.style.left = '-9999px';
+  textarea.style.top = '0';
+  textarea.style.opacity = '0';
+  document.body.append(textarea);
+  textarea.focus();
+  textarea.select();
+  const ok = document.execCommand('copy');
+  textarea.remove();
+  if (!ok) throw new Error('copy failed');
+}
+
+function copyButton(text) {
+  const button = node('button', {
+    class: 'copy-button icon-button',
+    type: 'button',
+    text: '⧉',
+    title: 'Copy message',
+    'aria-label': 'Copy message'
+  });
+  button.addEventListener('click', async (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const original = button.textContent;
+    try {
+      await copyText(text);
+      button.textContent = '✓';
+      button.title = 'Copied';
+      button.setAttribute('aria-label', 'Copied');
+      button.classList.remove('copy-error');
+      button.classList.add('copied');
+    } catch (_) {
+      button.textContent = '!';
+      button.title = 'Copy failed';
+      button.setAttribute('aria-label', 'Copy failed');
+      button.classList.remove('copied');
+      button.classList.add('copy-error');
+    }
+    window.setTimeout(() => {
+      button.textContent = original;
+      button.title = 'Copy message';
+      button.setAttribute('aria-label', 'Copy message');
+      button.classList.remove('copied', 'copy-error');
+    }, 1400);
+  });
+  return button;
+}
+
+function feedHead(block, label, copyTextValue) {
+  return node('div', { class: 'feed-head' }, [
+    node('div', { class: 'feed-meta', text: metaLabel(block.timestamp, label) }),
+    copyButton(copyTextValue)
+  ]);
+}
+
 function renderMarkdownBlock(block, className, label) {
   const outer = node('article', { class: 'feed-block ' + className }, [
-    node('div', { class: 'feed-meta', text: metaLabel(block.timestamp, label) })
+    feedHead(block, label, block.text || '')
   ]);
   const body = node('div', { class: 'feed-body markdown' });
   body.innerHTML = markdownToHtml(block.text);
@@ -1842,8 +2086,15 @@ function renderFeedBlocks(blocks) {
   let pendingTool = null;
   function flushTool() {
     if (!pendingTool) return;
+    const toolText = [
+      'tool: ' + pendingTool.name + pendingTool.args,
+      pendingTool.output.join('\n') || 'no output'
+    ].join('\n');
     const details = node('details', { class: 'tool-details feed-block' }, [
-      node('summary', { text: metaLabel(pendingTool.timestamp, '⚙ ' + pendingTool.name + pendingTool.args) }),
+      node('summary', {}, [
+        node('span', { text: metaLabel(pendingTool.timestamp, '⚙ ' + pendingTool.name + pendingTool.args) }),
+        copyButton(toolText)
+      ]),
       node('pre', { class: 'tool-output', text: pendingTool.output.join('\n') || 'no output' })
     ]);
     nodes.push(details);
@@ -1875,12 +2126,12 @@ function renderFeedBlocks(blocks) {
       nodes.push(renderMarkdownBlock(block, 'feed-plain level_' + block.level, ''));
     } else if (block.kind === 'user') {
       nodes.push(node('article', { class: 'feed-block feed-user' }, [
-        node('div', { class: 'feed-meta', text: metaLabel(block.timestamp, 'you ▸') }),
+        feedHead(block, 'you ▸', block.text || ''),
         node('div', { class: 'feed-body', text: block.text || '' })
       ]));
     } else if (block.kind === 'thinking') {
       nodes.push(node('article', { class: 'feed-block feed-thinking' }, [
-        node('div', { class: 'feed-meta', text: metaLabel(block.timestamp, '[thinking]') }),
+        feedHead(block, '[thinking]', block.text || ''),
         node('div', { class: 'feed-body', text: block.text || '' })
       ]));
     }
@@ -1916,6 +2167,90 @@ function render(snapshot) {
   renderApproval(snapshot);
 }
 
+function insertInputText(text) {
+  const start = input.selectionStart ?? input.value.length;
+  const end = input.selectionEnd ?? input.value.length;
+  input.value = input.value.slice(0, start) + text + input.value.slice(end);
+  const next = start + text.length;
+  input.selectionStart = next;
+  input.selectionEnd = next;
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+function isInputComposing(event) {
+  return Boolean(
+    event.isComposing ||
+    inputComposing ||
+    event.keyCode === 229 ||
+    Date.now() - inputCompositionEndedAt < 50
+  );
+}
+
+function humanBytes(bytes) {
+  const value = Number(bytes || 0);
+  if (value < 1024) return value + ' B';
+  if (value < 1024 * 1024) return (value / 1024).toFixed(1) + ' KB';
+  return (value / 1024 / 1024).toFixed(1) + ' MB';
+}
+
+function renderAttachments() {
+  if (!pendingImages.length) {
+    attachmentStrip.className = 'attachment-strip';
+    attachmentStrip.replaceChildren();
+    return;
+  }
+  attachmentStrip.className = 'attachment-strip visible';
+  attachmentStrip.replaceChildren(...pendingImages.map((image, index) => {
+    const remove = node('button', {
+      type: 'button',
+      text: '×',
+      title: 'Remove attachment',
+      'aria-label': 'Remove attachment'
+    });
+    remove.addEventListener('click', () => {
+      pendingImages.splice(index, 1);
+      renderAttachments();
+      input.focus();
+    });
+    return node('div', { class: 'attachment-chip' }, [
+      node('span', { text: image.name + ' · ' + humanBytes(image.size) }),
+      remove
+    ]);
+  }));
+}
+
+function clearAttachments() {
+  pendingImages = [];
+  renderAttachments();
+}
+
+function readImageFile(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.addEventListener('load', () => {
+      const result = String(reader.result || '');
+      const data = result.includes(',') ? result.split(',').pop() : result;
+      resolve({
+        name: file.name || 'clipboard image',
+        size: file.size || 0,
+        data
+      });
+    });
+    reader.addEventListener('error', () => reject(reader.error || new Error('read image failed')));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function addImageFiles(files) {
+  const images = Array.from(files || []).filter((file) => String(file.type || '').startsWith('image/'));
+  if (!images.length) return;
+  for (const file of images) {
+    if (pendingImages.length >= MAX_IMAGE_ATTACHMENTS) break;
+    pendingImages.push(await readImageFile(file));
+  }
+  renderAttachments();
+}
+
 fetch('/state').then((r) => r.json()).then(render);
 const events = new EventSource('/events');
 events.addEventListener('snapshot', (event) => render(JSON.parse(event.data)));
@@ -1923,17 +2258,25 @@ events.addEventListener('snapshot', (event) => render(JSON.parse(event.data)));
 form.addEventListener('submit', async (event) => {
   event.preventDefault();
   const text = input.value;
-  if (!text.trim()) return;
+  const images = pendingImages.map((image) => ({ name: image.name, data: image.data }));
+  if (!text.trim() && !images.length) return;
   input.value = '';
+  clearAttachments();
   hideCompletions();
   await fetch('/prompt', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ text })
+    body: JSON.stringify({ text, images })
   });
 });
 
 abortButton.addEventListener('click', () => fetch('/abort', { method: 'POST' }));
+attachImageButton.addEventListener('click', () => imageInput.click());
+imageInput.addEventListener('change', async () => {
+  await addImageFiles(imageInput.files);
+  imageInput.value = '';
+  input.focus();
+});
 closeDetail.addEventListener('click', hideDetail);
 detailModal.addEventListener('click', (event) => {
   if (event.target === detailModal) hideDetail();
@@ -1948,10 +2291,37 @@ async function resolveApproval(approve) {
 approveApproval.addEventListener('click', () => resolveApproval(true));
 denyApproval.addEventListener('click', () => resolveApproval(false));
 input.addEventListener('input', refreshCompletions);
+input.addEventListener('compositionstart', () => {
+  inputComposing = true;
+});
+input.addEventListener('compositionend', () => {
+  inputComposing = false;
+  inputCompositionEndedAt = Date.now();
+});
+input.addEventListener('paste', async (event) => {
+  const files = [];
+  for (const item of Array.from(event.clipboardData?.items || [])) {
+    if (item.kind === 'file') {
+      const file = item.getAsFile();
+      if (file && String(file.type || '').startsWith('image/')) files.push(file);
+    }
+  }
+  if (!files.length) return;
+  event.preventDefault();
+  await addImageFiles(files);
+});
 input.addEventListener('keydown', (event) => {
-  if (approval.classList.contains('visible') && event.key === 'Enter' && event.metaKey) {
+  if (event.key === 'Enter' && isInputComposing(event)) {
+    return;
+  } else if (event.key === 'Enter' && event.metaKey) {
     event.preventDefault();
-    resolveApproval(true);
+    event.stopPropagation();
+    insertInputText('\n');
+  } else if (approval.classList.contains('visible') && event.key === 'Enter') {
+    event.preventDefault();
+  } else if (event.key === 'Enter') {
+    event.preventDefault();
+    form.requestSubmit();
   } else if (event.key === 'Tab' && completionItems.length) {
     event.preventDefault();
     applyCompletion(completionIndex, true);
@@ -1962,9 +2332,6 @@ input.addEventListener('keydown', (event) => {
   } else if (event.key === 'ArrowUp' && completionItems.length) {
     event.preventDefault();
     moveCompletion(-1);
-  } else if (event.key === 'Enter' && event.metaKey) {
-    event.preventDefault();
-    form.requestSubmit();
   } else if (event.key === 'Escape') {
     if (approval.classList.contains('visible')) {
       resolveApproval(false);
@@ -2056,6 +2423,33 @@ mod tests {
         assert_eq!(first.chars().nth(13), Some(':'), "{lines:?}");
     }
 
+    #[test]
+    fn web_prompt_images_decode_to_image_content() {
+        let data = base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\npng");
+        let images = load_web_prompt_images(&[WebPromptImage {
+            data,
+            name: Some("clip.png".into()),
+        }])
+        .unwrap();
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].mime_type, "image/png");
+        assert!(!images[0].data.is_empty());
+    }
+
+    #[test]
+    fn web_prompt_images_enforce_count_limit() {
+        let images = vec![
+            WebPromptImage {
+                data: String::new(),
+                name: None,
+            };
+            crate::images::MAX_IMAGES_PER_MESSAGE + 1
+        ];
+        let err = load_web_prompt_images(&images).unwrap_err().to_string();
+        assert!(err.contains("exceeds per-message cap"), "{err}");
+    }
+
     #[tokio::test]
     async fn endpoints_return_state_accept_commands_and_stream_snapshots() {
         let (command_tx, mut command_rx) = mpsc::unbounded_channel::<WebCommand>();
@@ -2112,7 +2506,35 @@ mod tests {
             .unwrap();
         assert_eq!(accepted["accepted"], true);
         match command_rx.recv().await.unwrap() {
-            WebCommand::Submit { text } => assert_eq!(text, "hello"),
+            WebCommand::Submit { text, images } => {
+                assert_eq!(text, "hello");
+                assert!(images.is_empty());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let accepted: serde_json::Value = client
+            .post(format!("{base}/prompt"))
+            .json(&json!({
+                "text": "describe",
+                "images": [{
+                    "name": "clip.png",
+                    "data": base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\npng")
+                }]
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(accepted["accepted"], true);
+        match command_rx.recv().await.unwrap() {
+            WebCommand::Submit { text, images } => {
+                assert_eq!(text, "describe");
+                assert_eq!(images.len(), 1);
+                assert_eq!(images[0].name.as_deref(), Some("clip.png"));
+            }
             other => panic!("unexpected command: {other:?}"),
         }
 
