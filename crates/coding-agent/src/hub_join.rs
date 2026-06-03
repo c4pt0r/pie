@@ -109,11 +109,13 @@ pub(crate) async fn join_default_hub_with_options(options: HubJoinOptions) -> Re
         );
     }
 
-    if let Err(e) = open_browser(&start.login_url).await {
-        if options.manual_login.is_some() {
-            notify_manual_login(&options, &start.login_url, callback_port, format!("{e:#}"));
-        } else {
-            return Err(e).context("open browser for hub login");
+    if !options.show_manual_login {
+        if let Err(e) = open_browser(&start.login_url).await {
+            if options.manual_login.is_some() {
+                notify_manual_login(&options, &start.login_url, callback_port, format!("{e:#}"));
+            } else {
+                return Err(e).context("open browser for hub login");
+            }
         }
     }
 

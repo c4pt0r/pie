@@ -106,14 +106,21 @@ async fn await_background(outcome: commands::CommandOutcome) {
     }
 }
 
-async fn wait_for_login_url(slot: &Arc<Mutex<Option<String>>>) -> String {
+fn faux_hub_login_url() -> String {
+    "http://127.0.0.1/login?req=command-exchange-request-1&state=state-public".into()
+}
+
+async fn wait_for_output(capture: &OutputCapture, needle: &str) {
     for _ in 0..100 {
-        if let Some(url) = slot.lock().unwrap().clone() {
-            return url;
+        if capture.text().contains(needle) {
+            return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    panic!("login URL was not captured");
+    panic!(
+        "output did not contain {needle:?}; got:\n{}",
+        capture.text()
+    );
 }
 
 fn faux_model() -> pie_ai::Model {
@@ -446,22 +453,10 @@ async fn hub_join_command_success_outputs_safe_user_text_and_stores_credential()
     let mcp_server = FauxHubMcpServer::start().await;
     let _mcp_endpoint_guard =
         mcp_loader::install_test_built_in_hub_endpoint(mcp_server.endpoint.clone());
-    let login_url_seen = Arc::new(Mutex::new(None::<String>));
-    let (callback_tx, callback_rx) = tokio::sync::oneshot::channel::<String>();
-    let callback_tx = parking_lot::Mutex::new(Some(callback_tx));
-    let state_for_opener = server.state.clone();
-    let login_for_opener = login_url_seen.clone();
-    let _join_guard = hub_join::install_test_join_runtime(server.origin.clone(), move |url| {
-        *login_for_opener.lock().unwrap() = Some(url.to_string());
-        let url = url.to_string();
-        let state = state_for_opener.clone();
-        let tx = callback_tx.lock().take();
-        tokio::spawn(async move {
-            let callback_text = drive_faux_hub_join_browser(&url, state).await;
-            if let Some(tx) = tx {
-                let _ = tx.send(callback_text);
-            }
-        });
+    let opener_called = Arc::new(Mutex::new(false));
+    let opener_called_for_opener = opener_called.clone();
+    let _join_guard = hub_join::install_test_join_runtime(server.origin.clone(), move |_| {
+        *opener_called_for_opener.lock().unwrap() = true;
         Ok(())
     });
     let capture = OutputCapture::install();
@@ -481,12 +476,22 @@ async fn hub_join_command_success_outputs_safe_user_text_and_stores_credential()
     };
 
     let outcome = commands::dispatch("/hub join", &registry, &ctx).await;
-    await_background(outcome).await;
-    let callback_text = callback_rx.await.unwrap();
+    let task = match outcome {
+        commands::CommandOutcome::BackgroundTask { task, .. } => tokio::spawn(task),
+        other => panic!("expected BackgroundTask outcome, got {other:?}"),
+    };
+    let login_url = faux_hub_login_url();
+    wait_for_output(&capture, &login_url).await;
+    assert!(
+        !*opener_called.lock().unwrap(),
+        "/hub join must not auto-open a browser"
+    );
+    let callback_text = drive_faux_hub_join_browser(&login_url, server.state.clone()).await;
     assert!(
         callback_text.contains("Hub login complete"),
         "{callback_text}"
     );
+    task.await.unwrap();
 
     let store = auth::AuthStore::load().unwrap();
     match store
@@ -538,11 +543,6 @@ async fn hub_join_command_success_outputs_safe_user_text_and_stores_credential()
         text.contains("Open this login link in a browser:"),
         "{text}"
     );
-    let login_url = login_url_seen
-        .lock()
-        .unwrap()
-        .clone()
-        .expect("captured login url");
     assert!(text.contains(&login_url), "{text}");
     let secrets = hub_auth::HubAuthSecretFragments {
         hub_token: Some("hub_agent_command_join_secret"),
@@ -576,7 +576,7 @@ async fn hub_join_command_success_outputs_safe_user_text_and_stores_credential()
 }
 
 #[tokio::test]
-async fn hub_join_command_browser_open_failure_prints_manual_login_and_keeps_waiting() {
+async fn hub_join_command_prints_manual_login_and_keeps_waiting_without_browser_opener() {
     let _auth_guard = auth::ENV_LOCK.lock().unwrap();
     let _pie_guard = PIE_DIR_ENV_LOCK.lock().unwrap();
     let temp = tempfile::tempdir().unwrap();
@@ -587,11 +587,11 @@ async fn hub_join_command_browser_open_failure_prints_manual_login_and_keeps_wai
     let mcp_server = FauxHubMcpServer::start().await;
     let _mcp_endpoint_guard =
         mcp_loader::install_test_built_in_hub_endpoint(mcp_server.endpoint.clone());
-    let login_url_seen = Arc::new(Mutex::new(None::<String>));
-    let login_for_opener = login_url_seen.clone();
-    let _join_guard = hub_join::install_test_join_runtime(server.origin.clone(), move |url| {
-        *login_for_opener.lock().unwrap() = Some(url.to_string());
-        anyhow::bail!("no browser available")
+    let opener_called = Arc::new(Mutex::new(false));
+    let opener_called_for_opener = opener_called.clone();
+    let _join_guard = hub_join::install_test_join_runtime(server.origin.clone(), move |_| {
+        *opener_called_for_opener.lock().unwrap() = true;
+        Ok(())
     });
     let capture = OutputCapture::install();
 
@@ -615,7 +615,8 @@ async fn hub_join_command_browser_open_failure_prints_manual_login_and_keeps_wai
         other => panic!("expected BackgroundTask outcome, got {other:?}"),
     };
     let task = tokio::spawn(task);
-    let login_url = wait_for_login_url(&login_url_seen).await;
+    let login_url = faux_hub_login_url();
+    wait_for_output(&capture, &login_url).await;
     let text = capture.text();
     assert!(
         text.contains("Hub login fallback: copy this link to complete hub login"),
@@ -626,8 +627,11 @@ async fn hub_join_command_browser_open_failure_prints_manual_login_and_keeps_wai
         "{text}"
     );
     assert!(text.contains(&login_url), "{text}");
-    assert!(text.contains("SSH"), "{text}");
     assert!(text.contains("callback port"), "{text}");
+    assert!(
+        !*opener_called.lock().unwrap(),
+        "/hub join must not auto-open a browser"
+    );
     let callback_port = {
         let state = server.state.lock().await;
         let start = state.start.as_ref().expect("captured start request");
@@ -665,7 +669,7 @@ async fn hub_join_command_browser_open_failure_prints_manual_login_and_keeps_wai
 }
 
 #[tokio::test]
-async fn hub_join_command_prints_manual_login_before_successful_opener_can_block() {
+async fn hub_join_command_never_invokes_successful_browser_opener() {
     let _auth_guard = auth::ENV_LOCK.lock().unwrap();
     let _pie_guard = PIE_DIR_ENV_LOCK.lock().unwrap();
     let temp = tempfile::tempdir().unwrap();
@@ -676,10 +680,10 @@ async fn hub_join_command_prints_manual_login_before_successful_opener_can_block
     let mcp_server = FauxHubMcpServer::start().await;
     let _mcp_endpoint_guard =
         mcp_loader::install_test_built_in_hub_endpoint(mcp_server.endpoint.clone());
-    let login_url_seen = Arc::new(Mutex::new(None::<String>));
-    let login_for_opener = login_url_seen.clone();
-    let _join_guard = hub_join::install_test_join_runtime(server.origin.clone(), move |url| {
-        *login_for_opener.lock().unwrap() = Some(url.to_string());
+    let opener_called = Arc::new(Mutex::new(false));
+    let opener_called_for_opener = opener_called.clone();
+    let _join_guard = hub_join::install_test_join_runtime(server.origin.clone(), move |_| {
+        *opener_called_for_opener.lock().unwrap() = true;
         Ok(())
     });
     let capture = OutputCapture::install();
@@ -704,16 +708,8 @@ async fn hub_join_command_prints_manual_login_before_successful_opener_can_block
         other => panic!("expected BackgroundTask outcome, got {other:?}"),
     };
     let task = tokio::spawn(task);
-    let login_url = wait_for_login_url(&login_url_seen).await;
-    for _ in 0..100 {
-        if capture
-            .text()
-            .contains("Open this login link in a browser:")
-        {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
+    let login_url = faux_hub_login_url();
+    wait_for_output(&capture, "Open this login link in a browser:").await;
 
     let text = capture.text();
     assert!(
@@ -727,6 +723,10 @@ async fn hub_join_command_prints_manual_login_before_successful_opener_can_block
     assert!(!text.contains("code_verifier"), "{text}");
     assert!(!text.contains("/callback"), "{text}");
     assert!(!text.contains("Browser auto-open unavailable"), "{text}");
+    assert!(
+        !*opener_called.lock().unwrap(),
+        "/hub join must not auto-open a browser"
+    );
     task.abort();
 }
 
@@ -801,11 +801,8 @@ async fn hub_join_command_ssh_session_skips_browser_opener_and_prints_manual_log
     assert!(!text.contains("code_verifier"), "{text}");
     assert!(!text.contains("/callback"), "{text}");
 
-    let callback_text = drive_faux_hub_join_browser(
-        "http://127.0.0.1/login?req=command-exchange-request-1&state=state-public",
-        server.state.clone(),
-    )
-    .await;
+    let callback_text =
+        drive_faux_hub_join_browser(&faux_hub_login_url(), server.state.clone()).await;
     assert!(
         callback_text.contains("Hub login complete"),
         "{callback_text}"
@@ -833,13 +830,10 @@ async fn hub_join_command_redacts_secret_like_join_identity() {
     let mcp_server = FauxHubMcpServer::start().await;
     let _mcp_endpoint_guard =
         mcp_loader::install_test_built_in_hub_endpoint(mcp_server.endpoint.clone());
-    let state_for_opener = server.state.clone();
-    let _join_guard = hub_join::install_test_join_runtime(server.origin.clone(), move |url| {
-        let url = url.to_string();
-        let state = state_for_opener.clone();
-        tokio::spawn(async move {
-            let _ = drive_faux_hub_join_browser(&url, state).await;
-        });
+    let opener_called = Arc::new(Mutex::new(false));
+    let opener_called_for_opener = opener_called.clone();
+    let _join_guard = hub_join::install_test_join_runtime(server.origin.clone(), move |_| {
+        *opener_called_for_opener.lock().unwrap() = true;
         Ok(())
     });
     let capture = OutputCapture::install();
@@ -859,7 +853,17 @@ async fn hub_join_command_redacts_secret_like_join_identity() {
     };
 
     let outcome = commands::dispatch("/hub join", &registry, &ctx).await;
-    await_background(outcome).await;
+    let task = match outcome {
+        commands::CommandOutcome::BackgroundTask { task, .. } => tokio::spawn(task),
+        other => panic!("expected BackgroundTask outcome, got {other:?}"),
+    };
+    wait_for_output(&capture, &faux_hub_login_url()).await;
+    assert!(
+        !*opener_called.lock().unwrap(),
+        "/hub join must not auto-open a browser"
+    );
+    let _ = drive_faux_hub_join_browser(&faux_hub_login_url(), server.state.clone()).await;
+    task.await.unwrap();
 
     let text = capture.text();
     assert!(text.contains("Joined hub as unknown@hub"), "{text}");
