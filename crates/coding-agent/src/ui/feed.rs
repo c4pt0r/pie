@@ -575,7 +575,7 @@ fn display_prefix(timestamp: Option<&str>, label: &str) -> String {
 }
 
 fn current_time_label() -> Option<String> {
-    Some(Local::now().format("%H:%M").to_string())
+    Some(Local::now().format("%Y-%m-%d %H:%M").to_string())
 }
 
 fn message_timestamp_label(timestamp_ms: i64) -> Option<String> {
@@ -586,13 +586,9 @@ fn message_timestamp_label(timestamp_ms: i64) -> Option<String> {
     Some(format_timestamp_label(dt, Local::now()))
 }
 
-fn format_timestamp_label(timestamp: DateTime<Utc>, now: DateTime<Local>) -> String {
+fn format_timestamp_label(timestamp: DateTime<Utc>, _now: DateTime<Local>) -> String {
     let local = timestamp.with_timezone(&Local);
-    if local.date_naive() == now.date_naive() {
-        local.format("%H:%M").to_string()
-    } else {
-        local.format("%m-%d %H:%M").to_string()
-    }
+    local.format("%Y-%m-%d %H:%M").to_string()
 }
 
 /// Split `text` on newlines, word-wrap each paragraph to `width`, and push styled lines. An
@@ -790,6 +786,13 @@ mod tests {
             .join("\n")
     }
 
+    fn assert_full_timestamp_prefix(row: &str, rendered: &str) {
+        assert_eq!(row.chars().nth(4), Some('-'), "{rendered}");
+        assert_eq!(row.chars().nth(7), Some('-'), "{rendered}");
+        assert_eq!(row.chars().nth(10), Some(' '), "{rendered}");
+        assert_eq!(row.chars().nth(13), Some(':'), "{rendered}");
+    }
+
     #[test]
     fn text_deltas_accumulate_into_one_assistant_block() {
         let mut feed = Feed::new();
@@ -902,17 +905,17 @@ mod tests {
         let rows: Vec<&str> = rendered.lines().collect();
 
         assert!(rows[0].contains("you ▸ hello"), "{rendered}");
-        assert_eq!(rows[0].chars().nth(2), Some(':'), "{rendered}");
+        assert_full_timestamp_prefix(rows[0], &rendered);
         assert!(rows[2].contains("ai ▸ hi"), "{rendered}");
-        assert_eq!(rows[2].chars().nth(2), Some(':'), "{rendered}");
+        assert_full_timestamp_prefix(rows[2], &rendered);
         assert!(rows[3].contains("⚙ read(path=\"x\")"), "{rendered}");
-        assert_eq!(rows[3].chars().nth(2), Some(':'), "{rendered}");
+        assert_full_timestamp_prefix(rows[3], &rendered);
         assert!(rows[4].contains("    ok"), "{rendered}");
-        assert_eq!(rows[4].chars().nth(2), Some(':'), "{rendered}");
+        assert_full_timestamp_prefix(rows[4], &rendered);
     }
 
     #[test]
-    fn timestamp_label_includes_date_for_non_today_history() {
+    fn timestamp_label_includes_full_date_and_time() {
         let today = Local
             .with_ymd_and_hms(2026, 5, 27, 14, 37, 0)
             .single()
@@ -924,8 +927,11 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
 
-        assert_eq!(format_timestamp_label(same_day, today), "14:37");
-        assert_eq!(format_timestamp_label(previous_day, today), "05-26 23:59");
+        assert_eq!(format_timestamp_label(same_day, today), "2026-05-27 14:37");
+        assert_eq!(
+            format_timestamp_label(previous_day, today),
+            "2026-05-26 23:59"
+        );
     }
 
     #[test]

@@ -264,13 +264,19 @@ async fn delete_session_cmd(repo: &JsonlSessionRepo, id: &str) -> Result<()> {
     Ok(())
 }
 
-async fn select_resume_session(repo: &JsonlSessionRepo) -> Result<pie_agent_core::Session> {
+#[derive(Debug, PartialEq, Eq)]
+enum ResumeSessionChoice {
+    Clean,
+    Resume(usize),
+}
+
+async fn select_resume_session(
+    repo: &JsonlSessionRepo,
+    cwd: &std::path::Path,
+) -> Result<(pie_agent_core::Session, bool)> {
     let mut entries = session::list_entries(repo).await?;
     if entries.is_empty() {
         anyhow::bail!("no sessions to resume in {}", repo.root().display());
-    }
-    if entries.len() == 1 {
-        return Ok(repo.open(&entries[0].path).await?);
     }
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         anyhow::bail!(
@@ -280,20 +286,24 @@ async fn select_resume_session(repo: &JsonlSessionRepo) -> Result<pie_agent_core
     }
 
     entries.reverse();
-    let selected = prompt_for_resume_session(repo, &entries).await?;
-    Ok(repo.open(&entries[selected].path).await?)
+    match prompt_for_resume_session(repo, &entries).await? {
+        ResumeSessionChoice::Clean => Ok((session::create(repo, cwd).await?, false)),
+        ResumeSessionChoice::Resume(selected) => {
+            Ok((repo.open(&entries[selected].path).await?, true))
+        }
+    }
 }
 
 async fn prompt_for_resume_session(
     repo: &JsonlSessionRepo,
     entries: &[session::SessionEntry],
-) -> Result<usize> {
+) -> Result<ResumeSessionChoice> {
     let menu = render_resume_session_menu(repo.root(), entries);
     let count = entries.len();
     tokio::task::spawn_blocking(move || {
         print!("{menu}");
         loop {
-            print!("resume session [1-{count}, q to cancel]: ");
+            print!("resume session [0 clean, 1-{count}, q to cancel]: ");
             std::io::stdout().flush().ok();
 
             let mut line = String::new();
@@ -305,7 +315,7 @@ async fn prompt_for_resume_session(
                 anyhow::bail!("resume selection cancelled");
             }
             match parse_resume_session_choice(&line, count) {
-                Ok(Some(index)) => return Ok(index),
+                Ok(Some(choice)) => return Ok(choice),
                 Ok(None) => anyhow::bail!("resume selection cancelled"),
                 Err(e) => {
                     println!("{e}");
@@ -322,6 +332,7 @@ fn render_resume_session_menu(
     entries: &[session::SessionEntry],
 ) -> String {
     let mut out = format!("sessions in {}:\n", repo_root.display());
+    out.push_str("  0. clean  start a new session\n");
     for (idx, entry) in entries.iter().enumerate() {
         let preview = entry.preview.as_deref().unwrap_or("");
         let id_short: String = entry.id.chars().take(16).collect();
@@ -336,18 +347,21 @@ fn render_resume_session_menu(
     out
 }
 
-fn parse_resume_session_choice(input: &str, count: usize) -> Result<Option<usize>> {
+fn parse_resume_session_choice(input: &str, count: usize) -> Result<Option<ResumeSessionChoice>> {
     let trimmed = input.trim();
     if trimmed.eq_ignore_ascii_case("q") || trimmed.eq_ignore_ascii_case("quit") {
         return Ok(None);
     }
-    let number = trimmed
-        .parse::<usize>()
-        .with_context(|| format!("enter a number from 1 to {count}, or q to cancel"))?;
-    if !(1..=count).contains(&number) {
-        anyhow::bail!("enter a number from 1 to {count}, or q to cancel");
+    let number = trimmed.parse::<usize>().with_context(|| {
+        format!("enter 0 for clean, a number from 1 to {count}, or q to cancel")
+    })?;
+    if number == 0 {
+        return Ok(Some(ResumeSessionChoice::Clean));
     }
-    Ok(Some(number - 1))
+    if !(1..=count).contains(&number) {
+        anyhow::bail!("enter 0 for clean, a number from 1 to {count}, or q to cancel");
+    }
+    Ok(Some(ResumeSessionChoice::Resume(number - 1)))
 }
 
 async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo) -> Result<()> {
@@ -369,14 +383,13 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
     // reopen, while `--continue` keeps the old "newest session" fast path.
     let should_resume = cli.resume || cli.continue_ || cli.resume_id.is_some();
     let (session, resumed) = if should_resume {
-        let s = if let Some(id) = cli.resume_id.as_deref() {
-            session::resume(&repo, Some(id)).await?
+        if let Some(id) = cli.resume_id.as_deref() {
+            (session::resume(&repo, Some(id)).await?, true)
         } else if cli.resume {
-            select_resume_session(&repo).await?
+            select_resume_session(&repo, &cwd).await?
         } else {
-            session::resume(&repo, None).await?
-        };
-        (s, true)
+            (session::resume(&repo, None).await?, true)
+        }
     } else {
         let s = session::create(&repo, &cwd).await?;
         (s, false)
@@ -1299,17 +1312,27 @@ mod tests {
 
     #[test]
     fn resume_session_choice_parses_numbers_and_cancel() {
-        assert_eq!(parse_resume_session_choice("1\n", 3).unwrap(), Some(0));
-        assert_eq!(parse_resume_session_choice("3", 3).unwrap(), Some(2));
+        assert_eq!(
+            parse_resume_session_choice("0", 3).unwrap(),
+            Some(ResumeSessionChoice::Clean)
+        );
+        assert_eq!(
+            parse_resume_session_choice("1\n", 3).unwrap(),
+            Some(ResumeSessionChoice::Resume(0))
+        );
+        assert_eq!(
+            parse_resume_session_choice("3", 3).unwrap(),
+            Some(ResumeSessionChoice::Resume(2))
+        );
         assert_eq!(parse_resume_session_choice("q", 3).unwrap(), None);
         assert_eq!(parse_resume_session_choice("QUIT", 3).unwrap(), None);
 
         let err = parse_resume_session_choice("4", 3).unwrap_err().to_string();
-        assert!(err.contains("enter a number from 1 to 3"), "{err}");
+        assert!(err.contains("enter 0 for clean"), "{err}");
         let err = parse_resume_session_choice("abc", 3)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("enter a number from 1 to 3"), "{err}");
+        assert!(err.contains("enter 0 for clean"), "{err}");
     }
 
     #[test]
@@ -1331,6 +1354,7 @@ mod tests {
         let menu = render_resume_session_menu(std::path::Path::new("/tmp/sessions"), &entries);
 
         assert!(menu.contains("sessions in /tmp/sessions:"), "{menu}");
+        assert!(menu.contains("0. clean  start a new session"), "{menu}");
         assert!(menu.contains("1. 0123456789abcdef"), "{menu}");
         assert!(menu.contains("2026-06-03T09:00:00Z"), "{menu}");
         assert!(menu.contains("fix parser"), "{menu}");

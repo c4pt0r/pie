@@ -2049,11 +2049,11 @@ mod tests {
             lines.last().is_some_and(|line| line.contains("line 249")),
             "{lines:?}"
         );
-        assert_eq!(
-            lines.first().and_then(|line| line.chars().nth(2)),
-            Some(':'),
-            "{lines:?}"
-        );
+        let first = lines.first().expect("first line");
+        assert_eq!(first.chars().nth(4), Some('-'), "{lines:?}");
+        assert_eq!(first.chars().nth(7), Some('-'), "{lines:?}");
+        assert_eq!(first.chars().nth(10), Some(' '), "{lines:?}");
+        assert_eq!(first.chars().nth(13), Some(':'), "{lines:?}");
     }
 
     #[tokio::test]
