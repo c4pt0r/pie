@@ -229,6 +229,7 @@ impl Registry {
         r.register(Arc::new(GoalCommand));
         r.register(Arc::new(GoalStartCommand));
         r.register(Arc::new(HubCommand));
+        r.register(Arc::new(ConfigCommand));
         r.register(Arc::new(TriggersCommand));
         r.register(Arc::new(NewTriggerCommand));
         r.register(Arc::new(CronCommand));
@@ -1121,6 +1122,124 @@ async fn print_goal_status(ctx: &CommandCtx<'_>) {
 const HUB_SERVER_NAME: &str = crate::mcp_loader::BUILT_IN_HUB_SERVER_NAME;
 const HUB_TOKEN_REF: &str = crate::mcp_loader::BUILT_IN_HUB_TOKEN_REF;
 const HUB_DEFAULT_ENDPOINT: &str = crate::mcp_loader::BUILT_IN_HUB_ENDPOINT;
+
+/// `/config` — view or set persistent pie settings stored in `~/.pie/config.toml`.
+/// Currently exposes `hub.inject`; mutations persist and apply to the running session.
+struct ConfigCommand;
+
+#[async_trait]
+impl SlashCommand for ConfigCommand {
+    fn name(&self) -> &'static str {
+        "config"
+    }
+
+    fn description(&self) -> &'static str {
+        "view or set persistent pie settings (~/.pie/config.toml)"
+    }
+
+    fn usage(&self) -> &'static str {
+        "[hub.inject [off|summary|run]]"
+    }
+
+    async fn run(&self, argv: &[String], _ctx: &CommandCtx<'_>) -> CommandOutcome {
+        match argv.first().map(String::as_str) {
+            None => config_show_all(),
+            Some("hub.inject") => match argv.get(1).map(String::as_str) {
+                None => config_show_hub_inject(),
+                Some(value) if argv.len() == 2 => config_set_hub_inject(value).await,
+                _ => CommandOutcome::Error("usage: /config hub.inject [off|summary|run]".into()),
+            },
+            Some(other) => CommandOutcome::Error(format!(
+                "unknown config key {other:?}; known keys: hub.inject"
+            )),
+        }
+    }
+}
+
+fn config_show_all() -> CommandOutcome {
+    cprintln!("Config (~/.pie/config.toml):");
+    cprintln!(
+        "  hub.inject    {} (persisted: {})",
+        crate::config::hub_inject_mode().as_str(),
+        persisted_hub_inject().as_deref().unwrap_or("unset → off")
+    );
+    cprintln!("set with: /config hub.inject <off|summary|run>");
+    CommandOutcome::Handled
+}
+
+fn config_show_hub_inject() -> CommandOutcome {
+    cprintln!(
+        "hub.inject = {} (persisted: {})",
+        crate::config::hub_inject_mode().as_str(),
+        persisted_hub_inject().as_deref().unwrap_or("unset → off")
+    );
+    cprintln!("  off      notifications run through the normal trigger path; nothing enters chat");
+    cprintln!("  summary  inject the notification summary into the chat (no model turn)");
+    cprintln!("  run      inject the summary and run one model turn so the agent reacts");
+    CommandOutcome::Handled
+}
+
+async fn config_set_hub_inject(value: &str) -> CommandOutcome {
+    let Some(mode) = crate::config::HubInjectMode::from_token(value) else {
+        return CommandOutcome::Error(format!(
+            "invalid value {value:?}; expected off, summary, or run"
+        ));
+    };
+    if let Err(e) = write_config_hub_inject(&crate::config::base_dir(), mode).await {
+        return CommandOutcome::Error(format!("save config: {e}"));
+    }
+    crate::config::set_hub_inject_mode(mode);
+    cprintln!(
+        "set hub.inject = {} (applied now; saved to ~/.pie/config.toml)",
+        mode.as_str()
+    );
+    CommandOutcome::Handled
+}
+
+fn persisted_hub_inject() -> Option<String> {
+    let path = crate::config::base_dir().join("config.toml");
+    let text = std::fs::read_to_string(path).ok()?;
+    crate::config::parse_hub_inject_setting(&text)
+        .ok()
+        .flatten()
+}
+
+/// Read-modify-write `config.toml`'s `[hub] inject` key, preserving every other section.
+async fn write_config_hub_inject(
+    base_dir: &std::path::Path,
+    mode: crate::config::HubInjectMode,
+) -> anyhow::Result<()> {
+    let path = base_dir.join("config.toml");
+    let mut table: toml::Table = match tokio::fs::read_to_string(&path).await {
+        Ok(text) if !text.trim().is_empty() => text
+            .parse()
+            .map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?,
+        _ => toml::Table::new(),
+    };
+    let entry = table
+        .entry("hub".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    if !entry.is_table() {
+        *entry = toml::Value::Table(toml::Table::new());
+    }
+    if let Some(hub_table) = entry.as_table_mut() {
+        hub_table.insert(
+            "inject".to_string(),
+            toml::Value::String(mode.as_str().to_string()),
+        );
+    }
+    let serialized =
+        toml::to_string_pretty(&table).map_err(|e| anyhow::anyhow!("serialize config: {e}"))?;
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| anyhow::anyhow!("create {}: {e}", parent.display()))?;
+    }
+    tokio::fs::write(&path, serialized)
+        .await
+        .map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))?;
+    Ok(())
+}
 
 struct HubCommand;
 
@@ -3631,6 +3750,39 @@ pub async fn dispatch(input: &str, registry: &Registry, ctx: &CommandCtx<'_>) ->
 mod tests {
     use super::*;
     use pie_agent_core::SkillSource;
+
+    #[tokio::test]
+    async fn write_config_hub_inject_sets_key_and_preserves_other_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        // Pre-existing unrelated section must survive the read-modify-write.
+        std::fs::write(&path, "[triggers]\npoll_interval_secs = 42\n").unwrap();
+
+        write_config_hub_inject(dir.path(), crate::config::HubInjectMode::Run)
+            .await
+            .unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            crate::config::parse_hub_inject_setting(&text).unwrap(),
+            Some("run".to_string())
+        );
+        assert_eq!(
+            crate::config::parse_trigger_poll_interval_secs(&text).unwrap(),
+            Some(42),
+            "existing [triggers] section must be preserved"
+        );
+
+        // Overwrite in place.
+        write_config_hub_inject(dir.path(), crate::config::HubInjectMode::Summary)
+            .await
+            .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            crate::config::parse_hub_inject_setting(&text).unwrap(),
+            Some("summary".to_string())
+        );
+    }
 
     struct EnvGuard {
         key: &'static str,

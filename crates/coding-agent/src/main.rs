@@ -118,6 +118,13 @@ struct Cli {
     #[arg(long = "trigger-poll-secs", value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..))]
     trigger_poll_secs: Option<u64>,
 
+    /// How built-in hub notifications reach the session: `off` (default — run through the
+    /// normal trigger path, nothing injected into chat), `summary` (inject the summary
+    /// verbatim), or `run` (inject and run one model turn so the agent reacts). Overrides
+    /// `[hub] inject` in `~/.pie/config.toml`; change it live with `/config hub.inject`.
+    #[arg(long = "hub-inject", value_name = "MODE", value_enum)]
+    hub_inject: Option<config::HubInjectMode>,
+
     /// Show LLM call debug logs in the conversation feed, including trigger/sub-agent calls.
     #[arg(long)]
     debug: bool,
@@ -366,6 +373,11 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
     let (trigger_poll_secs, trigger_config_diagnostic) =
         read_trigger_poll_interval_secs(&config::base_dir(), cli.trigger_poll_secs).await;
     triggers::dynamic::set_dynamic_trigger_poll_interval_secs(trigger_poll_secs);
+    // Built-in hub notification delivery (`/config hub.inject`): CLI > config.toml > off.
+    // Published process-wide so the trigger action hook routes hub pushes live.
+    let (hub_inject_mode, hub_inject_diagnostic) =
+        read_hub_inject_mode(&config::base_dir(), cli.hub_inject).await;
+    config::set_hub_inject_mode(hub_inject_mode);
     let resolved_builtins =
         match builtin_skills::resolve_builtins(&cli.builtin_skill, &config_enabled_builtins) {
             Ok(r) => r,
@@ -610,6 +622,9 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
         app.system_line(diag);
     }
     if let Some(diag) = trigger_config_diagnostic {
+        app.error_line(diag);
+    }
+    if let Some(diag) = hub_inject_diagnostic {
         app.error_line(diag);
     }
     if !combined_skills.is_empty() {
@@ -988,6 +1003,36 @@ async fn read_trigger_poll_interval_secs(
     }
 }
 
+/// Resolve the built-in hub notification mode: CLI `--hub-inject` wins, else `[hub] inject`
+/// from `config.toml`, else the default (off). Returns an optional diagnostic for an
+/// invalid config value (the default is used in that case).
+async fn read_hub_inject_mode(
+    base_dir: &std::path::Path,
+    cli_override: Option<config::HubInjectMode>,
+) -> (config::HubInjectMode, Option<String>) {
+    if let Some(mode) = cli_override {
+        return (mode, None);
+    }
+    let path = base_dir.join("config.toml");
+    let Ok(text) = tokio::fs::read_to_string(&path).await else {
+        return (config::HubInjectMode::default(), None);
+    };
+    match config::parse_hub_inject_setting(&text) {
+        Ok(Some(token)) => (
+            config::HubInjectMode::from_token(&token).unwrap_or_default(),
+            None,
+        ),
+        Ok(None) => (config::HubInjectMode::default(), None),
+        Err(err) => (
+            config::HubInjectMode::default(),
+            Some(format!(
+                "hub: ignoring invalid inject mode in {}: {err}",
+                path.display()
+            )),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1051,6 +1096,7 @@ mod tests {
             image: Vec::new(),
             builtin_skill: Vec::new(),
             trigger_poll_secs: None,
+            hub_inject: None,
             debug: false,
             yes: false,
             hub_first_contact_decision: None,

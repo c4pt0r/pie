@@ -617,13 +617,20 @@ pub fn direct_inject_action_hook(
                 TriggerSource::Mcp { server_name, .. } => Some(server_name.clone()),
                 _ => None,
             };
-            let run = server
-                .as_ref()
-                .is_some_and(|s| inject_and_run_servers.contains(s));
-            let summary_only = !run
-                && server
+            // The built-in hub's delivery is a live setting (`/config hub.inject`),
+            // resolved per push rather than from the startup `mcp.toml` flag sets.
+            let hub_mode = server
+                .as_deref()
+                .and_then(crate::config::hub_inject_mode_for_server);
+            let run = matches!(hub_mode, Some(crate::config::HubInjectMode::Run))
+                || server
                     .as_ref()
-                    .is_some_and(|s| inject_summary_servers.contains(s));
+                    .is_some_and(|s| inject_and_run_servers.contains(s));
+            let summary_only = !run
+                && (matches!(hub_mode, Some(crate::config::HubInjectMode::Summary))
+                    || server
+                        .as_ref()
+                        .is_some_and(|s| inject_summary_servers.contains(s)));
 
             if run {
                 // Inject the summary as the prompt and run one turn in the parent context.
@@ -1203,6 +1210,76 @@ mod tests {
         CredentialScope, PayloadVisibility, ReplacementPolicy, SourceKind, TriggerAuthority,
         TriggerRuntimeSnapshot, TriggerSource,
     };
+
+    #[tokio::test]
+    async fn direct_inject_action_hook_routes_built_in_hub_by_live_mode() {
+        fn hub_ctx() -> BeforeTriggerActionContext {
+            BeforeTriggerActionContext {
+                trigger: Trigger {
+                    source: TriggerSource::Mcp {
+                        server_name: crate::config::HUB_SERVER_NAME.into(),
+                        method: "notifications/message".into(),
+                    },
+                    source_kind: SourceKind::Mcp,
+                    source_label: "mcp:pie-hub".into(),
+                    event_label: "message".into(),
+                    payload_visibility: PayloadVisibility::Local,
+                    payload_summary: Some("alice@team sent: ping".into()),
+                    payload: None,
+                    idempotency_key: "hub-key".into(),
+                    replacement_policy: ReplacementPolicy::Drop,
+                    trace_id: "trace-hub".into(),
+                    authority: TriggerAuthority {
+                        principal_id: "hub".into(),
+                        principal_label: "hub".into(),
+                        credential_scope: CredentialScope::User,
+                        allowed_source_actions: vec![],
+                        expires_at: None,
+                    },
+                    received_at: Utc::now(),
+                },
+                runtime: TriggerRuntimeSnapshot {
+                    dedup_entries: 0,
+                    active_traces: 0,
+                    accepted_total: 0,
+                    deduped_total: 0,
+                    cycle_suppressed_total: 0,
+                },
+            }
+        }
+
+        // No mcp.toml inject servers and a rule-free inner hook: only the live hub mode
+        // decides the hub's delivery; `off` must fall through to the sub-agent path.
+        let hook = direct_inject_action_hook(
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+            before_trigger_action_hook(DynamicTriggerRegistry::new()),
+        );
+
+        crate::config::set_hub_inject_mode(crate::config::HubInjectMode::Off);
+        let off = hook(hub_ctx(), CancellationToken::new()).await;
+        assert!(
+            matches!(off.delivery, TriggerDelivery::SubAgent),
+            "off → sub-agent"
+        );
+
+        crate::config::set_hub_inject_mode(crate::config::HubInjectMode::Summary);
+        let summary = hook(hub_ctx(), CancellationToken::new()).await;
+        assert!(
+            matches!(summary.delivery, TriggerDelivery::InjectSummary),
+            "summary → inject summary"
+        );
+
+        crate::config::set_hub_inject_mode(crate::config::HubInjectMode::Run);
+        let run = hook(hub_ctx(), CancellationToken::new()).await;
+        assert!(
+            matches!(run.delivery, TriggerDelivery::InjectAndRun),
+            "run → inject and run"
+        );
+        assert!(run.prompt.contains("alice@team sent: ping"));
+
+        crate::config::set_hub_inject_mode(crate::config::HubInjectMode::Off);
+    }
 
     #[test]
     fn new_trigger_permission_reason_is_value_free() {

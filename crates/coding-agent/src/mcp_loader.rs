@@ -21,7 +21,7 @@ use crate::config::base_dir;
 use crate::tools::mcp_adapter::McpAgentTool;
 use crate::triggers::McpNotificationHook;
 
-pub const BUILT_IN_HUB_SERVER_NAME: &str = "pie-hub";
+pub const BUILT_IN_HUB_SERVER_NAME: &str = crate::config::HUB_SERVER_NAME;
 pub const BUILT_IN_HUB_TOKEN_REF: &str = "pie-hub:default";
 pub const BUILT_IN_HUB_ENDPOINT: &str = "https://pie.0xfefe.me/mcp";
 
