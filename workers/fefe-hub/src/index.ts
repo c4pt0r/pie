@@ -20,6 +20,7 @@ const SUMMARY_LIMIT_CHARS = 240;
 const LIST_DEFAULT_LIMIT = 50;
 const LIST_MAX_LIMIT = 100;
 const AUTH_EXCHANGE_TTL_SECONDS = 5 * 60;
+const MANUAL_AUTH_CODE_CHARS = 8;
 const WEB_SESSION_COOKIE = "hub_session";
 const WEB_SESSION_MAX_AGE_SECONDS = 30 * 24 * 60 * 60;
 
@@ -910,6 +911,9 @@ export class HubApp {
       if (url.pathname === "/auth/exchange_code" && request.method === "POST") {
         return json(await this.exchangeAuthCode(await readJsonObject(request)));
       }
+      if (url.pathname === "/auth/exchange_manual_code" && request.method === "POST") {
+        return json(await this.exchangeManualAuthCode(await readJsonObject(request)));
+      }
       if (url.pathname === "/auth/register" && request.method === "POST") {
         return json(await this.registerUser(await readJsonObject(request)));
       }
@@ -1172,14 +1176,32 @@ export class HubApp {
   }
 
   private loginPage(url: URL): Response {
-    return this.loginForm(url.searchParams.get("req") ?? "", url.searchParams.get("state") ?? null);
+    return this.loginForm(
+      url.searchParams.get("req") ?? "",
+      url.searchParams.get("state") ?? null,
+      undefined,
+      200,
+      url.searchParams.get("manual") === "1" ? "manual" : "loopback",
+    );
   }
 
-  private loginForm(reqRaw: string, stateRaw: string | null, errorMessage?: string, status = 200): Response {
+  private loginForm(
+    reqRaw: string,
+    stateRaw: string | null,
+    errorMessage?: string,
+    status = 200,
+    delivery: "loopback" | "manual" = "loopback",
+  ): Response {
     const req = escapeHtml(reqRaw);
     const state = escapeHtml(stateRaw ?? "");
     const hiddenFields = `<input type="hidden" name="exchange_request_id" value="${req}">
-      <input type="hidden" name="state" value="${state}">`;
+      <input type="hidden" name="state" value="${state}">
+      <input type="hidden" name="delivery" value="${delivery}">`;
+    const manualUrl = new URLSearchParams({ req: reqRaw, ...(stateRaw ? { state: stateRaw } : {}), manual: "1" }).toString();
+    const loopbackUrl = new URLSearchParams({ req: reqRaw, ...(stateRaw ? { state: stateRaw } : {}) }).toString();
+    const fallback = delivery === "manual"
+      ? `<p class="fallback"><a href="/login?${escapeHtml(loopbackUrl)}">Use loopback callback instead</a></p>`
+      : `<p class="fallback"><a href="/login?${escapeHtml(manualUrl)}">Using SSH or no browser callback? Show a one-time paste code instead.</a></p>`;
     const error = errorMessage
       ? `<div class="notice error" role="alert">Could not complete sign-in: ${escapeHtml(errorMessage)}</div>`
       : "";
@@ -1278,6 +1300,11 @@ export class HubApp {
     font-size: 13px;
     font-weight: 400;
   }
+  .fallback {
+    margin-top: 16px;
+    font-size: 14px;
+  }
+  .fallback a { color: var(--accent); }
   button {
     min-height: 42px;
     border: 0;
@@ -1368,6 +1395,7 @@ export class HubApp {
       <button type="submit">Create account</button>
     </form>
   </section>
+  ${fallback}
 </main>
 </html>`;
     return new Response(body, {
@@ -1390,13 +1418,15 @@ export class HubApp {
         typeof args.state === "string" ? args.state : "",
         browserLoginErrorMessage(publicError, args),
         publicError.code === -32009 || publicError.code === -32010 ? 401 : 400,
+        optionalDelivery(args.delivery),
       );
     }
   }
 
   private async completeBrowserLogin(args: Record<string, unknown>): Promise<Response> {
-    ensureOnly(args, ["mode", "username", "password", "namespace", "exchange_request_id", "state"]);
+    ensureOnly(args, ["mode", "username", "password", "namespace", "exchange_request_id", "state", "delivery"]);
     const mode = optionalString(args.mode, "mode") ?? "login";
+    const delivery = optionalDelivery(args.delivery);
     const username = normalizeName(stringField(args, "username"), "username");
     const password = stringField(args, "password");
     const exchange = await this.requireAuthExchange(stringField(args, "exchange_request_id"), stringField(args, "state"));
@@ -1407,6 +1437,11 @@ export class HubApp {
       user = await this.requireUserPassword(username, password, optionalString(args.namespace, "namespace"));
     } else {
       throw ERR.schemaInvalid(["mode must be login or register"]);
+    }
+    if (delivery === "manual") {
+      const manualCode = manualAuthCode();
+      await this.store.issueAuthExchangeCode(exchange.exchange_request_id, await sha256Hex(manualCode), user.user_id, nowIso());
+      return this.manualCodePage(manualCode);
     }
     const code = `hub_code_${crypto.randomUUID()}_${randomSecret(24)}`;
     await this.store.issueAuthExchangeCode(exchange.exchange_request_id, await sha256Hex(code), user.user_id, nowIso());
@@ -1421,6 +1456,30 @@ export class HubApp {
         "referrer-policy": "no-referrer",
       },
     });
+  }
+
+  private manualCodePage(manualCode: string): Response {
+    return html(`<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Paste code into pie</title>
+<style>
+  :root { color-scheme: light dark; --bg: #f6f7f9; --fg: #15181d; --muted: #5d6673; --line: #d9dee7; --panel: #ffffff; }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 24px; background: var(--bg); color: var(--fg); font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  main { width: min(520px, 100%); padding: 24px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+  h1 { margin: 0 0 8px; font-size: 24px; }
+  p { margin: 0 0 16px; color: var(--muted); line-height: 1.45; }
+  code { display: block; padding: 16px; border: 1px solid var(--line); border-radius: 8px; text-align: center; font: 700 28px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: 0.08em; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #101215; --fg: #eff2f5; --muted: #a2aab5; --line: #303844; --panel: #181c22; } }
+</style>
+<main>
+  <h1>Paste this code into pie</h1>
+  <p>This one-time code expires with the join request and can be used only once.</p>
+  <code>${escapeHtml(manualCode)}</code>
+</main>
+</html>`);
   }
 
   private async chatPage(request: Request): Promise<Response> {
@@ -1603,14 +1662,38 @@ ${chatStyle()}
 
   private async exchangeAuthCode(args: Record<string, unknown>): Promise<unknown> {
     ensureOnly(args, ["exchange_request_id", "code", "state", "code_verifier"]);
-    const exchange = await this.requireAuthExchange(stringField(args, "exchange_request_id"), stringField(args, "state"));
+    return this.exchangeIssuedCode({
+      exchange_request_id: stringField(args, "exchange_request_id"),
+      code: validateLoopbackAuthCode(stringField(args, "code")),
+      state: stringField(args, "state"),
+      code_verifier: stringField(args, "code_verifier"),
+    });
+  }
+
+  private async exchangeManualAuthCode(args: Record<string, unknown>): Promise<unknown> {
+    ensureOnly(args, ["exchange_request_id", "manual_code", "state", "code_verifier"]);
+    return this.exchangeIssuedCode({
+      exchange_request_id: stringField(args, "exchange_request_id"),
+      code: validateManualAuthCode(stringField(args, "manual_code")),
+      state: stringField(args, "state"),
+      code_verifier: stringField(args, "code_verifier"),
+    });
+  }
+
+  private async exchangeIssuedCode(args: {
+    exchange_request_id: string;
+    code: string;
+    state: string;
+    code_verifier: string;
+  }): Promise<unknown> {
+    const exchange = await this.requireAuthExchange(args.exchange_request_id, args.state);
     if (!exchange.code_hash || !exchange.user_id || exchange.used_at) {
       throw ERR.authInvalid();
     }
-    if ((await sha256Hex(validateOpaqueValue(stringField(args, "code"), "code"))) !== exchange.code_hash) {
+    if ((await sha256Hex(args.code)) !== exchange.code_hash) {
       throw ERR.authInvalid();
     }
-    const verifier = validatePkceValue(stringField(args, "code_verifier"), "code_verifier");
+    const verifier = validatePkceValue(args.code_verifier, "code_verifier");
     if ((await sha256Base64Url(verifier)) !== exchange.code_challenge) {
       throw ERR.authInvalid();
     }
@@ -1622,6 +1705,10 @@ ${chatStyle()}
     if (!consumed) {
       throw ERR.authInvalid();
     }
+    return this.issueJoinCredential(user);
+  }
+
+  private async issueJoinCredential(user: UserRecord): Promise<unknown> {
     const agent = await this.ensureDefaultAgent(user);
     const hubToken = await this.issueAgentToken(agent, DEFAULT_PERMISSIONS.slice());
     return {
@@ -2385,6 +2472,12 @@ function optionalString(value: unknown, field: string): string | null {
   return value;
 }
 
+function optionalDelivery(value: unknown): "loopback" | "manual" {
+  if (value === undefined || value === null || value === "loopback") return "loopback";
+  if (value === "manual") return "manual";
+  throw ERR.schemaInvalid(["delivery must be loopback or manual"]);
+}
+
 function optionalObject(value: unknown, field: string): Record<string, unknown> {
   if (value === undefined || value === null) return {};
   if (!isObject(value) || Array.isArray(value)) {
@@ -2476,6 +2569,22 @@ function validateOpaqueValue(value: string, field: string): string {
     throw ERR.schemaInvalid([`${field} must be an opaque URL-safe value`]);
   }
   return value;
+}
+
+function validateLoopbackAuthCode(value: string): string {
+  const code = validateOpaqueValue(value, "code");
+  if (!code.startsWith("hub_code_")) {
+    throw ERR.schemaInvalid(["code must be a browser loopback auth code"]);
+  }
+  return code;
+}
+
+function validateManualAuthCode(value: string): string {
+  const compact = value.trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
+  if (!/^[A-Z2-9]{8}$/.test(compact)) {
+    throw ERR.schemaInvalid(["manual_code must be an 8-character one-time code"]);
+  }
+  return `${compact.slice(0, 4)}-${compact.slice(4)}`;
 }
 
 function validatePkceValue(value: string, field: string): string {
@@ -2671,6 +2780,14 @@ function randomSecret(bytes: number): string {
   const raw = new Uint8Array(bytes);
   crypto.getRandomValues(raw);
   return [...raw].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function manualAuthCode(): string {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const raw = new Uint8Array(MANUAL_AUTH_CODE_CHARS);
+  crypto.getRandomValues(raw);
+  const compact = [...raw].map((byte) => alphabet[byte % alphabet.length]).join("");
+  return `${compact.slice(0, 4)}-${compact.slice(4)}`;
 }
 
 function nowIso(): string {

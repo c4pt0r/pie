@@ -98,9 +98,109 @@ test("browser login page separates sign in from registration and explains namesp
   assert.match(body, /name="mode" value="login"/);
   assert.match(body, /name="mode" value="register"/);
   assert.match(body, /name="namespace"/);
+  assert.match(body, /Show a one-time paste code instead/);
+  assert.match(body, /manual=1/);
   assert.match(body, /autocomplete="current-password"/);
   assert.match(body, /autocomplete="new-password"/);
   assert.doesNotMatch(body, /hub_agent_|hub_hs_|hub_code_|code_verifier|Authorization|pie-hub:default/);
+});
+
+test("manual auth code joins with one-time short code and bounded output", async () => {
+  const app = createTestApp();
+  const verifier = "m".repeat(64);
+  const state = "state_manual_join";
+  const start = await authStart(app, {
+    verifier,
+    state,
+    loopback: "http://127.0.0.1:49170/callback",
+  });
+
+  const manualPage = await browserManualLoginResponse(app, start.exchange_request_id, state, {
+    mode: "register",
+    username: "manualalice",
+    namespace: "manualteam",
+    password: "manualalice-password-123",
+  });
+
+  assert.equal(manualPage.status, 200);
+  assert.match(manualPage.headers.get("content-type"), /text\/html/);
+  const html = await manualPage.text();
+  assert.match(html, /Paste this code into pie/);
+  const manualCode = html.match(/[A-Z2-9]{4}-[A-Z2-9]{4}/)?.[0];
+  assert.match(manualCode, /^[A-Z2-9]{4}-[A-Z2-9]{4}$/);
+  assert.doesNotMatch(html, /hub_agent_|hub_hs_|hub_code_|code_verifier|127\.0\.0\.1|state_manual_join/);
+
+  const wrong = await exchangeManualCode(app, {
+    exchange_request_id: start.exchange_request_id,
+    manual_code: "ZZZZ-ZZZZ",
+    state,
+    code_verifier: verifier,
+  });
+  assert.equal(wrong.status, 401);
+  assert.doesNotMatch(JSON.stringify(await wrong.json()), /hub_agent_|hub_hs_|hub_code_|[A-Z2-9]{4}-[A-Z2-9]{4}|state_manual_join|mmmm/);
+
+  const loopbackEndpoint = await exchangeCode(app, {
+    exchange_request_id: start.exchange_request_id,
+    code: manualCode,
+    state,
+    code_verifier: verifier,
+  });
+  assert.equal(loopbackEndpoint.status, 400);
+  assert.doesNotMatch(JSON.stringify(await loopbackEndpoint.json()), /hub_agent_|hub_hs_|hub_code_|state_manual_join|mmmm/);
+
+  const exchange = await exchangeManualJson(app, {
+    exchange_request_id: start.exchange_request_id,
+    manual_code: manualCode,
+    state,
+    code_verifier: verifier,
+  });
+  assert.equal(exchange.handle, "manualalice");
+  assert.equal(exchange.namespace, "manualteam");
+  assert.match(exchange.hub_token, /^hub_agent_/);
+
+  const replay = await exchangeManualCode(app, {
+    exchange_request_id: start.exchange_request_id,
+    manual_code: manualCode,
+    state,
+    code_verifier: verifier,
+  });
+  assert.equal(replay.status, 401);
+  assert.doesNotMatch(JSON.stringify(await replay.json()), /hub_agent_|hub_hs_|hub_code_|state_manual_join|mmmm/);
+});
+
+test("manual auth code expiry is bounded and does not issue a token", async () => {
+  const store = new MemoryStore();
+  const app = createTestApp(store);
+  const verifier = "x".repeat(64);
+  const state = "state_manual_expired";
+  const start = await authStart(app, {
+    verifier,
+    state,
+    loopback: "http://127.0.0.1:49171/callback",
+  });
+
+  const manualPage = await browserManualLoginResponse(app, start.exchange_request_id, state, {
+    mode: "register",
+    username: "manualexpired",
+    namespace: "manualteam",
+    password: "manualexpired-password-123",
+  });
+  const html = await manualPage.text();
+  const manualCode = html.match(/[A-Z2-9]{4}-[A-Z2-9]{4}/)?.[0];
+  assert.match(manualCode, /^[A-Z2-9]{4}-[A-Z2-9]{4}$/);
+
+  const record = await store.getAuthExchange(start.exchange_request_id);
+  assert.ok(record);
+  await store.createAuthExchange({ ...record, expires_at: "2000-01-01T00:00:00.000Z" });
+
+  const expired = await exchangeManualCode(app, {
+    exchange_request_id: start.exchange_request_id,
+    manual_code: manualCode,
+    state,
+    code_verifier: verifier,
+  });
+  assert.equal(expired.status, 401);
+  assert.doesNotMatch(JSON.stringify(await expired.json()), /hub_agent_|hub_hs_|hub_code_|state_manual_expired|xxxx/);
 });
 
 test("browser login form errors are bounded HTML and do not crash worker", async () => {
@@ -935,12 +1035,21 @@ async function browserLogin(app, exchangeRequestId, state, { mode, username, nam
 }
 
 async function browserLoginResponse(app, exchangeRequestId, state, { mode, username, namespace, password }) {
+  return browserLoginResponseWithDelivery(app, exchangeRequestId, state, { mode, username, namespace, password, delivery: "loopback" });
+}
+
+async function browserManualLoginResponse(app, exchangeRequestId, state, { mode, username, namespace, password }) {
+  return browserLoginResponseWithDelivery(app, exchangeRequestId, state, { mode, username, namespace, password, delivery: "manual" });
+}
+
+async function browserLoginResponseWithDelivery(app, exchangeRequestId, state, { mode, username, namespace, password, delivery }) {
   const form = new URLSearchParams({
     mode,
     username,
     password,
     exchange_request_id: exchangeRequestId,
     state,
+    delivery,
   });
   if (namespace) {
     form.set("namespace", namespace);
@@ -961,9 +1070,24 @@ async function exchangeJson(app, body) {
   return response.json();
 }
 
+async function exchangeManualJson(app, body) {
+  const response = await exchangeManualCode(app, body);
+  assert.equal(response.status, 200);
+  return response.json();
+}
+
 async function exchangeCode(app, body) {
   return app.fetch(
     new Request(`${BASE}/auth/exchange_code`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+async function exchangeManualCode(app, body) {
+  return app.fetch(
+    new Request(`${BASE}/auth/exchange_manual_code`, {
       method: "POST",
       body: JSON.stringify(body),
     }),
