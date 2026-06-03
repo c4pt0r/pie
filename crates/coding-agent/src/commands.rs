@@ -1174,7 +1174,7 @@ async fn hub_join(argv: &[String], ctx: &CommandCtx<'_>) -> CommandOutcome {
         label: "hub join",
         task: Box::pin(async move {
             cprintln!("Starting hub join for pie.0xfefe.me...");
-            cprintln!("Waiting for browser login; you can keep using pie while this completes.");
+            cprintln!("Waiting for hub login; you can keep using pie while this completes.");
             if let Err(e) = run_hub_join_background(&harness).await {
                 cprintln!(
                     "hub join failed: {}",
@@ -1190,9 +1190,11 @@ async fn run_hub_join_background(harness: &Arc<AgentHarness>) -> anyhow::Result<
     let manual_login_flag = manual_login_printed.clone();
     let options = crate::hub_join::HubJoinOptions {
         manual_login: Some(std::sync::Arc::new(move |manual| {
-            manual_login_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            if manual_login_flag.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
             cprintln!(
-                "Browser auto-open unavailable: {}",
+                "Hub login fallback: {}",
                 redact_hub_status_text(&manual.reason)
             );
             cprintln!("Open this login link in a browser:");
@@ -1202,6 +1204,7 @@ async fn run_hub_join_background(harness: &Arc<AgentHarness>) -> anyhow::Result<
                 manual.callback_port
             );
         })),
+        show_manual_login: true,
         ..Default::default()
     };
     match crate::hub_join::join_default_hub_with_options(options).await {

@@ -37,6 +37,7 @@ pub struct HubJoinOptions {
     pub auth_origin: String,
     pub timeout: Duration,
     pub manual_login: Option<Arc<dyn Fn(ManualLogin) + Send + Sync>>,
+    pub show_manual_login: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -52,6 +53,7 @@ impl Default for HubJoinOptions {
             auth_origin: test_auth_origin().unwrap_or_else(|| HUB_DEFAULT_AUTH_ORIGIN.into()),
             timeout: JOIN_TIMEOUT,
             manual_login: None,
+            show_manual_login: false,
         }
     }
 }
@@ -97,14 +99,19 @@ pub(crate) async fn join_default_hub_with_options(options: HubJoinOptions) -> Re
     )
     .await?;
 
+    let callback_port = listener.local_addr()?.port();
+    if options.show_manual_login {
+        notify_manual_login(
+            &options,
+            &start.login_url,
+            callback_port,
+            "copy this link to complete hub login".into(),
+        );
+    }
+
     if let Err(e) = open_browser(&start.login_url).await {
         if options.manual_login.is_some() {
-            notify_manual_login(
-                &options,
-                &start.login_url,
-                listener.local_addr()?.port(),
-                format!("{e:#}"),
-            );
+            notify_manual_login(&options, &start.login_url, callback_port, format!("{e:#}"));
         } else {
             return Err(e).context("open browser for hub login");
         }

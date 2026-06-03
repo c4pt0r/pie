@@ -530,27 +530,34 @@ async fn hub_join_command_success_outputs_safe_user_text_and_stores_credential()
     assert!(text.contains("Joined hub as alice@dongxu"), "{text}");
     assert!(text.contains("hub is connected"), "{text}");
     assert!(!text.contains("restart pie"), "{text}");
+    assert!(
+        text.contains("Hub login fallback: copy this link to complete hub login"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Open this login link in a browser:"),
+        "{text}"
+    );
     let login_url = login_url_seen
         .lock()
         .unwrap()
         .clone()
         .expect("captured login url");
+    assert!(text.contains(&login_url), "{text}");
     let secrets = hub_auth::HubAuthSecretFragments {
         hub_token: Some("hub_agent_command_join_secret"),
         code: Some(&exchange.code),
         state: Some(&exchange.state),
         code_verifier: Some(&exchange.code_verifier),
         loopback_redirect_uri: Some(&start.loopback_redirect_uri),
-        login_url: Some(&login_url),
+        login_url: None,
     };
     secrets.assert_absent_from("/hub join command output", &text);
     assert!(!text.contains("pie-hub:default"), "{text}");
     assert!(!text.contains("hub_agent_"), "{text}");
     assert!(!text.contains("hub_code_"), "{text}");
     assert!(!text.contains("state_"), "{text}");
-    assert!(!text.contains("127.0.0.1"), "{text}");
-    assert!(!text.contains("http://"), "{text}");
-    assert!(!text.contains("https://"), "{text}");
+    assert!(!text.contains("/callback"), "{text}");
     assert!(!text.contains("MCP"), "{text}");
     assert!(!text.contains("mcp"), "{text}");
     assert!(!text.contains("config"), "{text}");
@@ -610,7 +617,10 @@ async fn hub_join_command_browser_open_failure_prints_manual_login_and_keeps_wai
     let task = tokio::spawn(task);
     let login_url = wait_for_login_url(&login_url_seen).await;
     let text = capture.text();
-    assert!(text.contains("Browser auto-open unavailable"), "{text}");
+    assert!(
+        text.contains("Hub login fallback: copy this link to complete hub login"),
+        "{text}"
+    );
     assert!(
         text.contains("Open this login link in a browser:"),
         "{text}"
@@ -652,6 +662,72 @@ async fn hub_join_command_browser_open_failure_prints_manual_login_and_keeps_wai
     assert!(text.contains("hub is connected"), "{text}");
     assert!(!text.contains("redirect parameter"), "{text}");
     assert!(!text.contains("inside the login URL"), "{text}");
+}
+
+#[tokio::test]
+async fn hub_join_command_prints_manual_login_before_successful_opener_can_block() {
+    let _auth_guard = auth::ENV_LOCK.lock().unwrap();
+    let _pie_guard = PIE_DIR_ENV_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let _pie_dir = EnvGuard::set("PIE_DIR", temp.path());
+    auth::AuthStore::default().save().unwrap();
+
+    let server = FauxHubJoinServer::start().await;
+    let mcp_server = FauxHubMcpServer::start().await;
+    let _mcp_endpoint_guard =
+        mcp_loader::install_test_built_in_hub_endpoint(mcp_server.endpoint.clone());
+    let login_url_seen = Arc::new(Mutex::new(None::<String>));
+    let login_for_opener = login_url_seen.clone();
+    let _join_guard = hub_join::install_test_join_runtime(server.origin.clone(), move |url| {
+        *login_for_opener.lock().unwrap() = Some(url.to_string());
+        Ok(())
+    });
+    let capture = OutputCapture::install();
+
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage as Arc<dyn SessionStorage>);
+    let opts = AgentHarnessOptions::new(faux_model(), session);
+    let harness = Arc::new(AgentHarness::new(opts));
+    let registry = commands::Registry::with_builtins();
+    let cwd = std::env::current_dir().unwrap();
+    let ctx = commands::CommandCtx {
+        harness: &harness,
+        session_id: "test-hub-join-command-opener-success-fallback-first",
+        log_path: None::<&PathBuf>,
+        tool_count: 0,
+        cwd: &cwd,
+    };
+
+    let outcome = commands::dispatch("/hub join", &registry, &ctx).await;
+    let task = match outcome {
+        commands::CommandOutcome::BackgroundTask { task, .. } => task,
+        other => panic!("expected BackgroundTask outcome, got {other:?}"),
+    };
+    let task = tokio::spawn(task);
+    let login_url = wait_for_login_url(&login_url_seen).await;
+    for _ in 0..100 {
+        if capture
+            .text()
+            .contains("Open this login link in a browser:")
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let text = capture.text();
+    assert!(
+        text.contains("Hub login fallback: copy this link to complete hub login"),
+        "{text}"
+    );
+    assert!(text.contains(&login_url), "{text}");
+    assert!(text.contains("callback port"), "{text}");
+    assert!(!text.contains("hub_agent_"), "{text}");
+    assert!(!text.contains("hub_code_"), "{text}");
+    assert!(!text.contains("code_verifier"), "{text}");
+    assert!(!text.contains("/callback"), "{text}");
+    assert!(!text.contains("Browser auto-open unavailable"), "{text}");
+    task.abort();
 }
 
 #[tokio::test]
@@ -708,8 +784,8 @@ async fn hub_join_command_ssh_session_skips_browser_opener_and_prints_manual_log
 
     let text = capture.text();
     assert!(
-        text.contains("SSH session detected"),
-        "expected SSH fallback, got:\n{text}"
+        text.contains("Hub login fallback: copy this link to complete hub login"),
+        "expected manual login fallback, got:\n{text}"
     );
     assert!(
         text.contains("Open this login link in a browser:"),
