@@ -101,6 +101,7 @@ struct WebSkillsSnapshot {
 struct WebSkillSnapshot {
     name: String,
     source: String,
+    file_path: String,
     enabled: bool,
 }
 
@@ -470,6 +471,7 @@ impl App {
                     .map(|skill| WebSkillSnapshot {
                         name: skill.name.clone(),
                         source: skill.source.label().to_string(),
+                        file_path: skill.file_path.clone(),
                         enabled: !skill.disable_model_invocation,
                     })
                     .collect(),
@@ -1486,15 +1488,17 @@ function renderList(items) {
 }
 
 function renderSkills(skills) {
+  const skillDetail = (skill) =>
+    skill.name + ' / ' + skill.source + ' / ' + (skill.enabled ? 'enabled' : 'disabled') + ' / path ' + skill.file_path;
   const allSkills = skills.items.map((skill) =>
-    skill.name + ' / ' + skill.source + ' / ' + (skill.enabled ? 'enabled' : 'disabled')
+    skillDetail(skill)
   );
   const enabledSkills = skills.items
     .filter((skill) => skill.enabled)
-    .map((skill) => skill.name + ' / ' + skill.source);
+    .map(skillDetail);
   const disabledSkills = skills.items
     .filter((skill) => !skill.enabled)
-    .map((skill) => skill.name + ' / ' + skill.source);
+    .map(skillDetail);
   return node('div', {}, [
     metrics([
       ['enabled', skills.enabled, 'Enabled skills', enabledSkills],
