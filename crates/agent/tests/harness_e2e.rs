@@ -1,7 +1,10 @@
 //! End-to-end AgentHarness test. Wires Agent + Session + a synthetic StreamFn and verifies the
 //! prompt → assistant → session-persist cycle.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use pie_agent_core::{
     AgentHarness, AgentHarnessOptions, AgentMessage, CompactionSettings, HarnessEvent,
@@ -1135,6 +1138,90 @@ async fn force_compact_fallback_when_session_branch_read_fails() {
         saw_diagnostic,
         "expected a diagnostic HarnessEvent::Compaction (summary starts with 'compaction skipped:') — events: {:?}",
         events_snapshot
+    );
+}
+
+#[tokio::test]
+async fn auto_compaction_bounds_oversized_summary_prompt_before_provider_call() {
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage.clone() as Arc<dyn SessionStorage>);
+    let mut model = faux_model();
+    model.context_window = 5_000;
+
+    let saw_compaction = Arc::new(AtomicBool::new(false));
+    let saw_compaction_clone = saw_compaction.clone();
+    let stream_fn: StreamFn = Arc::new(move |_, context, _| {
+        let is_compaction = context
+            .system_prompt
+            .as_deref()
+            .is_some_and(|prompt| prompt.contains("context summarization assistant"));
+        if is_compaction {
+            let text = match &context.messages[0] {
+                pie_ai::Message::User(user) => match &user.content {
+                    pie_ai::UserContent::Text(text) => text.as_str(),
+                    _ => "",
+                },
+                _ => "",
+            };
+            assert!(
+                text.len().div_ceil(4) < 4_000,
+                "auto-compaction must bound the summarizer prompt before provider dispatch; got {} chars",
+                text.len()
+            );
+            assert!(
+                text.contains("[compaction note: omitted"),
+                "bounded summary prompt must disclose omitted content"
+            );
+            saw_compaction_clone.store(true, Ordering::SeqCst);
+        }
+
+        let (stream, mut sender) = AssistantMessageEventStream::new();
+        tokio::spawn(async move {
+            let msg = AssistantMessage {
+                role: AssistantRole::Assistant,
+                content: vec![ContentBlock::text(if is_compaction {
+                    "bounded compaction summary"
+                } else {
+                    "normal assistant reply"
+                })],
+                api: pie_ai::Api::from("faux"),
+                provider: pie_ai::Provider::from("faux"),
+                model: "faux".into(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                timestamp: 0,
+            };
+            sender.push(AssistantMessageEvent::Done {
+                reason: DoneReason::Stop,
+                message: msg,
+            });
+        });
+        stream
+    });
+
+    let mut opts = AgentHarnessOptions::new(model, session.clone());
+    opts.stream_fn = Some(stream_fn);
+    opts.compaction = CompactionSettings {
+        enabled: true,
+        reserve_tokens: 1_000,
+        keep_recent_tokens: 1,
+    };
+    let harness = AgentHarness::new(opts);
+
+    for i in 0..80 {
+        let message = user_message(&format!("old-msg-{i} {}", "x".repeat(1600)));
+        session.append_message(message.clone()).await.unwrap();
+        harness.agent().state().messages.push(message);
+    }
+
+    harness.prompt("next turn").await.unwrap();
+    assert!(
+        saw_compaction.load(Ordering::SeqCst),
+        "oversized context should trigger bounded auto-compaction"
     );
 }
 

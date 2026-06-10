@@ -278,6 +278,7 @@ pub fn find_cut_point(
 // ──────────────────────────────────────────────────────────────────────────────────────────
 
 pub const SUMMARIZATION_SYSTEM_PROMPT: &str = "You are a context summarization assistant. Your task is to read a conversation between a user and an AI coding assistant, then produce a structured summary preserving the user's intent, the files and topics discussed, decisions made, and any work still in progress. Be concise but thorough; the assistant will rely on your summary instead of replaying the dropped messages.";
+const DEFAULT_SUMMARY_PROMPT_TOKEN_BUDGET: u64 = 64_000;
 
 /// Synchronous helper used by the LLM-backed `generate_summary`. Serialize a message list into a
 /// compact text dump for the summarizer prompt.
@@ -339,11 +340,117 @@ pub fn serialize_conversation(messages: &[AgentMessage]) -> String {
     out
 }
 
+fn summarization_prompt_budget(model: &Model, settings: &CompactionSettings) -> u64 {
+    if model.context_window == 0 {
+        return DEFAULT_SUMMARY_PROMPT_TOKEN_BUDGET;
+    }
+    let available = model.context_window.saturating_sub(settings.reserve_tokens);
+    if available > 0 {
+        available as u64
+    } else {
+        (model.context_window as u64)
+            .saturating_mul(4)
+            .saturating_div(5)
+    }
+}
+
+fn summarize_prompt_estimate_tokens(
+    messages: &[AgentMessage],
+    custom_instructions: Option<&str>,
+) -> u64 {
+    let custom = custom_instructions
+        .map(|s| s.len().div_ceil(4) as u64)
+        .unwrap_or_default();
+    let framing = 512;
+    let system = SUMMARIZATION_SYSTEM_PROMPT.len().div_ceil(4) as u64;
+    let conversation: u64 = messages.iter().map(estimate_tokens).sum();
+    framing + system + custom + conversation
+}
+
+fn trim_messages_for_summary_budget(
+    messages: &[AgentMessage],
+    budget_tokens: u64,
+    custom_instructions: Option<&str>,
+) -> Vec<AgentMessage> {
+    if summarize_prompt_estimate_tokens(messages, custom_instructions) <= budget_tokens {
+        return messages.to_vec();
+    }
+
+    let mut kept = Vec::new();
+    let mut total = 512
+        + SUMMARIZATION_SYSTEM_PROMPT.len().div_ceil(4) as u64
+        + custom_instructions
+            .map(|s| s.len().div_ceil(4) as u64)
+            .unwrap_or_default();
+    for message in messages.iter().rev() {
+        let message_tokens = estimate_tokens(message);
+        if !kept.is_empty() && total + message_tokens > budget_tokens {
+            break;
+        }
+        kept.push(message.clone());
+        total = total.saturating_add(message_tokens);
+        if total >= budget_tokens {
+            break;
+        }
+    }
+    kept.reverse();
+    let omitted = messages.len().saturating_sub(kept.len());
+    if omitted > 0 {
+        kept.insert(
+            0,
+            AgentMessage::Llm(PiMessage::User(pie_ai::UserMessage {
+                role: pie_ai::UserRole::User,
+                content: pie_ai::UserContent::Text(format!(
+                    "[compaction note: omitted {omitted} older message(s) before summarization because the session exceeded the summarizer prompt budget]"
+                )),
+                timestamp: chrono::Utc::now().timestamp_millis(),
+            })),
+        );
+    }
+    kept
+}
+
+fn serialize_conversation_for_summary_budget(
+    messages: &[AgentMessage],
+    budget_tokens: u64,
+    custom_instructions: Option<&str>,
+) -> String {
+    let messages = trim_messages_for_summary_budget(messages, budget_tokens, custom_instructions);
+    let conversation = serialize_conversation(&messages);
+    let overhead_tokens = 512
+        + SUMMARIZATION_SYSTEM_PROMPT.len().div_ceil(4) as u64
+        + custom_instructions
+            .map(|s| s.len().div_ceil(4) as u64)
+            .unwrap_or_default();
+    let available_chars = budget_tokens
+        .saturating_sub(overhead_tokens)
+        .saturating_mul(4) as usize;
+    let note = "[compaction note: omitted older serialized content before summarization because the session exceeded the summarizer prompt budget]\n\n";
+    if conversation.len() <= available_chars {
+        return conversation;
+    }
+    if available_chars <= note.len() {
+        return note.chars().take(available_chars).collect();
+    }
+
+    let keep_chars = available_chars - note.len();
+    let suffix: String = conversation
+        .chars()
+        .rev()
+        .take(keep_chars)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{note}{suffix}")
+}
+
 #[derive(Clone)]
 pub struct GenerateSummaryRequest {
     pub model: Model,
     pub messages: Vec<AgentMessage>,
     pub custom_instructions: Option<String>,
+    pub prompt_budget_tokens: Option<u64>,
     /// Override stream function; falls back to `pie_ai::stream_simple` when `None`.
     pub stream_fn: Option<StreamFn>,
 }
@@ -360,12 +467,20 @@ pub async fn generate_summary(
     cancel: CancellationToken,
 ) -> Result<GenerateSummaryOutput, SummarizeError> {
     let mut prompt = SUMMARIZATION_SYSTEM_PROMPT.to_string();
-    if let Some(extra) = request.custom_instructions {
+    if let Some(extra) = request.custom_instructions.as_deref() {
         prompt.push_str("\n\n");
-        prompt.push_str(&extra);
+        prompt.push_str(extra);
     }
 
-    let convo = serialize_conversation(&request.messages);
+    let convo = if let Some(budget) = request.prompt_budget_tokens {
+        serialize_conversation_for_summary_budget(
+            &request.messages,
+            budget,
+            request.custom_instructions.as_deref(),
+        )
+    } else {
+        serialize_conversation(&request.messages)
+    };
     let user = pie_ai::UserMessage {
         role: pie_ai::UserRole::User,
         content: pie_ai::UserContent::Text(convo),
@@ -495,6 +610,7 @@ pub async fn compact(
         .collect();
     let out = generate_summary(
         GenerateSummaryRequest {
+            prompt_budget_tokens: Some(summarization_prompt_budget(&model, settings)),
             model,
             messages,
             custom_instructions,
@@ -514,6 +630,7 @@ pub async fn compact(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     fn user(text: &str) -> AgentMessage {
         AgentMessage::Llm(PiMessage::User(pie_ai::UserMessage {
@@ -521,6 +638,24 @@ mod tests {
             content: pie_ai::UserContent::Text(text.into()),
             timestamp: 0,
         }))
+    }
+
+    fn model_with_context_window(context_window: u32) -> Model {
+        Model {
+            id: "faux".into(),
+            name: "Faux".into(),
+            api: pie_ai::Api::from("faux"),
+            provider: pie_ai::Provider::from("faux"),
+            base_url: String::new(),
+            reasoning: false,
+            thinking_level_map: None,
+            input: vec![],
+            cost: pie_ai::ModelCost::default(),
+            context_window,
+            max_tokens: 0,
+            headers: None,
+            compat: None,
+        }
     }
 
     fn assistant(text: &str, stop: pie_ai::StopReason, usage: Usage) -> AgentMessage {
@@ -554,6 +689,104 @@ mod tests {
         assert!(should_compact(127_000, 128_000, &s));
         // Well below threshold does not trigger.
         assert!(!should_compact(80_000, 128_000, &s));
+    }
+
+    #[tokio::test]
+    async fn compact_trims_summarizer_prompt_before_provider_call() {
+        let mut entries = Vec::new();
+        let mut parent_id = None;
+        for i in 0..80 {
+            let id = format!("entry-{i}");
+            entries.push(SessionTreeEntry::Message {
+                id: id.clone(),
+                parent_id: parent_id.clone(),
+                timestamp: "t".into(),
+                message: user(&format!("old-msg-{i} {}", "x".repeat(1600))),
+            });
+            parent_id = Some(id);
+        }
+
+        let captured = Arc::new(Mutex::new(String::new()));
+        let captured_clone = captured.clone();
+        let stream_fn: StreamFn = Arc::new(move |_, context, _| {
+            let text = match &context.messages[0] {
+                PiMessage::User(user) => match &user.content {
+                    pie_ai::UserContent::Text(text) => text.clone(),
+                    _ => String::new(),
+                },
+                _ => String::new(),
+            };
+            assert!(
+                text.len().div_ceil(4) < 4_000,
+                "summarizer prompt must be trimmed before provider dispatch; got {} chars",
+                text.len()
+            );
+            assert!(
+                text.contains("[compaction note: omitted"),
+                "trimmed prompt must disclose omitted older content"
+            );
+            assert!(
+                !text.contains("old-msg-0"),
+                "oldest oversized content should not reach the provider prompt"
+            );
+            *captured_clone.lock().unwrap() = text;
+
+            let (stream, mut sender) = pie_ai::AssistantMessageEventStream::new();
+            tokio::spawn(async move {
+                let msg = AssistantMessage {
+                    role: pie_ai::AssistantRole::Assistant,
+                    content: vec![pie_ai::ContentBlock::text("bounded summary")],
+                    api: pie_ai::Api::from("faux"),
+                    provider: pie_ai::Provider::from("faux"),
+                    model: "faux".into(),
+                    response_model: None,
+                    response_id: None,
+                    diagnostics: None,
+                    usage: Usage::default(),
+                    stop_reason: pie_ai::StopReason::Stop,
+                    error_message: None,
+                    timestamp: 0,
+                };
+                sender.push(AssistantMessageEvent::Done {
+                    reason: pie_ai::DoneReason::Stop,
+                    message: msg,
+                });
+            });
+            stream
+        });
+
+        let result = compact(
+            model_with_context_window(5_000),
+            &entries,
+            &CompactionSettings {
+                enabled: true,
+                reserve_tokens: 1_000,
+                keep_recent_tokens: 1,
+            },
+            None,
+            Some(stream_fn),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("compaction should succeed with a bounded summarizer prompt");
+
+        assert_eq!(result.summary, "bounded summary");
+        assert!(!captured.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn summary_budget_caps_single_oversized_message() {
+        let conversation =
+            serialize_conversation_for_summary_budget(&[user(&"x".repeat(50_000))], 2_000, None);
+        assert!(
+            conversation.len().div_ceil(4) <= 2_000,
+            "serialized compaction prompt must fit the budget; got {} chars",
+            conversation.len()
+        );
+        assert!(
+            conversation.starts_with("[compaction note: omitted older serialized content"),
+            "single-message truncation must disclose omitted content"
+        );
     }
 
     #[test]
