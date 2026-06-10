@@ -1,10 +1,10 @@
 //! RFC 1 (issue #20) `NotificationHook` trait + status surface.
 //!
 //! A `NotificationHook` is the runtime's transport-agnostic plug for external sources
-//! (MCP server pushes, Cloudflare hub WebSocket, local cron, file-watch, etc.). Adapters
-//! own the transport, normalize the inbound stream into [`Trigger`](super::trigger::Trigger)
-//! envelopes, and push them into a shared `TriggerSink`. The runtime consumes whatever the
-//! hooks produce, regardless of source.
+//! (MCP server pushes, local cron, file-watch, etc.). Adapters own the transport,
+//! normalize the inbound stream into [`Trigger`](super::trigger::Trigger) envelopes, and
+//! push them into a shared `TriggerSink`. The runtime consumes whatever the hooks
+//! produce, regardless of source.
 //!
 //! Status: **types and trait only**. The runtime supervisor that spawns / monitors hooks
 //! and the per-source fair scheduler land in a follow-up PR; this skeleton exists so
@@ -39,7 +39,7 @@ pub type TriggerSink = mpsc::UnboundedSender<Trigger>;
 pub trait NotificationHook: Send + Sync {
     /// Stable label used in `NotificationHookStatus`, `/triggers hooks` UI rows, and
     /// per-source counters. Should be short and human-readable (e.g. `"mcp:filesystem"`,
-    /// `"cloudflare-hub"`, `"cron"`).
+    /// `"cron"`).
     fn label(&self) -> &str;
 
     /// Drive the source. Push triggers into `sink` as they arrive. Return `Ok(())` on
@@ -70,7 +70,7 @@ pub enum HookError {
     AuthFailed { reason: String },
 
     /// Source negotiated an incompatible protocol version. Distinct from `AuthFailed`
-    /// because UX should suggest "upgrade client/hub" not "re-login" (RFC 0 §3.3).
+    /// because UX should suggest "upgrade client/source" not "re-login".
     #[error("protocol mismatch: {reason}")]
     ProtocolMismatch { reason: String },
 
@@ -105,8 +105,8 @@ pub struct NotificationHookStatus {
     pub state: HookState,
     /// Wall-clock time the most recent trigger was pushed into the sink, if any.
     pub last_event_at: Option<DateTime<Utc>>,
-    /// Wall-clock time the most recent ack was received (hub-style transports only). MCP
-    /// push / cron / file-watch leave this `None`.
+    /// Wall-clock time the most recent ack was received, if the adapter protocol has
+    /// explicit acknowledgements. MCP push / cron / file-watch leave this `None`.
     pub last_ack_at: Option<DateTime<Utc>>,
     /// Most recent transport-level error, if any. Cleared on next successful transition
     /// back to `Connected`.

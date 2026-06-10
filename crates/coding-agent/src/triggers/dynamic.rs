@@ -1650,11 +1650,12 @@ mod tests {
         let action = hook(
             BeforeTriggerActionContext {
                 trigger: Trigger {
-                    source: TriggerSource::Hub {
-                        topic: "test".into(),
+                    source: TriggerSource::Mcp {
+                        server_name: "test".into(),
+                        method: "notification".into(),
                     },
-                    source_kind: SourceKind::Hub,
-                    source_label: "hub:test".into(),
+                    source_kind: SourceKind::Mcp,
+                    source_label: "mcp:test".into(),
                     event_label: "explicit shared".into(),
                     payload_visibility: PayloadVisibility::Shared,
                     payload_summary: Some("shared event".into()),
@@ -1663,8 +1664,8 @@ mod tests {
                     replacement_policy: ReplacementPolicy::Drop,
                     trace_id: "trace-shared".into(),
                     authority: TriggerAuthority {
-                        principal_id: "hub".into(),
-                        principal_label: "hub".into(),
+                        principal_id: "mcp:test".into(),
+                        principal_label: "mcp:test".into(),
                         credential_scope: CredentialScope::User,
                         allowed_source_actions: vec![],
                         expires_at: None,

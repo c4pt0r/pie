@@ -266,9 +266,9 @@ pub enum BeforeTriggerDecision {
 /// Bounded, preview-safe trigger prompt request emitted when
 /// [`BeforeTriggerDecision::Prompt`] asks the embedder to admit or deny a trigger.
 ///
-/// Runtime owns only exact per-trigger resolution. "Always" / "Block future sender" trust
-/// caches are embedder-owned (for fefe, `~/.pie/hub-trust.json`) and should be audited
-/// separately via a domain-specific Custom entry such as `fefe_trust_decision`.
+/// Runtime owns only exact per-trigger resolution. Any persistent "always allow" /
+/// "block future sender" policy is embedder-owned and should be audited separately via
+/// a domain-specific Custom entry.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TriggerPromptRequest {
     /// SHA-256 over the canonical binding tuple. This is the stable token the embedder
@@ -276,9 +276,9 @@ pub struct TriggerPromptRequest {
     pub trigger_prompt_id: String,
     pub trace_id: String,
     pub source_label: String,
-    /// Receiver id is optional at the generic runtime layer because non-hub trigger
-    /// sources may not have a receiver principal. Hub adapters should populate it in
-    /// `_meta.receiver_agent_id` or `receiver_agent_id` so fefe first-contact prompts bind
+    /// Receiver id is optional at the generic runtime layer because many trigger sources
+    /// do not have a receiver principal. Adapters with source/receiver scoping can
+    /// populate `_meta.receiver_agent_id` or `receiver_agent_id` so prompt decisions bind
     /// to the full `{receiver_agent_id, sender_agent_id, action_class}` scope.
     pub receiver_agent_id: Option<String>,
     pub sender_agent_id: String,
@@ -1436,7 +1436,7 @@ impl AgentHarness {
     /// Register a [`super::notification_hook::NotificationHook`] with the harness. Spawns
     /// two detached tokio tasks:
     /// - **Driver**: calls `hook.run(sink)` and drives the hook's transport (MCP read
-    ///   pump, Cloudflare hub WebSocket, etc.). Triggers the hook produces flow through
+    ///   pump, cron watcher, etc.). Triggers the hook produces flow through
     ///   the `sink` (an `mpsc::UnboundedSender<Trigger>`).
     /// - **Pump**: reads from the sink's receiver and calls
     ///   [`Self::handle_trigger`] for each trigger. Exits naturally when the sender is
@@ -1471,8 +1471,8 @@ impl AgentHarness {
 
         // Pump task: drain triggers into handle_trigger in order. We don't bound the
         // queue here — the hook's own backpressure is the right place for that since
-        // it knows the transport's per-hook semantics (MCP push has no rate, hub frames
-        // have per-topic rate limits, cron has burst smoothing).
+        // it knows the transport's per-hook semantics (MCP push has no rate, cron has
+        // burst smoothing, etc.).
         //
         // Contract: `handle_trigger` must not panic. The pump deliberately does NOT wrap
         // the call in `catch_unwind`, because today every transition `handle_trigger` runs
@@ -2820,37 +2820,29 @@ fn build_template_context(
     use std::collections::HashMap;
     let mut ctx: HashMap<String, String> = HashMap::new();
     ctx.insert("trace_id".into(), trace_id.to_string());
-    let (source_kind_str, source_server, source_method, source_topic, source_subkind) =
-        match &trigger.source {
-            super::trigger::TriggerSource::Mcp {
-                server_name,
-                method,
-            } => (
-                "mcp".to_string(),
-                Some(server_name.clone()),
-                Some(method.clone()),
-                None,
-                None,
-            ),
-            super::trigger::TriggerSource::Hub { topic } => {
-                ("hub".to_string(), None, None, Some(topic.clone()), None)
-            }
-            super::trigger::TriggerSource::Local { subkind } => {
-                ("local".to_string(), None, None, None, Some(subkind.clone()))
-            }
-            super::trigger::TriggerSource::AgentDelegate { .. } => {
-                ("agent_delegate".to_string(), None, None, None, None)
-            }
-        };
+    let (source_kind_str, source_server, source_method, source_subkind) = match &trigger.source {
+        super::trigger::TriggerSource::Mcp {
+            server_name,
+            method,
+        } => (
+            "mcp".to_string(),
+            Some(server_name.clone()),
+            Some(method.clone()),
+            None,
+        ),
+        super::trigger::TriggerSource::Local { subkind } => {
+            ("local".to_string(), None, None, Some(subkind.clone()))
+        }
+        super::trigger::TriggerSource::AgentDelegate { .. } => {
+            ("agent_delegate".to_string(), None, None, None)
+        }
+    };
     ctx.insert("trigger.source.kind".into(), source_kind_str);
     if let Some(v) = source_server {
         ctx.insert("trigger.source.server_name".into(), v);
     }
     if let Some(v) = source_method {
         ctx.insert("trigger.source.method".into(), v);
-    }
-    if let Some(v) = source_topic {
-        ctx.insert("trigger.source.topic".into(), v);
     }
     if let Some(v) = source_subkind {
         ctx.insert("trigger.source.subkind".into(), v);

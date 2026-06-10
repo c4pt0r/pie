@@ -848,7 +848,7 @@ async fn build_session_context_skips_trigger_custom_entries() {
     let _id_trigger = session
         .append_custom(
             "trigger",
-            Some(serde_json::json!({ "trace_id": "trace-1", "source_kind": "Hub" })),
+            Some(serde_json::json!({ "trace_id": "trace-1", "source_kind": "Mcp" })),
         )
         .await
         .unwrap();
@@ -1750,7 +1750,7 @@ async fn before_trigger_prompt_records_needs_approval_state_and_reason() {
     let prompt_hook: BeforeTriggerHook = Arc::new(|_ctx: BeforeTriggerContext, _cancel| {
         Box::pin(async move {
             BeforeTriggerDecision::Prompt {
-                reason: "Cloudflare hub trigger from new principal".into(),
+                reason: "external trigger from new principal".into(),
             }
         })
     });
@@ -1811,7 +1811,7 @@ async fn before_trigger_prompt_records_needs_approval_state_and_reason() {
     assert_eq!(decision["permission"].as_str(), Some("prompt"));
     assert_eq!(
         decision["reason"].as_str(),
-        Some("Cloudflare hub trigger from new principal")
+        Some("external trigger from new principal")
     );
 
     let prompt_event = evs
@@ -1853,7 +1853,7 @@ async fn before_trigger_prompt_records_needs_approval_state_and_reason() {
 }
 
 #[tokio::test]
-async fn before_trigger_prompt_allow_admits_trigger_and_binds_hub_identity() {
+async fn before_trigger_prompt_allow_admits_trigger_and_binds_source_identity() {
     use pie_agent_core::{
         BeforeTriggerContext, BeforeTriggerDecision, BeforeTriggerHook, OnTriggerPromptHook,
         TriggerPromptDecision,
@@ -1866,7 +1866,7 @@ async fn before_trigger_prompt_allow_admits_trigger_and_binds_hub_identity() {
     let prompt_hook: BeforeTriggerHook = Arc::new(|_ctx: BeforeTriggerContext, _cancel| {
         Box::pin(async move {
             BeforeTriggerDecision::Prompt {
-                reason: "new hub sender requires first-contact approval".into(),
+                reason: "new source sender requires approval".into(),
             }
         })
     });
@@ -1882,8 +1882,8 @@ async fn before_trigger_prompt_allow_admits_trigger_and_binds_hub_identity() {
     let harness = AgentHarness::new(opts);
 
     let mut trigger = sample_trigger("prompt-allow", "trace-prompt-allow");
-    trigger.source_kind = pie_agent_core::SourceKind::Hub;
-    trigger.source_label = "fefe hub".into();
+    trigger.source_kind = pie_agent_core::SourceKind::Mcp;
+    trigger.source_label = "external notifier".into();
     trigger.event_label = "notification".into();
     trigger.payload_visibility = pie_agent_core::PayloadVisibility::Shared;
     trigger.payload_summary = Some("alice sent a notification".into());
@@ -1891,7 +1891,7 @@ async fn before_trigger_prompt_allow_admits_trigger_and_binds_hub_identity() {
         "_meta": {
             "receiver_agent_id": "11111111-1111-4111-8111-111111111111",
             "sender_agent_id": "22222222-2222-4222-8222-222222222222",
-            "action_class": "hub.notification"
+            "action_class": "notification"
         },
         "secret_body": "this raw payload must stay out of prompt preview"
     }));
@@ -1913,11 +1913,8 @@ async fn before_trigger_prompt_allow_admits_trigger_and_binds_hub_identity() {
         request.sender_agent_id,
         "22222222-2222-4222-8222-222222222222"
     );
-    assert_eq!(request.action_class, "hub.notification");
-    assert_eq!(
-        request.reason,
-        "new hub sender requires first-contact approval"
-    );
+    assert_eq!(request.action_class, "notification");
+    assert_eq!(request.reason, "new source sender requires approval");
     assert!(
         !request.payload.to_string().contains("secret_body"),
         "prompt preview must never carry raw trigger payload"
@@ -1983,7 +1980,7 @@ async fn before_trigger_prompt_prefers_meta_binding_over_legacy_top_level_fields
     let prompt_hook: BeforeTriggerHook = Arc::new(|_ctx: BeforeTriggerContext, _cancel| {
         Box::pin(async move {
             BeforeTriggerDecision::Prompt {
-                reason: "new hub sender requires first-contact approval".into(),
+                reason: "new source sender requires approval".into(),
             }
         })
     });
@@ -2006,7 +2003,7 @@ async fn before_trigger_prompt_prefers_meta_binding_over_legacy_top_level_fields
         "_meta": {
             "receiver_agent_id": "11111111-1111-4111-8111-111111111111",
             "sender_agent_id": "22222222-2222-4222-8222-222222222222",
-            "action_class": "hub.notification"
+            "action_class": "notification"
         }
     }));
 
@@ -2025,7 +2022,7 @@ async fn before_trigger_prompt_prefers_meta_binding_over_legacy_top_level_fields
         request.sender_agent_id,
         "22222222-2222-4222-8222-222222222222"
     );
-    assert_eq!(request.action_class, "hub.notification");
+    assert_eq!(request.action_class, "notification");
 }
 
 #[tokio::test]
@@ -2071,7 +2068,7 @@ async fn before_trigger_prompt_rejects_untrusted_payload_identity_fields_and_cap
     }));
 
     let mut trigger = sample_trigger("prompt-invalid-meta", "trace-invalid-meta");
-    trigger.source_kind = pie_agent_core::SourceKind::Hub;
+    trigger.source_kind = pie_agent_core::SourceKind::Mcp;
     trigger.event_label = "notification".into();
     trigger.payload = Some(serde_json::json!({
         "_meta": {

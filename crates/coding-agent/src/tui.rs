@@ -397,7 +397,6 @@ fn source_kind_label(kind: pie_agent_core::SourceKind) -> &'static str {
     match kind {
         pie_agent_core::SourceKind::Local => "local",
         pie_agent_core::SourceKind::Mcp => "mcp",
-        pie_agent_core::SourceKind::Hub => "hub",
     }
 }
 

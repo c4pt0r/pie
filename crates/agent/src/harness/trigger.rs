@@ -2,8 +2,8 @@
 //! `TriggerRecord` persisted as `SessionTreeEntry::Custom { custom_type: "trigger" }`.
 //!
 //! This module is the runtime type surface for external-event-driven agent invocation. It
-//! deliberately knows nothing about specific transports (Cloudflare hub WebSocket, MCP push,
-//! cron, file-watch). Transport adapters live in `crates/coding-agent` and consume the
+//! deliberately knows nothing about specific transports (MCP push, cron, file-watch, etc.).
+//! Transport adapters live in `crates/coding-agent` and consume the
 //! [`NotificationHook`](super::notification_hook::NotificationHook) trait next door.
 //!
 //! Status: **types only**. The agent loop entrypoint
@@ -27,10 +27,9 @@ use serde::{Deserialize, Serialize};
 pub struct Trigger {
     /// Typed source descriptor. Lets the rule engine match on adapter family + adapter id.
     pub source: TriggerSource,
-    /// First-class display dimension: `Local` / `Mcp` / `Hub`. UI groups `/triggers` by this.
+    /// First-class display dimension. UI groups `/triggers` by this.
     pub source_kind: SourceKind,
-    /// Human-readable source label supplied by the adapter (e.g. "MCP filesystem",
-    /// "Cloudflare hub").
+    /// Human-readable source label supplied by the adapter (e.g. "MCP filesystem").
     pub source_label: String,
     /// Human-readable event label supplied by the adapter (e.g. "file changed", "pr merged").
     pub event_label: String,
@@ -40,8 +39,8 @@ pub struct Trigger {
     pub payload_visibility: PayloadVisibility,
     /// Truncated human-readable summary; bounded by the runtime persist cap (4 KiB).
     pub payload_summary: Option<String>,
-    /// Source-specific full payload. Default `None` (envelope-only). Hub frame may carry
-    /// up to 64 KiB; the runtime always truncates to `payload_summary` before persistence.
+    /// Source-specific full payload. Default `None` (envelope-only). The runtime always
+    /// truncates to `payload_summary` before persistence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<serde_json::Value>,
     /// Required: dedup key. Runtime drops events with a duplicate key within the
@@ -75,8 +74,6 @@ pub struct Trigger {
 pub enum TriggerSource {
     /// Notification pushed by an MCP server (per RFC 1 §4.2).
     Mcp { server_name: String, method: String },
-    /// Notification arriving over a Cloudflare hub WebSocket subscription (RFC 0).
-    Hub { topic: String },
     /// Locally fired event (cron / file-watch / agent self-trigger). Tools-MCP-Lead's
     /// adapter taxonomy in RFC 4 §2.1 uses concrete `subkind`s; the runtime envelope only
     /// needs a generic carrier. (`subkind` rather than `kind` because the enum is
@@ -96,18 +93,17 @@ pub enum TriggerSource {
 pub enum SourceKind {
     Local,
     Mcp,
-    Hub,
 }
 
 /// Privacy tier for the carried payload. Enforced by the runtime when persisting and by
-/// adapters when rendering; see RFC 0 §3.2.2 for the full table.
+/// adapters when rendering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PayloadVisibility {
     /// `payload` is `None`. Only `payload_summary` is available to consumers. Default.
     Local,
-    /// `payload` may be `Some(...)` up to the hub frame cap (64 KiB). Runtime still
-    /// truncates to `payload_summary` for persistence (4 KiB cap).
+    /// `payload` may be `Some(...)`. Runtime still truncates to `payload_summary` for
+    /// persistence (4 KiB cap).
     Shared,
     /// `payload` is forced to `None` and `payload_summary` must be de-identified.
     Redacted,
@@ -116,7 +112,7 @@ pub enum PayloadVisibility {
 /// Audit / authorization summary attached to every trigger. Token material is **never**
 /// stored here. `principal_id` is opaque-stable (ULID-style); `principal_label` is for
 /// display only; `credential_scope` is the source's declared scope, never used as a secret
-/// lookup key. See RFC 0 §3.2.2 + Provider-Auth §4.1.
+/// lookup key.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TriggerAuthority {
     pub principal_id: String,
@@ -128,7 +124,7 @@ pub struct TriggerAuthority {
     /// call.
     #[serde(default)]
     pub allowed_source_actions: Vec<String>,
-    /// Source-stated expiry (for short-lived hub tokens). Optional; runtime does not act
+    /// Source-stated expiry (for short-lived source credentials). Optional; runtime does not act
     /// on it directly — adapters refresh tokens themselves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
@@ -149,8 +145,8 @@ pub struct TriggerAuthority {
 ///   [`Self::LatestReplaces`] (the latest catalog snapshot supersedes earlier ones).
 /// - MCP `notifications/resources/updated` per resource URI → [`Self::LatestReplaces`].
 /// - Custom MCP notifications without a `_pie_dedup_key` agreement → [`Self::Drop`].
-/// - Hub webhook events where every occurrence matters (e.g. PR comments) →
-///   [`Self::Drop`] keyed by per-event id.
+/// - Webhook-style events where every occurrence matters (e.g. PR comments) →
+///   [`Self::Drop`] keyed by a per-event id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReplacementPolicy {

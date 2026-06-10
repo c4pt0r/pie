@@ -396,7 +396,7 @@ pub struct BeforeToolCallResult {
 }
 
 /// Per-tool classification override evaluated **before** [`BeforeToolCallHook`]. Tools that
-/// mutate persistent state (skills, triggers, hub trust) return [`PermissionClassification::Prompt`]
+/// mutate persistent state (skills, triggers, trust policy) return [`PermissionClassification::Prompt`]
 /// with a bounded human-readable reason; tools that wrap escalations the model must never
 /// self-authorize (e.g. re-enabling a `disable_model_invocation=true` skill) return
 /// [`PermissionClassification::Block`]. Default impl on [`AgentTool::permission_classification`]
@@ -426,8 +426,7 @@ pub enum PermissionClassification {
 ///
 /// **Bounded fields only.** The `label` and `payload` MUST NOT contain raw SKILL.md bodies,
 /// raw rule text, install source URL tokens, provider/base_url credentials, auth-store
-/// values, or raw payload bytes — same redaction discipline as `fefe_trust_decision`
-/// (RFC #18 §5.7). Runtime caps `label` at 200 chars before persistence; `payload` is
+/// values, or raw payload bytes. Runtime caps `label` at 200 chars before persistence; `payload` is
 /// embedder-defined JSON, bounded by the tool/classifier that produced it.
 #[derive(Clone, Debug)]
 pub struct ControlPlanePromptRequest {
