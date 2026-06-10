@@ -65,10 +65,14 @@ Every sub-issue below MUST address the same five axes in its design write-up bef
 
 - [ ] #16 — Multi-modal IO (image input, terminal image rendering)
 
-### Tier 8 — cross-agent connectivity (RFC)
+### Tier 8 — cross-agent connectivity
 
-- [x] **#18 — `pie.0xfefe.me` public MCP hub** — Worker/API v0 live (RFC + Worker MVP + deploy workflow merged; gate 6 live e2e passed 2026-05-30). See [[18-rfc-fefe-mcp-hub]].
-- [x] **#19 — pie client onboard for the fefe hub** — happy path, auth wire contract, Skip semantics, acceptance gates. Phases 1-6 merged; two-clean-client live TUI e2e on `pie.0xfefe.me` passed 2026-05-31 covering `/hub join → status → send → first-contact card → Accept once → bounded feed`, plus Always / Block / Skip decision matrix; redaction sweep passed. See [[19-fefe-client-onboard]].
+- ~~#18 — public MCP cross-agent service~~ — **de-scoped and removed from the shipped
+  product surface on 2026-06-10**. The RFC is retained only as historical design context;
+  it is no longer an implementation or release target.
+- ~~#19 — client onboarding for the public cross-agent service~~ — **de-scoped and removed
+  from the shipped product surface on 2026-06-10**. The client command surface was removed;
+  generic MCP transport and generic trigger primitives remain in their own tiers.
 
 ## Non-goals (explicit)
 

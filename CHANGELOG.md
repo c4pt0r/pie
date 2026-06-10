@@ -5,6 +5,19 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
 
 ## [Unreleased]
 
+### Removed
+
+- Removed the experimental public cross-agent messaging service from the shipped client
+  surface. The CLI/TUI/Web command registry no longer advertises the old join/status/send/inbox
+  or endpoint commands, clean installs no longer auto-create an official MCP profile, and stale
+  local credentials or trust files are ignored by the generic MCP loader. The generic
+  Streamable HTTP MCP transport and generic notification-trigger runtime remain available for
+  explicitly configured MCP servers.
+- The public Worker service is being decommissioned through a tombstone release: old service
+  entrypoints return bounded removed-feature responses, chat cookies are cleared, and the MCP
+  surface cannot open server-push streams or execute tools. Final Cloudflare resource deletion is
+  a separate release step after bounded production smoke and maintainer sign-off.
+
 ### Added — Tier 1 (daily UX)
 
 - **#2** Mid-stream Ctrl-C abort with double-Ctrl-C exit. Biased select against stalled
@@ -55,22 +68,11 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
   accepting `/login <provider> <api-key>` inline. Inline keys are rejected with a usage
   message that does not repeat the secret, preventing interactive terminal scrollback from
   retaining raw credential material.
-- Added the first `/hub` client commands for `pie.0xfefe.me`: `/hub connect` writes the
-  canonical `streamable_http` MCP entry, `/hub login` stores the hub token through the
-  existing no-echo secret prompt, `/hub status` renders bounded local config/auth/hook
-  state, and `/hub logout` clears the local hub credential without printing token refs.
-- The official `pie.0xfefe.me` hub is now a built-in default client profile: `/hub status`
-  works on a clean install without `mcp.toml`, and the loader auto-enables the canonical
-  `pie-hub` transport after the local hub credential exists without emitting missing-token
-  startup diagnostics.
-- Public webhook endpoints: `/endpoint register` mints a hub capability URL
-  (`https://pie.0xfefe.me/e/<token>`); external POSTs inject into the owning session
-  (run/summary modes), with hub backlog replay on resume. (docs/endpoints.md)
 - `pie --resume <id>` now resumes a specific session directly (same as `--resume-id`);
   bare `--resume` keeps the picker.
 - pie starts without a model API key (warning instead of a hard error), so
-  notification-only sessions — e.g. summary-mode webhook endpoints — work as a pure
-  inbox; the first model turn surfaces the auth error and `/login` fixes it live.
+  notification-only sessions can work as pure inboxes; the first model turn surfaces the auth
+  error and `/login` fixes it live.
 - **#66** `/triggers` slash command for the RFC 1 trigger surface. It now shows runtime
   counters, hook health, running trigger actions, recent trigger audit rows, and supports
   aborting one or all in-flight trigger actions from the terminal while rendering only
@@ -150,29 +152,18 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
 - **#16** `--image <path>` CLI flag (repeatable, PNG/JPEG/WebP/GIF, 10 MiB per image, 10
   per message). Magic-byte mime detection.
 
-### Added — Tier 8 (cross-agent connectivity)
+### Added — Tier 8 (MCP transport)
 
-- **#18** Initial `pie.0xfefe.me` Cloudflare Worker MVP under `workers/fefe-hub`.
-  The Worker exposes health, v0 human register/login, MCP `initialize` /
-  `tools/list` / `tools/call`, agent registration/token rotation, discovery,
-  notification send/list/ack, trust/block management, and SSE server-push
-  `notifications/agent_message` frames with `_meta.pie_dedup_key` and
-  `_meta.pie_summary`. D1 stores registry/auth/backlog state; a Durable Object
-  fans out live receiver mailboxes. Worker CI runs hermetic npm tests only; real
-  Cloudflare deploy remains isolated to the protected GitHub Actions lane using
-  `CF_API_KEY`.
-- **#19 Phase A** `HttpMcpTransport` for Streamable HTTP MCP servers. `crates/mcp`
-  now adapts POST request/response bodies plus long-lived SSE pushes into the
-  existing line-oriented `Transport` queue, so `McpClient` can reuse the same
-  inflight, cancel, `tools/list`, `tools/call`, and notification pump logic as
-  stdio servers. `~/.pie/mcp.toml` entries can set `kind = "streamable_http"`,
-  `endpoint = "https://pie.0xfefe.me/mcp"`, and bearer auth via
-  `auth = { kind = "bearer", token_keychain_ref = "pie-hub:default" }`; the
-  token is resolved from the local auth store and injected only as
-  `Authorization: Bearer`, never into MCP JSON bodies or diagnostics. Hermetic
-  faux HTTP/SSE tests cover POST, SSE notification delivery, body-cap rejection,
-  bearer header injection, config parsing, and auth debug redaction. CLI/TUI
-  `/hub` UX remains a follow-up layer on top of this engine API.
+- **Streamable HTTP MCP transport.** `crates/mcp` now adapts POST request/response
+  bodies plus long-lived SSE pushes into the existing line-oriented `Transport` queue, so
+  `McpClient` can reuse the same inflight, cancel, `tools/list`, `tools/call`, and
+  notification pump logic as stdio servers. `~/.pie/mcp.toml` entries can set
+  `kind = "streamable_http"` and bearer auth via `auth = { kind = "bearer",
+  token_keychain_ref = "<configured-token-ref>" }`; credentials are resolved from the
+  local auth store and injected only as `Authorization: Bearer`, never into MCP JSON
+  bodies or diagnostics. Hermetic faux HTTP/SSE tests cover POST, SSE notification
+  delivery, body-cap rejection, bearer header injection, config parsing, and auth debug
+  redaction.
 
 ### Added — Framework
 
@@ -299,8 +290,8 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
   reserved for credential failures and protocol mismatches mapping to `Disconnected`),
   `HookError`, and the `TriggerSink = mpsc::UnboundedSender<Trigger>` alias. **Types
   only — no agent loop entrypoint yet**; the supervisor + state machine wiring + the
-  `AgentHarness::handle_trigger` API land in a follow-up PR. Adapter authors (MCP read
-  pump, Cloudflare hub WebSocket hook) can build against the trait in parallel.
+  `AgentHarness::handle_trigger` API land in a follow-up PR. Adapter authors such as MCP
+  read pumps and custom push hooks can build against the trait in parallel.
 - **#20 (dedup + cycle engine)** Pure-logic `TriggerRuntime` evaluator that decides
   whether an incoming `Trigger` should be admitted, deduplicated against a prior trigger
   within a configurable window, or suppressed because its trace chain has exceeded the
@@ -371,17 +362,17 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
   4 new integration tests pin default-Allow, Deny→PermissionDenied (asserting both the
   audit record AND the event carry the reason), Prompt→NeedsApproval (same dual
   assertion), and that the hook is bypassed on the Deduped path.
-- **#110 / fefe trigger prompt channel.** `BeforeTriggerDecision::Prompt` now routes
+- **#110 / trigger prompt channel.** `BeforeTriggerDecision::Prompt` now routes
   through a trigger-specific confirmation channel instead of remaining a passive
   `NeedsApproval` marker. New `AgentHarnessOptions::on_trigger_prompt:
   Option<OnTriggerPromptHook>` emits `HarnessEvent::TriggerPromptRequest`, awaits an
   embedder decision, writes a bounded `trigger_prompt` Custom audit entry, and admits the
   trigger only on `TriggerPromptDecision::Allow`. Missing hooks fail closed to
   `NeedsApproval`. `TriggerPromptRequest` carries a deterministic `trigger_prompt_id`
-  bound to the trigger envelope plus receiver/sender/action-class identity when present in
-  hub `_meta`; the preview payload is built only from bounded envelope fields and never
-  includes raw `Trigger.payload`. 2 integration tests pin fail-closed audit/event behavior
-  and the hub identity binding path.
+  bound to the trigger envelope plus safe source identity fields when present; the preview
+  payload is built only from bounded envelope fields and never includes raw
+  `Trigger.payload`. 2 integration tests pin fail-closed audit/event behavior and bounded
+  source-preview behavior.
 - **#20 (sub-agent execution, no promotion yet)** Accepted triggers now spawn a detached
   sub-agent that runs the trigger's action prompt without blocking the `handle_trigger`
   caller or the `register_notification_hook` pump (RFC 1 §5.A). New
@@ -448,12 +439,6 @@ versions sync across all workspace crates per the lockstep policy in `AGENTS.md`
 
 ### Fixed
 
-- `/hub status` now describes the built-in connection as `hub pie.0xfefe.me`
-  instead of exposing the internal `pie-hub` server label in user-facing output.
-- Advanced `/hub connect` now uses the same product-facing host wording and no longer
-  prints the internal `pie-hub` server label in its success output.
-- Hub recovery hints now point users back to `/hub join` without mentioning restarts or
-  MCP transport internals.
 - `find` tool results are now bounded more tightly by default to reduce token waste and
   oversized TUI previews. The default path limit is 200 instead of 1000, truncated results
   include a clear recovery hint, and structured details now report the limit and whether it

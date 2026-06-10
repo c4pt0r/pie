@@ -55,15 +55,6 @@ Triggers are a first-class runtime concept, not a feature flag. The runtime live
 
 An accepted trigger's delivery is chosen by the `before_trigger_action` hook, which returns a `TriggerAction` whose `delivery: TriggerDelivery` is one of: `SubAgent` (default — run the sub-agent in a fresh context); `InjectSummary` (skip the sub-agent, inject `trigger.payload_summary` straight into the parent chat via the promotion path, no model call); or `InjectAndRun` (inject `action.prompt` into the parent chat AND run one model turn in the parent's full context). For `InjectAndRun` the runtime never drives the single-tenant parent agent itself: when the parent is streaming it enqueues a follow-up; when idle it emits `HarnessEvent::TriggerRequestsMainRun`, which the coding-agent REPL funnels into a single serialized run channel (shared with user input) so triggered turns and user prompts never race. MCP servers marked `inject_summary` / `inject_and_run` in `mcp.toml` are treated as notification feeds and take those paths (see `triggers::direct_inject_action_hook`). The runtime stays domain-agnostic across all modes — it only moves the opaque `payload_summary` / prompt strings.
 
-Public webhook endpoints (`/endpoint register`) are a hub-mediated trigger source: the
-hub mints a capability URL (`POST /e/<token>`, route + tools in `workers/fefe-hub`),
-stores inbound messages as `sender_namespace = "endpoint"` notification rows, and pushes
-`notifications/endpoint_message` frames. The session-side binding lives in the
-`<session>.endpoints.json` sidecar (`triggers/endpoint.rs`); only the owning session maps
-the frame to a trigger, delivers per-endpoint (`run` → `InjectAndRun`, `summary` →
-`InjectSummary`, bypassing the server-level inject classification), and acks. Un-acked
-backlog replays on resume via `EndpointBacklogHook`.
-
 ### `inject_and_run` + same-server tools: feedback-loop awareness
 
 A single MCP server can both push notifications AND register tools (the two surfaces are independent: `notifications/*` JSON-RPC frames vs `tools/list` + `tools/call`). When a server is configured with `inject_and_run = true`, every push triggers a model turn in the parent's full tool context — including that same server's tools. If the agent then calls one of those tools and the operation causes the server to emit another notification (e.g. "wrote file X" → file-watcher push, or "fetched data" → cache-updated push), the cycle continues. Cycle suppression via `trace_id` does not catch this, because each fresh MCP push from the source adapter mints a new `trace_id` (the chain is reset at the source boundary, not propagated through tool calls).

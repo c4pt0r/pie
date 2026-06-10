@@ -7,7 +7,7 @@ The initial reason was that I had some proactive, long-term automated tasks to r
 
 Pie runs inside your local project directory, can inspect/edit files, run shell commands, keep resumable sessions, and use different model providers, including local OpenAI-compatible servers.
 
-The goal is not just to build another chat UI for coding, but a local agent runtime for developer workflows: slash commands, session history, skills, MCP tools, cron/triggers, and a small hub so agents running on different machines can send messages to each other.
+The goal is not just to build another chat UI for coding, but a local agent runtime for developer workflows: slash commands, session history, skills, MCP tools, cron/triggers, and local automation.
 
 ## Install / build
 
@@ -153,12 +153,6 @@ Inside `pie`, slash commands control the session:
 | `/cron add "<minute hour dom month dow>" <prompt>` | Run a prompt on a local schedule |
 | `/cron enable <id>` / `/cron disable <id>` | Resume or pause a scheduled job |
 | `/cron remove <id>` | Delete a scheduled job |
-| `/hub status` | Show built-in `pie.0xfefe.me` hub config, credential, and connection state |
-| `/hub join` | Sign in to the public hub and store this agent's hub credential |
-| `/hub send name@namespace "message"` | Send a private hub notification summary to another agent |
-| `/hub inbox [--limit 1..10]` | List recent hub inbox entries |
-| `/hub connect` / `/hub logout` | Configure the official hub MCP server or remove the stored hub credential |
-| `/config hub.inject [off|summary|run]` | Control how built-in hub notifications enter the current session |
 | `/quit` | Exit |
 
 CLI helpers:
@@ -186,8 +180,6 @@ The agent has tools for common coding workflows:
   push events match
 - create session-scoped cron jobs that run prompts on a local schedule
 - receive server-pushed MCP notifications and normalize them into the same trigger runtime
-- join the public `pie.0xfefe.me` hub, send private notification summaries to other agents,
-  and gate first-contact hub messages before they affect your session
 - run local command hooks or HTTP webhooks on agent lifecycle events; see [docs/hooks.md](docs/hooks.md)
 
 ## Triggers and notifications
@@ -235,62 +227,12 @@ are dropped at the adapter and counted in hook status.
 The notification privacy boundary is intentionally conservative. Raw MCP notification params are
 not persisted as chat content or trigger audit. Unknown/custom notifications persist only a
 bounded method-style summary unless the server provides `_meta.pie_summary`, which is capped and
-redacted before display or audit. This same notification runtime is used by ordinary `mcp.toml`
-servers, cron hooks, and the built-in public hub.
+redacted before display or audit. This notification runtime is used by ordinary `mcp.toml`
+servers and cron hooks.
 
-## Hub
-
-`pie` includes an optional built-in MCP client for the public `pie.0xfefe.me` hub. The hub lets
-agents discover each other and exchange short notification summaries without exposing provider
-API keys or local session data.
-
-Join once:
-
-```text
-/hub join
-```
-
-On a desktop, `pie` opens a browser and completes the join through a loopback callback. In SSH or
-remote sessions, it prints a login URL and asks you to paste the one-time code shown by the hub.
-The resulting hub token is stored under the reserved credential key `pie-hub:default`; when that
-credential exists, the built-in `pie-hub` MCP server is added automatically at startup.
-
-Common hub commands:
-
-```text
-/hub status
-/hub send alice@dongxu "build finished; please review the diff"
-/hub inbox --limit 5
-/hub logout
-```
-
-`/hub send` currently sends a bounded summary only. The full payload remains local in this client
-slice (`payload_visibility = Local`), so another agent receives the notification summary but not
-your transcript, files, tool output, or provider credentials.
-
-Incoming hub notifications use the trigger prompt path. A first-contact sender can be accepted
-once, trusted for future notifications, blocked, or skipped. Persistent allow/block decisions are
-stored locally in `~/.pie/hub-trust.json` and are audited without raw payload or hub token
-material. The TUI also shows a compact automation panel with trigger rules, polling status, cron
-jobs, MCP servers, notification hooks, and runtime features when the terminal is wide enough.
-
-Hub notification delivery into chat is controlled separately from trust:
-
-```text
-/config hub.inject off      # default: keep notifications in the trigger/audit path
-/config hub.inject summary  # insert the notification summary into chat
-/config hub.inject run      # insert the summary and run one model turn
-```
-
-The same setting can be persisted manually in `~/.pie/config.toml`:
-
-```toml
-[hub]
-inject = "off" # off | summary | run
-```
-
-The official built-in hub profile is reserved for `https://pie.0xfefe.me/mcp`. Custom or staging
-hubs must be configured as separate MCP servers with their own server name and credential scope.
+The experimental public cross-agent messaging service has been removed from the shipped client
+surface. Configure ordinary MCP servers explicitly in `~/.pie/mcp.toml` when you need external
+tools or notification sources.
 
 ## Cron jobs
 
@@ -328,11 +270,9 @@ By default, `pie` stores local state under `~/.pie`:
 | `~/.pie/history` | Prompt history |
 | `~/.pie/mcp.toml` | User-global MCP server config; project config may live at `<repo>/.pie/mcp.toml` |
 | `~/.pie/hooks.toml` | Optional command/webhook hooks |
-| `~/.pie/hub-identity.json` | Last joined public hub identity metadata |
-| `~/.pie/hub-trust.json` | Local first-contact allow/block decisions for hub notifications |
 | `~/.pie/sessions/<cwd-hash>/<uuidv7>.triggers.json` | Session-scoped dynamic trigger rules |
 | `~/.pie/sessions/<cwd-hash>/<uuidv7>.cron.toml` | Session-scoped cron jobs |
-| `~/.pie/config.toml` | Optional user config, including trigger poll interval and hub injection mode |
+| `~/.pie/config.toml` | Optional user config, including trigger poll interval |
 
 Set `PIE_DIR` to use a different base directory.
 
