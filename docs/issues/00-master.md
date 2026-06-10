@@ -39,6 +39,8 @@ Every sub-issue below MUST address the same five axes in its design write-up bef
 
 - [ ] #6 — `--continue` (global most-recent), named sessions, `/share` export to HTML/Gist
 - [ ] #7 — Token & cost tracking, per-session budget cap, fallback model on provider failure
+- [ ] **#20 — Session export / import for replayable agent backups**. See
+  [[20-session-export-import]].
 
 ### Tier 3 — safety / sandboxing
 
