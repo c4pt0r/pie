@@ -41,6 +41,9 @@
 //!   `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$` and be ≤ 64 chars (matches `validate_name` in
 //!   `pie_agent_core::harness::skills`). No path traversal characters reach the target
 //!   path.
+//! - Skill description: missing, empty, or oversized `description:` is normalized to a
+//!   bounded fallback and surfaced as a warning, not a hard install failure. The installed
+//!   `SKILL.md` stays loadable by the runtime skill loader.
 //!
 //! Preview / audit / tool result remain bounded even with large skill bodies: only
 //! metadata (name, description, hash, size, target path) is echoed; the body itself never
@@ -58,6 +61,7 @@ use pie_agent_core::{
 use pie_ai::{Tool, UserContentBlock};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use serde_yaml::Value as YamlValue;
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
@@ -194,6 +198,7 @@ impl AgentTool for InstallSkillTool {
                     "phase": "preview",
                     "name": parsed.name,
                     "description": parsed.description,
+                    "warnings": parsed.warnings,
                     "target_path": target_path.display().to_string(),
                     "content_hash": parsed.content_hash,
                     "size": parsed.size,
@@ -213,7 +218,7 @@ impl AgentTool for InstallSkillTool {
             )));
         }
 
-        atomic_write_skill(&target_path, &fetched.content).await?;
+        atomic_write_skill(&target_path, &parsed.normalized_content).await?;
 
         // Hot-reload via the runtime API (PR-A). On success the harness already swapped its
         // skill catalog and rebuilt the system prompt; the next turn sees the new skill.
@@ -228,14 +233,16 @@ impl AgentTool for InstallSkillTool {
 
         // Did the new skill actually surface in the reloaded catalog?
         let installed = reload.skills.iter().any(|s| s.name == parsed.name);
-        let warnings: Vec<String> = reload
-            .diagnostics
-            .iter()
-            .filter(|d| {
-                d.path.contains(&parsed.name) || d.path == target_path.display().to_string()
-            })
-            .map(|d| format!("{:?}: {}", d.code, d.message))
-            .collect();
+        let mut warnings = parsed.warnings.clone();
+        warnings.extend(
+            reload
+                .diagnostics
+                .iter()
+                .filter(|d| {
+                    d.path.contains(&parsed.name) || d.path == target_path.display().to_string()
+                })
+                .map(|d| format!("{:?}: {}", d.code, d.message)),
+        );
 
         // Persistent audit: append `Custom { custom_type: "skill_install" }` to the session
         // so `--resume`, bug-report, and post-hoc forensics can see model-driven skill
@@ -525,8 +532,10 @@ fn is_private_or_local_host(host: &str) -> bool {
 struct ParsedSkill {
     name: String,
     description: String,
+    normalized_content: String,
     content_hash: String,
     size: usize,
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -554,29 +563,84 @@ fn parse_and_validate(fetched: &Fetched) -> Result<ParsedSkill, AgentToolError> 
         .ok_or_else(|| AgentToolError::from("frontmatter missing required field: name"))?;
     validate_name(&name)?;
 
-    let description = frontmatter
-        .description
-        .ok_or_else(|| AgentToolError::from("frontmatter missing required field: description"))?;
-    let description = description.trim().to_string();
-    if description.is_empty() {
-        return Err(AgentToolError::from("description must not be empty"));
-    }
-    if description.chars().count() > MAX_DESCRIPTION_LEN {
-        return Err(AgentToolError::Message(format!(
-            "description exceeds {MAX_DESCRIPTION_LEN} characters"
-        )));
-    }
+    let (description, warnings, rewrite_description) =
+        normalize_description(frontmatter.description);
+    let normalized_content = if rewrite_description {
+        normalize_skill_content(&normalized, end + 3, &description)?
+    } else {
+        normalized
+    };
 
     let mut hasher = Sha256::new();
-    hasher.update(normalized.as_bytes());
+    hasher.update(normalized_content.as_bytes());
     let hash = hex::encode(hasher.finalize());
+    let size = normalized_content.len();
 
     Ok(ParsedSkill {
         name,
         description,
+        normalized_content,
         content_hash: hash,
-        size: normalized.len(),
+        size,
+        warnings,
     })
+}
+
+fn normalize_description(description: Option<String>) -> (String, Vec<String>, bool) {
+    let Some(description) = description else {
+        return (
+            fallback_description(),
+            vec!["description missing; using generated fallback".to_string()],
+            true,
+        );
+    };
+    let trimmed = description.trim().to_string();
+    if trimmed.is_empty() {
+        return (
+            fallback_description(),
+            vec!["description empty; using generated fallback".to_string()],
+            true,
+        );
+    }
+    if trimmed.chars().count() > MAX_DESCRIPTION_LEN {
+        return (
+            fallback_description(),
+            vec![format!(
+                "description exceeds {MAX_DESCRIPTION_LEN} characters; using generated fallback"
+            )],
+            true,
+        );
+    }
+    (trimmed, Vec::new(), false)
+}
+
+fn fallback_description() -> String {
+    "No description provided.".to_string()
+}
+
+fn normalize_skill_content(
+    normalized: &str,
+    yaml_end: usize,
+    description: &str,
+) -> Result<String, AgentToolError> {
+    let yaml = &normalized[4..yaml_end];
+    let mut frontmatter: YamlValue = serde_yaml::from_str(yaml)
+        .map_err(|e| AgentToolError::Message(format!("invalid frontmatter yaml: {e}")))?;
+    let mapping = frontmatter
+        .as_mapping_mut()
+        .ok_or_else(|| AgentToolError::from("skill frontmatter must be a YAML mapping"))?;
+    mapping.insert(
+        YamlValue::String("description".to_string()),
+        YamlValue::String(description.to_string()),
+    );
+    let frontmatter = serde_yaml::to_string(&frontmatter)
+        .map_err(|e| AgentToolError::Message(format!("failed to normalize frontmatter: {e}")))?;
+
+    Ok(format!(
+        "---\n{}{}",
+        frontmatter.trim_start_matches("---\n"),
+        &normalized[yaml_end..]
+    ))
 }
 
 fn validate_name(name: &str) -> Result<(), AgentToolError> {
@@ -980,14 +1044,14 @@ mod tests {
         );
     }
 
-    /// Malformed frontmatter / missing required fields → error before any write.
+    /// Malformed frontmatter / missing name → error before any write. Missing description is
+    /// recoverable and covered below.
     #[tokio::test]
     async fn rejects_skill_missing_frontmatter() {
         let (_harness, cell, dir) = build_test_harness(vec![]);
         let tool = test_tool(cell, &dir);
         for bad in [
             "no frontmatter at all",
-            "---\nname: only-name\n---\nbody",
             "---\ndescription: only-desc\n---\nbody",
             "---\nname: foo\n",
         ] {
@@ -998,6 +1062,152 @@ mod tests {
             .await;
             assert!(result.is_err(), "input {bad:?} must be refused");
         }
+    }
+
+    #[tokio::test]
+    async fn installs_skill_missing_description_with_warning() {
+        let (harness, cell, dir) = build_test_harness(vec![]);
+        let tool = test_tool(cell, &dir);
+        let skill_md = "---\nname: only-name\n---\n# Heading\nBody body.";
+
+        let preview = execute(
+            &tool,
+            json!({"source": {"type": "content", "content": skill_md}}),
+        )
+        .await
+        .expect("missing description should preview with warning");
+        assert_eq!(preview.details["phase"], "preview");
+        assert_eq!(preview.details["name"], "only-name");
+        assert_eq!(preview.details["description"], "No description provided.");
+        assert!(
+            preview.details["warnings"][0]
+                .as_str()
+                .unwrap()
+                .contains("description missing"),
+            "expected missing-description warning, got {:?}",
+            preview.details["warnings"]
+        );
+
+        let installed = execute(
+            &tool,
+            json!({"source": {"type": "content", "content": skill_md}, "confirm": true}),
+        )
+        .await
+        .expect("missing description should install with fallback");
+        assert_eq!(installed.details["phase"], "installed");
+        assert_eq!(installed.details["installed_visible_in_catalog"], true);
+        assert!(
+            installed.details["warnings"][0]
+                .as_str()
+                .unwrap()
+                .contains("description missing"),
+            "expected missing-description install warning, got {:?}",
+            installed.details["warnings"]
+        );
+
+        let written = tokio::fs::read_to_string(dir.path().join("only-name").join("SKILL.md"))
+            .await
+            .expect("SKILL.md was written");
+        assert!(written.contains("description: No description provided."));
+        assert!(
+            harness
+                .skills()
+                .iter()
+                .any(|s| { s.name == "only-name" && s.description == "No description provided." }),
+            "installed skill should be visible after reload"
+        );
+    }
+
+    #[tokio::test]
+    async fn previews_recoverable_description_format_with_warning() {
+        let (_harness, cell, dir) = build_test_harness(vec![]);
+        let tool = test_tool(cell, &dir);
+        let oversized = "x".repeat(MAX_DESCRIPTION_LEN + 1);
+        for (skill_md, expected_warning) in [
+            (
+                "---\nname: empty-desc\ndescription: '   '\n---\nBody.".to_string(),
+                "description empty",
+            ),
+            (
+                format!("---\nname: long-desc\ndescription: {oversized}\n---\nBody."),
+                "description exceeds",
+            ),
+        ] {
+            let preview = execute(
+                &tool,
+                json!({"source": {"type": "content", "content": skill_md}}),
+            )
+            .await
+            .expect("recoverable description should preview with warning");
+            assert_eq!(preview.details["phase"], "preview");
+            assert_eq!(preview.details["description"], "No description provided.");
+            assert!(
+                preview.details["warnings"][0]
+                    .as_str()
+                    .unwrap()
+                    .contains(expected_warning),
+                "expected {expected_warning:?} warning, got {:?}",
+                preview.details["warnings"]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn installs_block_scalar_oversized_description_with_warning() {
+        let (harness, cell, dir) = build_test_harness(vec![]);
+        let tool = test_tool(cell, &dir);
+        let oversized = "x".repeat(MAX_DESCRIPTION_LEN + 1);
+        let skill_md = format!(
+            "---\nname: block-desc\ndescription: |\n  {oversized}\nx-custom: true\n---\n# Heading\nBody."
+        );
+
+        let installed = execute(
+            &tool,
+            json!({"source": {"type": "content", "content": skill_md}, "confirm": true}),
+        )
+        .await
+        .expect("block scalar oversized description should install with fallback");
+        assert_eq!(installed.details["phase"], "installed");
+        assert_eq!(installed.details["installed_visible_in_catalog"], true);
+        assert!(
+            installed.details["warnings"][0]
+                .as_str()
+                .unwrap()
+                .contains("description exceeds"),
+            "expected oversized-description install warning, got {:?}",
+            installed.details["warnings"]
+        );
+
+        let written = tokio::fs::read_to_string(dir.path().join("block-desc").join("SKILL.md"))
+            .await
+            .expect("SKILL.md was written");
+        assert!(written.contains("description: No description provided."));
+        assert!(!written.contains(&format!("  {oversized}")));
+        assert!(written.contains("x-custom: true"));
+        assert!(
+            harness
+                .skills()
+                .iter()
+                .any(|s| { s.name == "block-desc" && s.description == "No description provided." }),
+            "installed block scalar skill should be visible after reload"
+        );
+    }
+
+    #[tokio::test]
+    async fn accepts_unknown_extra_frontmatter_fields() {
+        let (_harness, cell, dir) = build_test_harness(vec![]);
+        let tool = test_tool(cell, &dir);
+        let skill_md = "---\nname: extra-field\ndescription: useful\nx-custom: true\n---\nBody.";
+
+        let preview = execute(
+            &tool,
+            json!({"source": {"type": "content", "content": skill_md}}),
+        )
+        .await
+        .expect("unknown frontmatter fields should be ignored");
+        assert_eq!(preview.details["phase"], "preview");
+        assert_eq!(preview.details["name"], "extra-field");
+        assert_eq!(preview.details["warnings"].as_array().unwrap().len(), 0);
     }
 
     /// Existing skill, same on-disk content → not overwrite_required (idempotent re-install OK).
