@@ -34,9 +34,12 @@ Recommended CLI/TUI entry points:
 
 ```text
 pie session export [--session <id>|--current] [--output <file>] [--exclude-triggers]
-pie session import <file> [--cwd <path>] [--name <name>] [--activate-triggers=off|ask|on]
+pie session import <file> [--cwd <path>] [--activate-triggers=off|on]
 pie --resume-id <imported-id>
 ```
+
+`--activate-triggers=ask` is reserved for a future interactive confirmation flow. The v1
+implementation rejects it explicitly instead of silently treating it as `off`.
 
 Inside the REPL, mirror the same behavior:
 
@@ -131,7 +134,8 @@ Default import is safe and inert:
 - Conversation/session tree is restored and resumable.
 - Dynamic trigger rules, including both enabled and disabled definitions, export by default as
   part of a complete backup. Import keeps all dynamic trigger rules disabled unless the user
-  passes `--activate-triggers=on` or confirms an `ask` prompt.
+  passes `--activate-triggers=on`. `ask` is reserved and currently unsupported until the
+  CLI/TUI confirmation path exists.
 - Cron jobs are imported disabled by default. `running_trace_id`, `last_due_at`, and overlap
   counters should be cleared or marked as imported/stale so a moved session does not immediately
   fire old work.
@@ -153,7 +157,7 @@ existing replay semantics.
 | User/assistant/tool transcript | yes | context replay only; no tool re-execution |
 | Model/thinking changes | yes | preserve as session entries |
 | Compaction summaries | yes | preserve and replay through `build_context()` |
-| Dynamic triggers | yes, enabled and disabled definitions by default | import disabled by default; can ask/enable |
+| Dynamic triggers | yes, enabled and disabled definitions by default | import disabled by default; enable only with `--activate-triggers=on`; `ask` reserved/unsupported |
 | Cron jobs | yes | import disabled by default; clear stale running state |
 | Endpoint bindings | optional metadata | disabled/unbound by default |
 | Skills/templates installed on disk | manifest references only in v1 | warn if missing; do not bundle by default |

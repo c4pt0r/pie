@@ -33,6 +33,7 @@ mod oauth;
 mod otlp;
 mod readline;
 mod session;
+mod session_archive;
 mod skills;
 mod skills_state;
 mod templates;
@@ -44,7 +45,7 @@ use std::io::{IsTerminal as _, Write as _};
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result};
-use clap::{CommandFactory, Parser};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use pie_agent_core::{
     AgentHarness, AgentHarnessOptions, AgentMessage, JsonlSessionRepo, PermissionPolicy,
     ThinkingLevel,
@@ -58,6 +59,9 @@ use pie_ai::Message as PiMessage;
     about = "Simple coding agent on top of pie-agent-core"
 )]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<CliCommand>,
+
     /// Provider id (anthropic, openai, openrouter, …). When unset, auto-detected from env.
     #[arg(long)]
     provider: Option<String>,
@@ -140,6 +144,62 @@ struct Cli {
     web_port: u16,
 }
 
+#[derive(Subcommand, Debug)]
+enum CliCommand {
+    /// Export or import replayable `.piesession` backups.
+    Session {
+        #[command(subcommand)]
+        command: SessionCliCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SessionCliCommand {
+    /// Export a session transcript and automation sidecars to a `.piesession` archive.
+    Export {
+        /// Session id to export (full UUIDv7 or unique prefix). Defaults to newest for this cwd.
+        #[arg(long, conflicts_with = "current")]
+        session: Option<String>,
+        /// Export the newest session for this cwd.
+        #[arg(long)]
+        current: bool,
+        /// Destination `.piesession` file. Defaults to `pie-session-<id>.piesession` in cwd.
+        #[arg(long, value_name = "FILE")]
+        output: Option<std::path::PathBuf>,
+        /// Do not include dynamic trigger or cron sidecars.
+        #[arg(long = "exclude-triggers")]
+        exclude_triggers: bool,
+    },
+    /// Import a `.piesession` archive as a new local session.
+    Import {
+        /// `.piesession` archive to import.
+        file: std::path::PathBuf,
+        /// Cwd to write into the imported session metadata. Defaults to the current directory.
+        #[arg(long, value_name = "PATH")]
+        cwd: Option<std::path::PathBuf>,
+        /// Activation mode for imported triggers/crons. Defaults to disabled; ask is reserved.
+        #[arg(long = "activate-triggers", default_value = "off")]
+        activate_triggers: ActivateTriggersArg,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ActivateTriggersArg {
+    Off,
+    Ask,
+    On,
+}
+
+impl From<ActivateTriggersArg> for session_archive::ActivateTriggers {
+    fn from(value: ActivateTriggersArg) -> Self {
+        match value {
+            ActivateTriggersArg::Off => Self::Off,
+            ActivateTriggersArg::Ask => Self::Ask,
+            ActivateTriggersArg::On => Self::On,
+        }
+    }
+}
+
 impl Cli {
     /// Session id to resume, merging both spellings: `--resume-id <id>` wins, then
     /// `--resume <id>`. Bare `--resume` (the picker) yields `None`.
@@ -157,6 +217,10 @@ async fn main() -> Result<()> {
     let cwd = std::env::current_dir().context("getting cwd")?;
     let repo = session::open_repo(&cwd).await;
 
+    if let Some(command) = &cli.command {
+        return run_cli_command(command, &repo, &cwd).await;
+    }
+
     if cli.list_sessions {
         return list_sessions_cmd(&repo).await;
     }
@@ -170,17 +234,157 @@ async fn main() -> Result<()> {
     run_repl(cli, cwd, repo).await
 }
 
+async fn run_cli_command(
+    command: &CliCommand,
+    repo: &JsonlSessionRepo,
+    cwd: &std::path::Path,
+) -> Result<()> {
+    match command {
+        CliCommand::Session { command } => run_session_cli_command(command, repo, cwd).await,
+    }
+}
+
+async fn run_session_cli_command(
+    command: &SessionCliCommand,
+    repo: &JsonlSessionRepo,
+    cwd: &std::path::Path,
+) -> Result<()> {
+    match command {
+        SessionCliCommand::Export {
+            session,
+            current: _,
+            output,
+            exclude_triggers,
+        } => {
+            let session_path = if let Some(id) = session {
+                session::find_path_by_id(repo, id)
+                    .await?
+                    .with_context(|| format!("no session matches id {id}"))?
+            } else {
+                session::newest_path(repo).await?.with_context(|| {
+                    format!("no sessions to export in {}", repo.root().display())
+                })?
+            };
+            let session = repo.open(&session_path).await?;
+            let metadata = session.storage().get_metadata_json().await?;
+            let session_id = metadata
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| {
+                    session_path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("session")
+                });
+            let output_path = output
+                .clone()
+                .unwrap_or_else(|| session_archive::default_export_path(cwd, session_id));
+            let output_path = if output_path.is_absolute() {
+                output_path
+            } else {
+                cwd.join(output_path)
+            };
+            print_session_archive_warning();
+            let summary =
+                session_archive::export_session(&session_path, &output_path, *exclude_triggers)
+                    .await?;
+            println!(
+                "exported session archive: {}",
+                summary.output_path.display()
+            );
+            println!(
+                "session {} entries={} triggers={} cron={}",
+                short_id(&summary.session_id),
+                summary.entry_count,
+                yes_no(summary.has_triggers),
+                yes_no(summary.has_cron)
+            );
+            Ok(())
+        }
+        SessionCliCommand::Import {
+            file,
+            cwd: import_cwd,
+            activate_triggers,
+        } => {
+            let archive_path = if file.is_absolute() {
+                file.clone()
+            } else {
+                cwd.join(file)
+            };
+            let target_cwd = import_cwd.clone().unwrap_or_else(|| cwd.to_path_buf());
+            print_session_archive_warning();
+            let summary = session_archive::import_session(
+                repo,
+                &archive_path,
+                &target_cwd,
+                (*activate_triggers).into(),
+            )
+            .await?;
+            println!("imported session: {}", short_id(&summary.session_id));
+            println!("path: {}", summary.session_path.display());
+            println!(
+                "entries={} triggers={} cron={} automation={}",
+                summary.entry_count,
+                summary.triggers_imported,
+                summary.cron_imported,
+                if summary.automation_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
+            println!("resume with: pie --resume-id {}", summary.session_id);
+            Ok(())
+        }
+    }
+}
+
+fn print_session_archive_warning() {
+    println!(
+        "warning: .piesession archives include transcript and tool history. They do not include separate auth stores, provider credentials, OAuth tokens, or MCP config."
+    );
+}
+
+fn short_id(id: &str) -> String {
+    id.chars().take(16).collect()
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
+}
+
 fn print_dynamic_help_and_exit_if_requested() -> Result<()> {
-    if !std::env::args_os()
-        .skip(1)
-        .any(|arg| arg == "--help" || arg == "-h")
-    {
+    if !should_print_dynamic_top_level_help(std::env::args_os().skip(1)) {
         return Ok(());
     }
     let mut command = Cli::command().after_help(commands::cli_model_help_text());
     command.print_help()?;
     println!();
     std::process::exit(0);
+}
+
+fn should_print_dynamic_top_level_help<I>(args: I) -> bool
+where
+    I: IntoIterator<Item = std::ffi::OsString>,
+{
+    let subcommands: Vec<String> = Cli::command()
+        .get_subcommands()
+        .map(|command| command.get_name().to_string())
+        .collect();
+    let mut has_help = false;
+    for arg in args {
+        if arg == "--help" || arg == "-h" {
+            has_help = true;
+            continue;
+        }
+        if arg
+            .to_str()
+            .is_some_and(|arg| subcommands.iter().any(|subcommand| subcommand == arg))
+        {
+            return false;
+        }
+    }
+    has_help
 }
 
 async fn list_sessions_cmd(repo: &JsonlSessionRepo) -> Result<()> {
@@ -1176,6 +1380,7 @@ mod tests {
     #[test]
     fn base_url_override_requires_explicit_provider() {
         let mut cli = Cli {
+            command: None,
             provider: None,
             model: Some("deepseek-v4-flash".into()),
             base_url: Some("http://user:secret-token@127.0.0.1:8000/v1?token=secret".into()),
@@ -1210,6 +1415,74 @@ mod tests {
 
         cli.provider = Some("ds4".into());
         validate_base_url_override(&cli).unwrap();
+    }
+
+    #[test]
+    fn cli_parses_session_export_import_commands() {
+        let cli = Cli::parse_from([
+            "pie",
+            "session",
+            "export",
+            "--session",
+            "018f",
+            "--output",
+            "backup.piesession",
+            "--exclude-triggers",
+        ]);
+        match cli.command {
+            Some(CliCommand::Session {
+                command:
+                    SessionCliCommand::Export {
+                        session,
+                        output,
+                        exclude_triggers,
+                        ..
+                    },
+            }) => {
+                assert_eq!(session.as_deref(), Some("018f"));
+                assert_eq!(
+                    output.unwrap(),
+                    std::path::PathBuf::from("backup.piesession")
+                );
+                assert!(exclude_triggers);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let cli = Cli::parse_from([
+            "pie",
+            "session",
+            "import",
+            "backup.piesession",
+            "--activate-triggers",
+            "off",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Session {
+                command: SessionCliCommand::Import {
+                    activate_triggers: ActivateTriggersArg::Off,
+                    ..
+                }
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn cli_session_import_ask_activation_is_explicitly_unsupported() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = JsonlSessionRepo::new(temp.path().join("sessions"));
+        let command = SessionCliCommand::Import {
+            file: std::path::PathBuf::from("missing.piesession"),
+            cwd: None,
+            activate_triggers: ActivateTriggersArg::Ask,
+        };
+        let err = run_session_cli_command(&command, &repo, temp.path())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("activate-triggers=ask"), "{err}");
+        assert!(err.contains("not implemented"), "{err}");
     }
 
     #[test]

@@ -215,6 +215,18 @@ async fn find_session_path(
     Ok(None)
 }
 
+/// Resolve a session id (full UUIDv7 or unique prefix) to its transcript path.
+pub async fn find_path_by_id(repo: &JsonlSessionRepo, id: &str) -> Result<Option<PathBuf>> {
+    let files = repo.list().await?;
+    find_session_path(repo, &files, id).await
+}
+
+/// Return the newest session transcript path for this cwd-scoped repo.
+pub async fn newest_path(repo: &JsonlSessionRepo) -> Result<Option<PathBuf>> {
+    let files = repo.list().await?;
+    Ok(files.last().cloned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

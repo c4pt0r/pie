@@ -197,6 +197,7 @@ impl Registry {
         r.register(Arc::new(UndoCommand));
         r.register(Arc::new(BugReportCommand));
         r.register(Arc::new(NameCommand));
+        r.register(Arc::new(SessionCommand));
         r.register(Arc::new(SessionsCommand));
         r.register(Arc::new(ShareCommand));
         r.register(Arc::new(LoginCommand));
@@ -1661,6 +1662,148 @@ impl SlashCommand for NameCommand {
     }
 }
 
+struct SessionCommand;
+
+#[async_trait]
+impl SlashCommand for SessionCommand {
+    fn name(&self) -> &'static str {
+        "session"
+    }
+    fn description(&self) -> &'static str {
+        "export/import replayable .piesession backups"
+    }
+    fn usage(&self) -> &'static str {
+        "export [path] [--exclude-triggers] | import <path>"
+    }
+    async fn run(&self, argv: &[String], ctx: &CommandCtx<'_>) -> CommandOutcome {
+        match argv.first().map(String::as_str) {
+            Some("export") => session_export_command(&argv[1..], ctx).await,
+            Some("import") => session_import_command(&argv[1..], ctx).await,
+            Some(other) => CommandOutcome::Error(format!(
+                "unknown /session subcommand: {other}; use /session export [path] or /session import <path>"
+            )),
+            None => CommandOutcome::Error(
+                "usage: /session export [path] [--exclude-triggers] | /session import <path>"
+                    .into(),
+            ),
+        }
+    }
+}
+
+async fn session_export_command(argv: &[String], ctx: &CommandCtx<'_>) -> CommandOutcome {
+    let mut exclude_triggers = false;
+    let mut path_arg: Option<&str> = None;
+    for arg in argv {
+        if arg == "--exclude-triggers" {
+            exclude_triggers = true;
+        } else if path_arg.is_none() {
+            path_arg = Some(arg);
+        } else {
+            return CommandOutcome::Error(
+                "usage: /session export [path] [--exclude-triggers]".into(),
+            );
+        }
+    }
+
+    let metadata = match ctx.harness.session().storage().get_metadata_json().await {
+        Ok(metadata) => metadata,
+        Err(err) => return CommandOutcome::Error(format!("read session metadata: {err}")),
+    };
+    let Some(session_path) = metadata
+        .get("path")
+        .and_then(|value| value.as_str())
+        .map(std::path::PathBuf::from)
+    else {
+        return CommandOutcome::Error("session metadata is missing transcript path".into());
+    };
+    let output_path = match path_arg {
+        Some(path) => std::path::PathBuf::from(path),
+        None => crate::session_archive::default_export_path(ctx.cwd, ctx.session_id),
+    };
+    let output_path = if output_path.is_absolute() {
+        output_path
+    } else {
+        ctx.cwd.join(output_path)
+    };
+
+    emit_session_archive_warning();
+    match crate::session_archive::export_session(&session_path, &output_path, exclude_triggers)
+        .await
+    {
+        Ok(summary) => {
+            cprintln!(
+                "exported session archive: {}",
+                summary.output_path.display()
+            );
+            cprintln!(
+                "session {} entries={} triggers={} cron={}",
+                short_id(&summary.session_id),
+                summary.entry_count,
+                yes_no(summary.has_triggers),
+                yes_no(summary.has_cron)
+            );
+            CommandOutcome::Handled
+        }
+        Err(err) => CommandOutcome::Error(format!("session export failed: {err}")),
+    }
+}
+
+async fn session_import_command(argv: &[String], ctx: &CommandCtx<'_>) -> CommandOutcome {
+    if argv.len() != 1 {
+        return CommandOutcome::Error("usage: /session import <path>".into());
+    }
+    let archive_path = std::path::PathBuf::from(&argv[0]);
+    let archive_path = if archive_path.is_absolute() {
+        archive_path
+    } else {
+        ctx.cwd.join(archive_path)
+    };
+    let repo = crate::session::open_repo(ctx.cwd).await;
+
+    emit_session_archive_warning();
+    match crate::session_archive::import_session(
+        &repo,
+        &archive_path,
+        ctx.cwd,
+        crate::session_archive::ActivateTriggers::Off,
+    )
+    .await
+    {
+        Ok(summary) => {
+            cprintln!("imported session: {}", short_id(&summary.session_id));
+            cprintln!("path: {}", summary.session_path.display());
+            cprintln!(
+                "entries={} triggers={} cron={} automation={}",
+                summary.entry_count,
+                summary.triggers_imported,
+                summary.cron_imported,
+                if summary.automation_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
+            cprintln!("resume with: pie --resume-id {}", summary.session_id);
+            CommandOutcome::Handled
+        }
+        Err(err) => CommandOutcome::Error(format!("session import failed: {err}")),
+    }
+}
+
+fn emit_session_archive_warning() {
+    cprintln!(
+        "warning: .piesession archives include transcript and tool history. They do not include separate auth stores, provider credentials, OAuth tokens, or MCP config."
+    );
+}
+
+fn short_id(id: &str) -> String {
+    id.chars().take(16).collect()
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
+}
+
 struct SessionsCommand;
 
 #[async_trait]
@@ -2900,6 +3043,7 @@ mod tests {
         assert!(r.find("quit").is_some());
         assert!(r.find("q").is_some());
         assert!(r.find("exit").is_some());
+        assert!(r.find("session").is_some());
         assert!(r.find("triggers").is_some());
         assert!(r.find("nope").is_none());
     }

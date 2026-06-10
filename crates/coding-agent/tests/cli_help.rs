@@ -73,6 +73,24 @@ fn help_lists_web_and_tui_mode_flags() {
 }
 
 #[test]
+fn session_import_help_shows_subcommand_options() {
+    let output = Command::new(env!("CARGO_BIN_EXE_pie"))
+        .args(["session", "import", "--help"])
+        .output()
+        .expect("run pie session import --help");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Import a `.piesession` archive"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("--cwd"), "{stdout}");
+    assert!(stdout.contains("--activate-triggers"), "{stdout}");
+    assert!(stdout.contains("ask is reserved"), "{stdout}");
+    assert!(!stdout.contains("Model catalog:"), "{stdout}");
+}
+
+#[test]
 fn invalid_thinking_value_reports_candidates() {
     let output = Command::new(env!("CARGO_BIN_EXE_pie"))
         .args(["--thinking", "turbo", "--list-sessions"])

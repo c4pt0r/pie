@@ -55,6 +55,9 @@ mod mcp_loader;
 #[path = "../src/session/mod.rs"]
 mod session;
 #[allow(dead_code)]
+#[path = "../src/session_archive.rs"]
+mod session_archive;
+#[allow(dead_code)]
 #[path = "../src/skills_state.rs"]
 mod skills_state;
 #[allow(dead_code)]
@@ -319,6 +322,48 @@ async fn dispatch_thinking_command_updates_state_and_session() {
         saw_change,
         "thinking_level_change entry must be persisted: {entries:#?}"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dispatch_session_export_writes_archive_with_bounded_output() {
+    let _output_guard = COMMAND_OUTPUT_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = temp.path().join("repo");
+    tokio::fs::create_dir_all(&cwd).await.unwrap();
+    let repo = pie_agent_core::JsonlSessionRepo::new(temp.path().join("sessions"));
+    let session = repo
+        .create(cwd.to_string_lossy().to_string())
+        .await
+        .unwrap();
+    session
+        .append_custom(
+            "test_payload",
+            Some(serde_json::json!({"secret_transcript_marker": "do-not-render"})),
+        )
+        .await
+        .unwrap();
+    let metadata = session.storage().get_metadata_json().await.unwrap();
+    let session_id = metadata["id"].as_str().unwrap().to_string();
+    let opts = AgentHarnessOptions::new(faux_model(), session);
+    let harness = Arc::new(AgentHarness::new(opts));
+    let registry = commands::Registry::with_builtins();
+    let capture = OutputCapture::install();
+    let ctx = commands::CommandCtx {
+        harness: &harness,
+        session_id: &session_id,
+        log_path: None,
+        tool_count: 0,
+        cwd: &cwd,
+    };
+
+    let outcome = commands::dispatch("/session export backup.piesession", &registry, &ctx).await;
+    assert!(matches!(outcome, commands::CommandOutcome::Handled));
+    assert!(cwd.join("backup.piesession").exists());
+    let output = capture.text();
+    assert!(output.contains(".piesession archives include transcript and tool history"));
+    assert!(output.contains("exported session archive"));
+    assert!(!output.contains("do-not-render"), "{output}");
+    assert!(!output.contains("secret_transcript_marker"), "{output}");
 }
 
 #[tokio::test]
