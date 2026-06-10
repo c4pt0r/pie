@@ -1,5 +1,5 @@
 //! Source adapters for the runtime `NotificationHook` trait. Each module here wraps a
-//! transport (MCP push, Cloudflare hub, cron, file-watch, ...) and pushes normalized
+//! transport (MCP push, cron, file-watch, ...) and pushes normalized
 //! [`Trigger`](pie_agent_core::Trigger) envelopes into a shared sink.
 //!
 //! The runtime side of the trait + envelope lives in `pie_agent_core::harness`. The
@@ -12,7 +12,6 @@
 
 pub mod cron;
 pub mod dynamic;
-pub mod endpoint;
 pub mod mcp_notification_hook;
 
 #[allow(unused_imports)]
@@ -25,11 +24,6 @@ pub use dynamic::{
     DynamicTriggerCheckHook, ListTriggersTool, NewTriggerTool, RemoveTriggerTool,
     SetTriggerStateTool, before_trigger_action_hook, direct_inject_action_hook,
     fire_once_harness_listener, global_registry,
-};
-#[allow(unused_imports)]
-pub use endpoint::{
-    EndpointAcker, EndpointBacklogHook, EndpointBinding, EndpointMode, EndpointRegistry,
-    endpoint_action_hook, global_endpoint_registry, map_endpoint_message, replay_params,
 };
 #[allow(unused_imports)]
 pub use mcp_notification_hook::McpNotificationHook;

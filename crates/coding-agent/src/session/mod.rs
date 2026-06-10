@@ -55,23 +55,6 @@ pub fn endpoint_sidecar_path(session_path: &std::path::Path) -> PathBuf {
     session_path.with_extension("endpoints.json")
 }
 
-/// Return the endpoint-binding sidecar for a live session.
-pub async fn endpoint_sidecar_path_for_session(
-    session: &Session,
-    repo: &JsonlSessionRepo,
-) -> Result<PathBuf> {
-    let metadata = session.storage().get_metadata_json().await?;
-    if let Some(path) = metadata.get("path").and_then(|v| v.as_str()) {
-        return Ok(endpoint_sidecar_path(std::path::Path::new(path)));
-    }
-
-    let session_id = metadata
-        .get("id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown-session");
-    Ok(repo.root().join(format!("{session_id}.endpoints.json")))
-}
-
 /// Return the cron sidecar for a live session.
 pub async fn cron_sidecar_path_for_session(
     session: &Session,

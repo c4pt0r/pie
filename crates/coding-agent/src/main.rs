@@ -20,9 +20,6 @@ mod goal;
 mod history;
 mod hooks;
 #[allow(dead_code)]
-mod hub_auth;
-mod hub_client;
-mod hub_join;
 mod images;
 mod local_models;
 mod logging;
@@ -40,7 +37,6 @@ mod skills;
 mod skills_state;
 mod templates;
 mod tools;
-mod trigger_prompt;
 mod triggers;
 mod ui;
 
@@ -118,13 +114,6 @@ struct Cli {
     #[arg(long = "trigger-poll-secs", value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..))]
     trigger_poll_secs: Option<u64>,
 
-    /// How built-in hub notifications reach the session: `off` (default — run through the
-    /// normal trigger path, nothing injected into chat), `summary` (inject the summary
-    /// verbatim), or `run` (inject and run one model turn so the agent reacts). Overrides
-    /// `[hub] inject` in `~/.pie/config.toml`; change it live with `/config hub.inject`.
-    #[arg(long = "hub-inject", value_name = "MODE", value_enum)]
-    hub_inject: Option<config::HubInjectMode>,
-
     /// Show LLM call debug logs in the conversation feed, including trigger/sub-agent calls.
     #[arg(long)]
     debug: bool,
@@ -133,20 +122,9 @@ struct Cli {
     #[arg(long)]
     yes: bool,
 
-    /// Auto-approve every approval prompt, including control-plane writes and trigger
-    /// first-contact prompts.
+    /// Auto-approve every approval prompt, including control-plane writes.
     #[arg(long = "always-allow")]
     always_allow: bool,
-
-    /// Hidden e2e driver for hub first-contact decisions. This lets live tests exercise the
-    /// runtime prompt path without brittle PTY key timing.
-    #[arg(
-        long = "hub-first-contact-decision",
-        hide = true,
-        value_name = "accept|always|block|skip",
-        value_parser = clap::builder::PossibleValuesParser::new(["accept", "always", "block", "skip"])
-    )]
-    hub_first_contact_decision: Option<String>,
 
     /// Run the local browser UI instead of the terminal UI. Defaults to loopback-only.
     #[arg(long, conflicts_with = "tui")]
@@ -448,9 +426,6 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
     let cron_registry = triggers::global_cron_registry().clone();
     let cron_path = session::cron_sidecar_path_for_session(&session, &repo).await?;
     let cron_load_error = cron_registry.load_from_path(cron_path).err();
-    let endpoint_registry = triggers::global_endpoint_registry().clone();
-    let endpoint_path = session::endpoint_sidecar_path_for_session(&session, &repo).await?;
-    let endpoint_load_error = endpoint_registry.load_from_path(endpoint_path).err();
     let memory_dir = config::memory_dir();
     let mut tools = tools::default_tools(memory_dir.clone());
     // Task delegation tool (issue #11). Shares the parent's model + stream backend so its
@@ -521,11 +496,6 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
     let (trigger_poll_secs, trigger_config_diagnostic) =
         read_trigger_poll_interval_secs(&config::base_dir(), cli.trigger_poll_secs).await;
     triggers::dynamic::set_dynamic_trigger_poll_interval_secs(trigger_poll_secs);
-    // Built-in hub notification delivery (`/config hub.inject`): CLI > config.toml > off.
-    // Published process-wide so the trigger action hook routes hub pushes live.
-    let (hub_inject_mode, hub_inject_diagnostic) =
-        read_hub_inject_mode(&config::base_dir(), cli.hub_inject).await;
-    config::set_hub_inject_mode(hub_inject_mode);
     let resolved_builtins =
         match builtin_skills::resolve_builtins(&cli.builtin_skill, &config_enabled_builtins) {
             Ok(r) => r,
@@ -601,71 +571,16 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
         ));
         None
     };
-    let hub_first_contact_driver = cli
-        .hub_first_contact_decision
-        .as_deref()
-        .map(|value| {
-            trigger_prompt::TriggerPromptDriverDecision::parse(value).map_err(anyhow::Error::msg)
-        })
-        .transpose()?;
-    let trigger_prompt_rx = if cli.always_allow {
-        opts.on_trigger_prompt = Some(trigger_prompt::decision_driver_hook(
-            session.clone(),
-            trigger_prompt::TriggerPromptDriverDecision::Always,
-        ));
-        None
-    } else if interactive_tui {
-        let (hook, rx) = trigger_prompt::interactive_hook(session.clone());
-        opts.on_trigger_prompt = Some(hook);
-        Some(rx)
-    } else if let Some(decision) = hub_first_contact_driver {
-        opts.on_trigger_prompt = Some(trigger_prompt::decision_driver_hook(
-            session.clone(),
-            decision,
-        ));
-        None
-    } else if run_web {
-        opts.on_trigger_prompt = Some(trigger_prompt::deny_hook(
-            "hub first-contact prompts are not available in the Web UI yet; run pie in the terminal UI to review this notification",
-        ));
-        None
-    } else {
-        opts.on_trigger_prompt = Some(trigger_prompt::deny_hook(
-            "hub first-contact prompt requires an interactive terminal; run pie in a TTY to review this notification",
-        ));
-        None
-    };
-    opts.before_trigger = Some(trigger_prompt::hub_trust_gate_hook());
     // Triggers from MCP servers configured with `inject_summary` / `inject_and_run` bypass
     // the sub-agent and inject their pushed summary into chat (the latter also runs one
     // model turn in the parent context); everything else falls through to the dynamic-rule
     // hook. The match is structural (server name), no model.
-    // Endpoint messages ack back to the hub the moment this session accepts them, so the
-    // backlog stops replaying them on the next reconnect. Fire-and-forget: a failed ack
-    // just means one redundant replay later.
-    let endpoint_acker: triggers::EndpointAcker = std::sync::Arc::new(|notification_id: String| {
-        tokio::spawn(async move {
-            match hub_client::HubClient::connect_default().await {
-                Ok(client) => {
-                    if let Err(e) = client.ack_notifications(&[notification_id]).await {
-                        tracing::warn!("endpoint ack failed: {e}");
-                    }
-                    client.close().await;
-                }
-                Err(e) => tracing::warn!("endpoint ack skipped: {e}"),
-            }
-        });
-    });
     opts.before_trigger_action = Some(triggers::cron_action_hook(
         cron_registry.clone(),
-        triggers::endpoint_action_hook(
-            endpoint_registry.clone(),
-            endpoint_acker,
-            triggers::direct_inject_action_hook(
-                mcp_inject_summary_servers,
-                mcp_inject_and_run_servers,
-                triggers::before_trigger_action_hook(dynamic_trigger_registry.clone()),
-            ),
+        triggers::direct_inject_action_hook(
+            mcp_inject_summary_servers,
+            mcp_inject_and_run_servers,
+            triggers::before_trigger_action_hook(dynamic_trigger_registry.clone()),
         ),
     ));
     // LSP feedback loop (issue #12): attach diagnostics to write/edit tool results when
@@ -713,15 +628,6 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
     harness.register_notification_hook(std::sync::Arc::new(
         triggers::DynamicTriggerCheckHook::new(dynamic_trigger_registry.clone()),
     ));
-    // One-shot endpoint backlog replay: messages POSTed while this session was offline
-    // are pulled from the hub inbox and re-injected via the live mapping path. No-op
-    // when this session has no endpoint bindings or no hub credential.
-    if !endpoint_registry.list().is_empty() {
-        harness.register_notification_hook(std::sync::Arc::new(
-            triggers::EndpointBacklogHook::new(endpoint_registry.clone()),
-        ));
-    }
-
     // Resume hydration (if --resume) — the rebuilt transcript is replayed into the feed below.
     let replay_context = if resumed {
         Some(harness.rehydrate_from_session().await?)
@@ -768,8 +674,6 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
         feed_rx,
         main_run_rx,
         control_plane_prompt_rx,
-        trigger_prompt_rx,
-        trigger_prompt_driver: hub_first_contact_driver,
         panel_status: ui::PanelStatus {
             mcp_servers: mcp.client_count,
             mcp_tools: mcp_tool_count,
@@ -802,9 +706,6 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
         app.system_line(diag);
     }
     if let Some(diag) = trigger_config_diagnostic {
-        app.error_line(diag);
-    }
-    if let Some(diag) = hub_inject_diagnostic {
         app.error_line(diag);
     }
     if !combined_skills.is_empty() {
@@ -847,19 +748,6 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
         app.system_line(format!(
             "loaded {} cron job(s) from {}",
             cron_registry.list().len(),
-            location
-        ));
-    }
-    if let Some(err) = &endpoint_load_error {
-        app.error_line(format!("endpoints: {err}"));
-    } else if !endpoint_registry.list().is_empty() {
-        let location = endpoint_registry
-            .storage_path()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "memory".into());
-        app.system_line(format!(
-            "loaded {} endpoint binding(s) from {}",
-            endpoint_registry.list().len(),
             location
         ));
     }
@@ -1013,7 +901,6 @@ fn active_hook_registrations(lsp_lang_count: usize, cli_hooks_loaded: bool) -> V
     let mut points = vec![
         "before_tool_call".to_string(),
         "on_control_plane_prompt".to_string(),
-        "on_trigger_prompt".to_string(),
         "before_trigger_action".to_string(),
     ];
     if lsp_lang_count > 0 {
@@ -1048,35 +935,6 @@ pub(crate) async fn prompt_for_api_key(provider: &str) -> Result<String> {
     })
     .await
     .context("login prompt task")?
-}
-
-/// Print the SSH/remote hub login link and read the one-time paste code from a cooked
-/// terminal. The caller drops out of the full-screen TUI first so the link and prompt are
-/// visible. The code is one-time and tied to the exchange, so it is echoed for paste
-/// verification.
-pub(crate) async fn prompt_for_hub_code(login_url: &str) -> Result<String> {
-    let login_url = login_url.to_string();
-    tokio::task::spawn_blocking(move || {
-        if !std::io::stdin().is_terminal() {
-            anyhow::bail!(
-                "pasting a hub code needs an interactive terminal; run pie in a TTY, then /hub join"
-            );
-        }
-        println!("SSH / remote session detected; finishing hub login with a paste code.");
-        println!(
-            "Open this link in a browser on your local machine, sign in, then paste the one-time code:"
-        );
-        println!("  {login_url}");
-        print!("paste hub code: ");
-        std::io::Write::flush(&mut std::io::stdout()).ok();
-        let mut line = String::new();
-        std::io::stdin()
-            .read_line(&mut line)
-            .context("read hub code")?;
-        Ok(line.trim().to_string())
-    })
-    .await
-    .context("hub code prompt task")?
 }
 
 pub(crate) fn login_requires_tty_message(provider: &str, recovery_command: Option<&str>) -> String {
@@ -1237,36 +1095,6 @@ async fn read_trigger_poll_interval_secs(
     }
 }
 
-/// Resolve the built-in hub notification mode: CLI `--hub-inject` wins, else `[hub] inject`
-/// from `config.toml`, else the default (off). Returns an optional diagnostic for an
-/// invalid config value (the default is used in that case).
-async fn read_hub_inject_mode(
-    base_dir: &std::path::Path,
-    cli_override: Option<config::HubInjectMode>,
-) -> (config::HubInjectMode, Option<String>) {
-    if let Some(mode) = cli_override {
-        return (mode, None);
-    }
-    let path = base_dir.join("config.toml");
-    let Ok(text) = tokio::fs::read_to_string(&path).await else {
-        return (config::HubInjectMode::default(), None);
-    };
-    match config::parse_hub_inject_setting(&text) {
-        Ok(Some(token)) => (
-            config::HubInjectMode::from_token(&token).unwrap_or_default(),
-            None,
-        ),
-        Ok(None) => (config::HubInjectMode::default(), None),
-        Err(err) => (
-            config::HubInjectMode::default(),
-            Some(format!(
-                "hub: ignoring invalid inject mode in {}: {err}",
-                path.display()
-            )),
-        ),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1361,11 +1189,9 @@ mod tests {
             image: Vec::new(),
             builtin_skill: Vec::new(),
             trigger_poll_secs: None,
-            hub_inject: None,
             debug: false,
             yes: false,
             always_allow: false,
-            hub_first_contact_decision: None,
             web: false,
             tui: false,
             web_host: "127.0.0.1".into(),

@@ -61,9 +61,6 @@ use crate::commands::{self, CommandCtx, CommandOutcome, Registry};
 use crate::control_plane_prompt::UiControlPlanePrompt;
 use crate::history::HistoryStore;
 use crate::readline::SlashCompleter;
-use crate::trigger_prompt::{
-    TriggerPromptDriverDecision, TriggerTrustDecision, UiTriggerPrompt, UiTriggerPromptResolution,
-};
 use crate::{images, mentions};
 use feed::{Feed, Level, TriggerPollStatus};
 use kernel::{QueuedTurn, ReplKernel, TurnState, poll_turn};
@@ -79,8 +76,6 @@ const TRIGGER_PANEL_MIN_TOTAL_WIDTH: u16 = 100;
 const TRIGGER_PANEL_WIDTH: u16 = 36;
 const TRIGGER_PANEL_RULE_LIMIT: usize = 5;
 const CONTROL_PROMPT_TEXT_WIDTH: usize = 68;
-const TRIGGER_PROMPT_TEXT_WIDTH: usize = 68;
-const TRIGGER_PROMPT_SUMMARY_CHARS: usize = 120;
 
 #[derive(Clone, Debug, Default)]
 pub struct PanelStatus {
@@ -116,8 +111,6 @@ pub struct AppConfig {
     pub feed_rx: UnboundedReceiver<FeedUpdate>,
     pub main_run_rx: UnboundedReceiver<String>,
     pub control_plane_prompt_rx: Option<UnboundedReceiver<UiControlPlanePrompt>>,
-    pub trigger_prompt_rx: Option<UnboundedReceiver<UiTriggerPrompt>>,
-    pub trigger_prompt_driver: Option<TriggerPromptDriverDecision>,
     pub panel_status: PanelStatus,
 }
 
@@ -144,9 +137,6 @@ pub struct App {
     main_run_rx: Option<UnboundedReceiver<String>>,
     control_plane_prompt_rx: Option<UnboundedReceiver<UiControlPlanePrompt>>,
     control_plane_prompt: Option<UiControlPlanePrompt>,
-    trigger_prompt_rx: Option<UnboundedReceiver<UiTriggerPrompt>>,
-    trigger_prompt: Option<UiTriggerPrompt>,
-    trigger_prompt_driver: Option<TriggerPromptDriverDecision>,
     panel_status: PanelStatus,
 
     input: TextArea<'static>,
@@ -190,9 +180,6 @@ impl App {
             main_run_rx: Some(config.main_run_rx),
             control_plane_prompt_rx: config.control_plane_prompt_rx,
             control_plane_prompt: None,
-            trigger_prompt_rx: config.trigger_prompt_rx,
-            trigger_prompt: None,
-            trigger_prompt_driver: config.trigger_prompt_driver,
             panel_status: config.panel_status,
             input: new_textarea(),
             completions: Vec::new(),
@@ -339,7 +326,6 @@ impl App {
         let mut feed_rx = self.feed_rx.take().expect("feed_rx taken once");
         let mut main_run_rx = self.main_run_rx.take().expect("main_run_rx taken once");
         let mut control_plane_prompt_rx = self.control_plane_prompt_rx.take();
-        let mut trigger_prompt_rx = self.trigger_prompt_rx.take();
         let mut turn = TurnState::default();
         self.refresh_goal_state().await;
 
@@ -376,14 +362,6 @@ impl App {
                     }
                 }, if self.control_plane_prompt.is_none() && control_plane_prompt_rx.is_some() => {
                     self.show_control_plane_prompt(prompt);
-                }
-                Some(prompt) = async {
-                    match trigger_prompt_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => None,
-                    }
-                }, if self.trigger_prompt.is_none() && trigger_prompt_rx.is_some() => {
-                    self.show_trigger_prompt(prompt);
                 }
                 _ = tick.tick() => {
                     if turn.fut.is_some() {
@@ -439,16 +417,6 @@ impl App {
         self.follow = true;
     }
 
-    fn show_trigger_prompt(&mut self, prompt: UiTriggerPrompt) {
-        let sender = trigger_prompt_sender_label(&prompt.request);
-        self.trigger_prompt = Some(prompt);
-        self.system_line(format!("hub first-contact prompt: {sender}"));
-        self.follow = true;
-        if let Some(decision) = self.trigger_prompt_driver {
-            self.resolve_trigger_prompt(decision.resolution());
-        }
-    }
-
     fn resolve_control_plane_prompt(
         &mut self,
         decision: pie_agent_core::ControlPlanePromptDecision,
@@ -472,56 +440,6 @@ impl App {
         };
         prompt.resolve(decision);
         self.system_line(message);
-    }
-
-    fn resolve_trigger_prompt(&mut self, resolution: UiTriggerPromptResolution) {
-        let Some(prompt) = self.trigger_prompt.take() else {
-            return;
-        };
-        let sender = trigger_prompt_sender_label(&prompt.request);
-        let message = match (&resolution.decision, resolution.trust_decision) {
-            (pie_agent_core::TriggerPromptDecision::Allow, None) => {
-                format!("accepted hub notification once: {sender}")
-            }
-            (pie_agent_core::TriggerPromptDecision::Allow, Some(TriggerTrustDecision::Always)) => {
-                format!("trusted hub sender for future notifications: {sender}")
-            }
-            (
-                pie_agent_core::TriggerPromptDecision::Deny { reason },
-                Some(TriggerTrustDecision::Block),
-            ) => {
-                let reason = reason.as_deref().unwrap_or("blocked by user");
-                let reason = safe_trigger_prompt_text(reason, TRIGGER_PROMPT_TEXT_WIDTH);
-                format!("blocked hub sender: {sender} ({reason})")
-            }
-            (pie_agent_core::TriggerPromptDecision::Allow, Some(TriggerTrustDecision::Block)) => {
-                format!("accepted hub notification once: {sender}")
-            }
-            (pie_agent_core::TriggerPromptDecision::Deny { reason }, _) => {
-                let reason = reason.as_deref().unwrap_or("denied by user");
-                let reason = safe_trigger_prompt_text(reason, TRIGGER_PROMPT_TEXT_WIDTH);
-                format!("denied hub notification: {sender} ({reason})")
-            }
-            (pie_agent_core::TriggerPromptDecision::Timeout { .. }, _) => {
-                format!("skipped hub notification: {sender}")
-            }
-        };
-        let accepted_summary = if matches!(
-            resolution.decision,
-            pie_agent_core::TriggerPromptDecision::Allow
-        ) {
-            Some(format!(
-                "hub notification summary: {sender} — {}",
-                trigger_prompt_summary(&prompt.request)
-            ))
-        } else {
-            None
-        };
-        prompt.resolve(resolution);
-        self.system_line(message);
-        if let Some(summary) = accepted_summary {
-            self.system_line(summary);
-        }
     }
 
     // ── event handling ──────────────────────────────────────────────────────────────────
@@ -557,9 +475,6 @@ impl App {
         terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     ) -> Result<()> {
         if self.handle_control_plane_prompt_key(&key) {
-            return Ok(());
-        }
-        if self.handle_trigger_prompt_key(&key) {
             return Ok(());
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -655,66 +570,6 @@ impl App {
             self.resolve_control_plane_prompt(pie_agent_core::ControlPlanePromptDecision::Deny {
                 reason: Some("denied by user".into()),
             });
-        }
-        true
-    }
-
-    fn handle_trigger_prompt_key(&mut self, key: &KeyEvent) -> bool {
-        if self.trigger_prompt.is_none() {
-            return false;
-        }
-        if key.kind == KeyEventKind::Release {
-            return true;
-        }
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        match key.code {
-            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('a') => {
-                self.resolve_trigger_prompt(UiTriggerPromptResolution {
-                    decision: pie_agent_core::TriggerPromptDecision::Allow,
-                    trust_decision: None,
-                });
-            }
-            KeyCode::Char('A') => {
-                self.resolve_trigger_prompt(UiTriggerPromptResolution {
-                    decision: pie_agent_core::TriggerPromptDecision::Allow,
-                    trust_decision: Some(TriggerTrustDecision::Always),
-                });
-            }
-            KeyCode::Char('b') | KeyCode::Char('B') => {
-                self.resolve_trigger_prompt(UiTriggerPromptResolution {
-                    decision: pie_agent_core::TriggerPromptDecision::Deny {
-                        reason: Some("blocked by user".into()),
-                    },
-                    trust_decision: Some(TriggerTrustDecision::Block),
-                });
-            }
-            KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Char('n') | KeyCode::Char('N') => {
-                self.resolve_trigger_prompt(UiTriggerPromptResolution {
-                    decision: pie_agent_core::TriggerPromptDecision::Deny {
-                        reason: Some("denied by user".into()),
-                    },
-                    trust_decision: None,
-                });
-            }
-            KeyCode::Esc | KeyCode::Char('s') | KeyCode::Char('S')
-                if !ctrl || matches!(key.code, KeyCode::Esc) =>
-            {
-                self.resolve_trigger_prompt(UiTriggerPromptResolution {
-                    decision: pie_agent_core::TriggerPromptDecision::Timeout {
-                        reason: Some("deferred_by_user".into()),
-                    },
-                    trust_decision: None,
-                });
-            }
-            KeyCode::Char('c') if ctrl => {
-                self.resolve_trigger_prompt(UiTriggerPromptResolution {
-                    decision: pie_agent_core::TriggerPromptDecision::Timeout {
-                        reason: Some("deferred_by_user".into()),
-                    },
-                    trust_decision: None,
-                });
-            }
-            _ => {}
         }
         true
     }
@@ -1011,45 +866,10 @@ impl App {
                 self.login(&provider, storage_key.as_deref(), terminal)
                     .await;
             }
-            CommandOutcome::BackgroundTask { label, task } => {
-                self.system_line(format!("{label} started in the background"));
-                tokio::spawn(task);
-            }
-            CommandOutcome::HubJoinManual { login_url, pending } => {
-                self.hub_join_manual(login_url, pending, terminal).await;
-            }
             CommandOutcome::Handled => {}
         }
         if input.trim_start().starts_with("/goal") {
             self.refresh_goal_state().await;
-        }
-    }
-
-    /// SSH / remote hub join: drop out of the TUI to show the login link, read the pasted
-    /// one-time code in a cooked terminal, then complete the exchange. The agent loop is
-    /// never driven by this flow.
-    async fn hub_join_manual(
-        &mut self,
-        login_url: String,
-        pending: Box<crate::hub_join::PendingHubJoin>,
-        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    ) {
-        leave_tui().ok();
-        let result = crate::prompt_for_hub_code(&login_url).await;
-        let _ = enter_tui();
-        let _ = terminal.clear();
-        match result {
-            Ok(code) if code.is_empty() => {
-                self.error_line("no code entered; hub join cancelled");
-            }
-            Ok(code) => {
-                if let Err(e) =
-                    commands::complete_hub_join_manual(self.kernel.harness(), pending, &code).await
-                {
-                    self.error_line(e.to_string());
-                }
-            }
-            Err(e) => self.error_line(e.to_string()),
         }
     }
 
@@ -1376,7 +1196,6 @@ impl App {
         // Completion popup, drawn above the input over the feed.
         self.render_completions(frame, status_area);
         self.render_control_plane_prompt(frame);
-        self.render_trigger_prompt(frame);
     }
 
     fn render_control_plane_prompt(&self, frame: &mut ratatui::Frame) {
@@ -1423,51 +1242,6 @@ impl App {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(" Confirm ")
-            .border_style(Style::default().fg(Color::Yellow));
-        frame.render_widget(Clear, rect);
-        frame.render_widget(
-            Paragraph::new(text).block(block).wrap(Wrap { trim: true }),
-            rect,
-        );
-    }
-
-    fn render_trigger_prompt(&self, frame: &mut ratatui::Frame) {
-        let Some(prompt) = self.trigger_prompt.as_ref() else {
-            return;
-        };
-        let area = frame.area();
-        let width = area.width.clamp(46, 78);
-        let height = area.height.clamp(11, 16);
-        let rect = centered_rect(area, width, height);
-        let request = &prompt.request;
-        let sender = trigger_prompt_sender_label(request);
-        let about = trigger_prompt_about(request);
-        let capabilities = trigger_prompt_capabilities(request);
-        let preview = trigger_prompt_summary(request);
-        let trace = safe_trace_prefix(&request.trace_id);
-        let text = vec![
-            Line::styled(
-                "Hub notification · first contact",
-                Style::default().fg(Color::Yellow),
-            ),
-            Line::raw(""),
-            Line::raw(format!("From   {sender}")),
-            Line::raw(format!("About  {about}")),
-            Line::raw(format!("Can    {capabilities}")),
-            Line::raw(""),
-            Line::styled("Message preview", Style::default().fg(Color::Cyan)),
-            Line::raw(format!("\"{preview}\"")),
-            Line::raw(""),
-            Line::styled(
-                "a accept once · A always trust · b block",
-                Style::default().fg(Color::Cyan),
-            ),
-            Line::styled("d deny · Esc skip", Style::default().fg(Color::Cyan)),
-            Line::raw(format!("trace {trace}")),
-        ];
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(" Hub ")
             .border_style(Style::default().fg(Color::Yellow));
         frame.render_widget(Clear, rect);
         frame.render_widget(
@@ -1897,39 +1671,6 @@ impl App {
                             Err(e) => eprintln!("error: compaction failed: {e}"),
                         }
                     }
-                    CommandOutcome::BackgroundTask { label, task } => {
-                        let mut handle = tokio::spawn(task);
-                        if tokio::time::timeout(std::time::Duration::from_secs(3), &mut handle)
-                            .await
-                            .is_err()
-                        {
-                            eprintln!(
-                                "{label} is still waiting in the background; keep pie running in an interactive terminal, or retry after completing the printed recovery steps"
-                            );
-                        }
-                    }
-                    CommandOutcome::HubJoinManual { login_url, pending } => {
-                        println!(
-                            "SSH / remote session detected; finish hub login in a browser, then paste the one-time code:"
-                        );
-                        println!("  {login_url}");
-                        print!("paste hub code: ");
-                        std::io::Write::flush(&mut std::io::stdout()).ok();
-                        match lines.next_line().await {
-                            Ok(Some(code)) => {
-                                if let Err(e) = commands::complete_hub_join_manual(
-                                    self.kernel.harness(),
-                                    pending,
-                                    code.trim(),
-                                )
-                                .await
-                                {
-                                    eprintln!("error: {e}");
-                                }
-                            }
-                            _ => eprintln!("error: no code entered; run /hub join again"),
-                        }
-                    }
                     _ => {}
                 }
                 continue;
@@ -1976,107 +1717,6 @@ fn safe_control_prompt_payload(value: &serde_json::Value, cap: usize) -> String 
     let text = serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string());
     safe_control_prompt_text(&text, cap)
 }
-
-fn safe_trigger_prompt_text(text: &str, cap: usize) -> String {
-    safe_control_prompt_text(text, cap)
-}
-
-fn trigger_prompt_sender_label(request: &pie_agent_core::TriggerPromptRequest) -> String {
-    for candidate in [
-        json_string_at(&request.payload, "/sender/mention"),
-        json_string_at(&request.payload, "/sender_mention"),
-        json_string_at(&request.payload, "/sender/handle"),
-        json_string_at(&request.payload, "/sender_handle"),
-        json_string_at(&request.payload, "/from"),
-        json_string_at(&request.payload, "/authority/principal_label"),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        let redacted = safe_trigger_prompt_text(candidate, 96);
-        if let Some(mention) = crate::hub_client::display_mention(&redacted) {
-            return mention;
-        }
-    }
-    "<hub sender>".into()
-}
-
-fn trigger_prompt_about(request: &pie_agent_core::TriggerPromptRequest) -> String {
-    let display = [
-        json_string_at(&request.payload, "/sender/display_name"),
-        json_string_at(&request.payload, "/profile/display_name"),
-    ]
-    .into_iter()
-    .flatten()
-    .find(|value| !value.trim().is_empty());
-    let description = [
-        json_string_at(&request.payload, "/sender/description"),
-        json_string_at(&request.payload, "/profile/description"),
-        json_string_at(&request.payload, "/authority/principal_label"),
-    ]
-    .into_iter()
-    .flatten()
-    .find(|value| !value.trim().is_empty());
-    let about = match (display, description) {
-        (Some(display), Some(description)) if display != description => {
-            format!("{display} — {description}")
-        }
-        (Some(display), _) => display.to_string(),
-        (_, Some(description)) => description.to_string(),
-        _ => "new hub sender".into(),
-    };
-    safe_trigger_prompt_text(&about, TRIGGER_PROMPT_TEXT_WIDTH)
-}
-
-fn trigger_prompt_capabilities(request: &pie_agent_core::TriggerPromptRequest) -> String {
-    let Some(capabilities) = request
-        .payload
-        .pointer("/sender/capabilities")
-        .or_else(|| request.payload.pointer("/profile/capabilities"))
-        .and_then(|value| value.as_array())
-    else {
-        return "notification".into();
-    };
-    let joined = capabilities
-        .iter()
-        .filter_map(|value| value.as_str())
-        .take(4)
-        .map(|value| safe_trigger_prompt_text(value, 24))
-        .collect::<Vec<_>>()
-        .join(", ");
-    if joined.is_empty() {
-        "notification".into()
-    } else {
-        safe_trigger_prompt_text(&joined, TRIGGER_PROMPT_TEXT_WIDTH)
-    }
-}
-
-fn trigger_prompt_summary(request: &pie_agent_core::TriggerPromptRequest) -> String {
-    let summary = request
-        .trigger_summary
-        .as_deref()
-        .or_else(|| json_string_at(&request.payload, "/payload_summary"))
-        .unwrap_or("notification received");
-    safe_trigger_prompt_text(summary, TRIGGER_PROMPT_SUMMARY_CHARS)
-}
-
-fn json_string_at<'a>(value: &'a serde_json::Value, pointer: &str) -> Option<&'a str> {
-    value.pointer(pointer).and_then(|value| value.as_str())
-}
-
-fn safe_trace_prefix(trace_id: &str) -> String {
-    let prefix: String = trace_id
-        .chars()
-        .filter(|ch| ch.is_ascii_hexdigit())
-        .take(8)
-        .collect();
-    if prefix.is_empty() {
-        "unknown".into()
-    } else {
-        prefix
-    }
-}
-
 fn redact_control_prompt_secrets(text: &str) -> String {
     static TOKENISH_FIELD: Lazy<Regex> = Lazy::new(|| {
         Regex::new(
@@ -2289,8 +1929,6 @@ mod tests {
             feed_rx,
             main_run_rx,
             control_plane_prompt_rx: None,
-            trigger_prompt_rx: None,
-            trigger_prompt_driver: None,
             panel_status: PanelStatus::default(),
         })
     }
@@ -3083,224 +2721,6 @@ mod tests {
         ));
     }
 
-    fn sample_trigger_prompt_request() -> pie_agent_core::TriggerPromptRequest {
-        pie_agent_core::TriggerPromptRequest {
-            trigger_prompt_id: "prompt_1".into(),
-            trace_id: "8a4b3c2d-1111-4111-8111-111111111111".into(),
-            source_label: "mcp:pie-hub:custom:agent_message:evt-secret".into(),
-            receiver_agent_id: Some("11111111-1111-4111-8111-111111111111".into()),
-            sender_agent_id: "22222222-2222-4222-8222-222222222222".into(),
-            action_class: "notification".into(),
-            trigger_summary: Some(
-                "在吗? token=hub_agent_SECRETSECRETSECRET and this tail should be capped".into(),
-            ),
-            payload: serde_json::json!({
-                "sender": {
-                    "mention": "@alice@dongxu",
-                    "display_name": "Alice hub_agent_SECRETSECRETSECRET",
-                    "description": "Software engineer working on pie",
-                    "capabilities": ["pair-programming", "code-review", "hub_agent_SECRETSECRETSECRET"]
-                },
-                "payload": {
-                    "note": "raw Local payload must never render"
-                },
-                "_meta": {
-                    "sender_ip": "203.0.113.10",
-                    "agent_id": "22222222-2222-4222-8222-222222222222"
-                }
-            }),
-            reason: "first contact".into(),
-        }
-    }
-
-    #[test]
-    fn trigger_prompt_card_redacts_and_skip_is_terminal_timeout_without_clearing_queue() {
-        use tokio::sync::oneshot;
-
-        let mut app = test_app();
-        app.queue_user_prompt("queued input".into(), "queued input".into(), Vec::new());
-        let (tx, mut rx) = oneshot::channel();
-        app.show_trigger_prompt(UiTriggerPrompt {
-            request: sample_trigger_prompt_request(),
-            responder: tx,
-        });
-
-        let backend = TestBackend::new(96, 26);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| app.render(f)).unwrap();
-        let rendered = buffer_text(terminal.backend().buffer());
-        assert!(rendered.contains("Hub notification · first contact"));
-        assert!(rendered.contains("From   alice@dongxu"), "{rendered}");
-        assert!(!rendered.contains("@alice@dongxu"), "{rendered}");
-        assert!(rendered.contains("pair-programming"), "{rendered}");
-        assert!(rendered.contains("Message preview"), "{rendered}");
-        assert!(!rendered.contains("deferred_by_user"), "{rendered}");
-        assert!(!rendered.contains("raw Local payload"), "{rendered}");
-        assert!(!rendered.contains("hub_agent_SECRET"), "{rendered}");
-        assert!(
-            !rendered.contains("22222222-2222-4222-8222-222222222222"),
-            "{rendered}"
-        );
-        assert!(!rendered.contains("mcp:pie-hub"), "{rendered}");
-
-        assert!(app.handle_trigger_prompt_key(&KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())));
-        assert!(app.trigger_prompt.is_none());
-        let resolution = rx.try_recv().expect("timeout decision should be sent");
-        match resolution.decision {
-            pie_agent_core::TriggerPromptDecision::Timeout { reason } => {
-                assert_eq!(reason.as_deref(), Some("deferred_by_user"));
-            }
-            other => panic!("expected timeout decision, got {other:?}"),
-        }
-        assert_eq!(resolution.trust_decision, None);
-        assert_eq!(
-            app.queued_turns.len(),
-            1,
-            "skipping a hub prompt must not clear unrelated queued user input"
-        );
-        terminal.draw(|f| app.render(f)).unwrap();
-        let rendered = buffer_text(terminal.backend().buffer());
-        assert!(rendered.contains("skipped hub notification: alice@dongxu"));
-        assert!(!rendered.contains("@alice@dongxu"), "{rendered}");
-        assert!(!rendered.contains("deferred_by_user"), "{rendered}");
-    }
-
-    #[test]
-    fn trigger_prompt_accept_always_deny_and_block_send_expected_decisions() {
-        use tokio::sync::oneshot;
-
-        let mut app = test_app();
-        let (tx, mut rx) = oneshot::channel();
-        app.show_trigger_prompt(UiTriggerPrompt {
-            request: sample_trigger_prompt_request(),
-            responder: tx,
-        });
-        assert!(
-            app.handle_trigger_prompt_key(&KeyEvent::new(
-                KeyCode::Char('a'),
-                KeyModifiers::empty()
-            ))
-        );
-        let resolution = rx.try_recv().expect("accept once should resolve");
-        assert!(matches!(
-            resolution.decision,
-            pie_agent_core::TriggerPromptDecision::Allow
-        ));
-        assert_eq!(resolution.trust_decision, None);
-        let backend = TestBackend::new(96, 26);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| app.render(f)).unwrap();
-        let rendered = buffer_text(terminal.backend().buffer());
-        assert!(
-            rendered.contains("hub notification summary: alice@dongxu"),
-            "{rendered}"
-        );
-        assert!(!rendered.contains("@alice@dongxu"), "{rendered}");
-        assert!(rendered.contains("token=[REDACTED]"), "{rendered}");
-        assert!(!rendered.contains("raw Local payload"), "{rendered}");
-        assert!(!rendered.contains("hub_agent_SECRET"), "{rendered}");
-
-        let (tx, mut rx) = oneshot::channel();
-        app.show_trigger_prompt(UiTriggerPrompt {
-            request: sample_trigger_prompt_request(),
-            responder: tx,
-        });
-        assert!(
-            app.handle_trigger_prompt_key(&KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT))
-        );
-        let resolution = rx.try_recv().expect("always trust should resolve");
-        assert!(matches!(
-            resolution.decision,
-            pie_agent_core::TriggerPromptDecision::Allow
-        ));
-        assert_eq!(
-            resolution.trust_decision,
-            Some(TriggerTrustDecision::Always)
-        );
-
-        let (tx, mut rx) = oneshot::channel();
-        app.show_trigger_prompt(UiTriggerPrompt {
-            request: sample_trigger_prompt_request(),
-            responder: tx,
-        });
-        assert!(
-            app.handle_trigger_prompt_key(&KeyEvent::new(
-                KeyCode::Char('d'),
-                KeyModifiers::empty()
-            ))
-        );
-        let resolution = rx.try_recv().expect("deny should resolve");
-        match resolution.decision {
-            pie_agent_core::TriggerPromptDecision::Deny { reason } => {
-                assert_eq!(reason.as_deref(), Some("denied by user"));
-            }
-            other => panic!("expected deny decision, got {other:?}"),
-        }
-        assert_eq!(resolution.trust_decision, None);
-
-        let (tx, mut rx) = oneshot::channel();
-        app.show_trigger_prompt(UiTriggerPrompt {
-            request: sample_trigger_prompt_request(),
-            responder: tx,
-        });
-        assert!(
-            app.handle_trigger_prompt_key(&KeyEvent::new(
-                KeyCode::Char('b'),
-                KeyModifiers::empty()
-            ))
-        );
-        let resolution = rx.try_recv().expect("block should resolve");
-        match resolution.decision {
-            pie_agent_core::TriggerPromptDecision::Deny { reason } => {
-                assert_eq!(reason.as_deref(), Some("blocked by user"));
-            }
-            other => panic!("expected block deny decision, got {other:?}"),
-        }
-        assert_eq!(resolution.trust_decision, Some(TriggerTrustDecision::Block));
-    }
-
-    #[test]
-    fn trigger_prompt_driver_resolves_prompt_without_pty_key_timing() {
-        use tokio::sync::oneshot;
-
-        let mut app = test_app();
-        app.trigger_prompt_driver = Some(TriggerPromptDriverDecision::Always);
-        let (tx, mut rx) = oneshot::channel();
-        app.show_trigger_prompt(UiTriggerPrompt {
-            request: sample_trigger_prompt_request(),
-            responder: tx,
-        });
-
-        assert!(app.trigger_prompt.is_none());
-        let resolution = rx
-            .try_recv()
-            .expect("headless driver should resolve immediately");
-        assert!(matches!(
-            resolution.decision,
-            pie_agent_core::TriggerPromptDecision::Allow
-        ));
-        assert_eq!(
-            resolution.trust_decision,
-            Some(TriggerTrustDecision::Always)
-        );
-
-        let backend = TestBackend::new(96, 26);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| app.render(f)).unwrap();
-        let rendered = buffer_text(terminal.backend().buffer());
-        assert!(
-            rendered.contains("trusted hub sender for future notifications: alice@dongxu"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("hub notification summary: alice@dongxu"),
-            "{rendered}"
-        );
-        assert!(!rendered.contains("@alice@dongxu"), "{rendered}");
-        assert!(!rendered.contains("raw Local payload"), "{rendered}");
-        assert!(!rendered.contains("hub_agent_SECRET"), "{rendered}");
-    }
-
     #[test]
     fn headless_control_plane_prompt_hook_denies_with_recovery() {
         let hook = crate::control_plane_prompt::deny_hook(
@@ -3354,15 +2774,6 @@ mod tests {
         assert!(msg.contains("/login ds4"));
         assert!(!msg.contains("api key for"));
         assert!(!msg.contains("sk-"));
-    }
-
-    #[test]
-    fn login_requires_tty_message_accepts_hub_specific_recovery() {
-        let msg = crate::login_requires_tty_message("pie-hub", Some("/hub login"));
-        assert!(msg.contains("interactive terminal"));
-        assert!(msg.contains("/hub login"));
-        assert!(!msg.contains("/login pie-hub"));
-        assert!(!msg.contains("pie-hub:default"));
     }
 
     #[test]

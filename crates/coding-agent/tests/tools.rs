@@ -9,6 +9,9 @@ use tokio_util::sync::CancellationToken;
 // Pull tool types out of the binary crate by including the source. Test-only.
 // `skills_state` is a top-level module that `tools::set_skill_state` references via
 // `crate::skills_state`, so it must be in this test binary's module tree too.
+#[path = "../src/auth.rs"]
+#[allow(dead_code)]
+mod auth;
 #[path = "../src/bug_report.rs"]
 #[allow(dead_code)]
 mod bug_report;
@@ -24,18 +27,6 @@ mod skills_state;
 #[path = "../src/tools/mod.rs"]
 #[allow(dead_code)]
 mod tools;
-// Minimal stub: hub_client needs only these two constants from mcp_loader.
-#[allow(dead_code)]
-mod mcp_loader {
-    pub const BUILT_IN_HUB_TOKEN_REF: &str = "pie-hub:default";
-    pub const BUILT_IN_HUB_ENDPOINT: &str = "https://pie.0xfefe.me/mcp";
-}
-#[path = "../src/auth.rs"]
-#[allow(dead_code)]
-mod auth;
-#[path = "../src/hub_client.rs"]
-#[allow(dead_code)]
-mod hub_client;
 #[path = "../src/triggers/mod.rs"]
 #[allow(dead_code)]
 mod triggers;

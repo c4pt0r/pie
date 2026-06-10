@@ -454,14 +454,6 @@ impl App {
                     "web login is not implemented yet; run `{command}` from the terminal UI"
                 ));
             }
-            CommandOutcome::BackgroundTask { task, .. } => {
-                tokio::spawn(task);
-            }
-            CommandOutcome::HubJoinManual { login_url, .. } => {
-                self.error_line(format!(
-                    "this session can't auto-open a browser; open {login_url} to sign in, then run /hub join from a terminal UI to paste the code"
-                ));
-            }
             CommandOutcome::Handled => {}
         }
         if input.trim_start().starts_with("/goal") {
@@ -769,9 +761,6 @@ fn bind_addr(options: &WebOptions) -> Result<SocketAddr> {
 }
 
 fn open_web_browser(url: &str) -> Result<()> {
-    if !crate::hub_join::browser_auto_open_available() {
-        bail!("browser auto-open unavailable in this session");
-    }
     let mut command = open_browser_command(url);
     command
         .stdin(std::process::Stdio::null())

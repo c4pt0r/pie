@@ -22,6 +22,9 @@ use pie_ai::{
 use tokio_util::sync::CancellationToken;
 
 #[allow(dead_code)]
+#[path = "../src/auth.rs"]
+mod auth;
+#[allow(dead_code)]
 #[path = "../src/bug_report.rs"]
 mod bug_report;
 #[allow(dead_code)]
@@ -30,18 +33,6 @@ mod config;
 #[allow(dead_code)]
 #[path = "../src/export.rs"]
 mod export;
-// Minimal stub: hub_client needs only these two constants from mcp_loader.
-#[allow(dead_code)]
-mod mcp_loader {
-    pub const BUILT_IN_HUB_TOKEN_REF: &str = "pie-hub:default";
-    pub const BUILT_IN_HUB_ENDPOINT: &str = "https://pie.0xfefe.me/mcp";
-}
-#[allow(dead_code)]
-#[path = "../src/auth.rs"]
-mod auth;
-#[allow(dead_code)]
-#[path = "../src/hub_client.rs"]
-mod hub_client;
 #[allow(dead_code)]
 #[path = "../src/triggers/mod.rs"]
 mod triggers;

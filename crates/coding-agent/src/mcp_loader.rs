@@ -21,10 +21,6 @@ use crate::config::base_dir;
 use crate::tools::mcp_adapter::McpAgentTool;
 use crate::triggers::McpNotificationHook;
 
-pub const BUILT_IN_HUB_SERVER_NAME: &str = crate::config::HUB_SERVER_NAME;
-pub const BUILT_IN_HUB_TOKEN_REF: &str = "pie-hub:default";
-pub const BUILT_IN_HUB_ENDPOINT: &str = "https://pie.0xfefe.me/mcp";
-
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct McpConfig {
     #[serde(default)]
@@ -140,68 +136,6 @@ pub async fn load_all(cwd: &Path) -> LoadedMcp {
         notification_hooks,
         inject_summary_servers,
         inject_and_run_servers,
-    }
-}
-
-fn built_in_hub_server() -> ServerConfig {
-    ServerConfig {
-        name: BUILT_IN_HUB_SERVER_NAME.into(),
-        kind: ServerKind::StreamableHttp,
-        command: None,
-        args: Vec::new(),
-        endpoint: Some(
-            test_built_in_hub_endpoint().unwrap_or_else(|| BUILT_IN_HUB_ENDPOINT.into()),
-        ),
-        auth: Some(HttpAuthConfig {
-            kind: "bearer".into(),
-            token_keychain_ref: Some(BUILT_IN_HUB_TOKEN_REF.into()),
-        }),
-        request_timeout_ms: None,
-        sse_idle_timeout_ms: None,
-        body_cap_bytes: None,
-        reconnect: None,
-        inject_summary: false,
-        inject_and_run: false,
-    }
-}
-
-pub async fn connect_built_in_hub_notification_hook() -> Result<Arc<McpNotificationHook>> {
-    let (_tools, hook) = connect_one(&built_in_hub_server()).await?;
-    Ok(hook)
-}
-
-#[cfg(test)]
-static TEST_BUILT_IN_HUB_ENDPOINT: once_cell::sync::Lazy<parking_lot::Mutex<Option<String>>> =
-    once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(None));
-
-#[cfg(test)]
-#[allow(dead_code)]
-pub(crate) struct BuiltInHubEndpointTestGuard;
-
-#[cfg(test)]
-#[allow(dead_code)]
-pub(crate) fn install_test_built_in_hub_endpoint(
-    endpoint: impl Into<String>,
-) -> BuiltInHubEndpointTestGuard {
-    *TEST_BUILT_IN_HUB_ENDPOINT.lock() = Some(endpoint.into());
-    BuiltInHubEndpointTestGuard
-}
-
-#[cfg(test)]
-impl Drop for BuiltInHubEndpointTestGuard {
-    fn drop(&mut self) {
-        *TEST_BUILT_IN_HUB_ENDPOINT.lock() = None;
-    }
-}
-
-fn test_built_in_hub_endpoint() -> Option<String> {
-    #[cfg(test)]
-    {
-        TEST_BUILT_IN_HUB_ENDPOINT.lock().clone()
-    }
-    #[cfg(not(test))]
-    {
-        None
     }
 }
 
@@ -519,59 +453,6 @@ body_cap_bytes = 1048576
         );
     }
 
-    struct EnvGuard {
-        key: &'static str,
-        original: Option<std::ffi::OsString>,
-    }
-
-    impl EnvGuard {
-        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-            let original = std::env::var_os(key);
-            unsafe { std::env::set_var(key, value) };
-            Self { key, original }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match self.original.take() {
-                Some(value) => unsafe { std::env::set_var(self.key, value) },
-                None => unsafe { std::env::remove_var(self.key) },
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn stored_hub_credential_does_not_create_implicit_server() {
-        let _env_lock = crate::auth::ENV_LOCK.lock().unwrap();
-        let temp = tempfile::TempDir::new().unwrap();
-        let _pie_dir = EnvGuard::set("PIE_DIR", temp.path());
-
-        let mut store = crate::auth::AuthStore::default();
-        store.set(
-            BUILT_IN_HUB_TOKEN_REF,
-            crate::auth::ProviderCredential::ApiKey {
-                value: "hub_agent_test_token_should_not_leak".into(),
-            },
-        );
-        store.save().unwrap();
-
-        let cwd = temp.path().join("project");
-        std::fs::create_dir_all(&cwd).unwrap();
-        let loaded = load_all(&cwd).await;
-        assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
-        assert_eq!(loaded.client_count, 0);
-        assert!(loaded.server_names.is_empty());
-        assert!(
-            loaded.tools.is_empty(),
-            "stored credentials must not implicitly add MCP tools"
-        );
-        assert!(
-            loaded.notification_hooks.is_empty(),
-            "stored credentials must not implicitly add MCP notification hooks"
-        );
-    }
-
     #[tokio::test]
     async fn streamable_http_rejects_command_args() {
         let server = ServerConfig {
@@ -627,7 +508,7 @@ body_cap_bytes = 1048576
     fn streamable_http_missing_auth_diagnostic_does_not_echo_token_ref() {
         let store = crate::auth::AuthStore::default();
 
-        let secret_like_ref = "hub_agent_should_not_leak";
+        let secret_like_ref = "secret_ref_should_not_leak";
         let err = resolve_http_auth_from_store(
             Some(&HttpAuthConfig {
                 kind: "bearer".into(),
