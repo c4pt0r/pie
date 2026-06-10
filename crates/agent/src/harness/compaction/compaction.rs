@@ -97,57 +97,58 @@ pub fn get_last_assistant_usage(entries: &[SessionTreeEntry]) -> Option<Usage> {
     None
 }
 
-/// Conservative char-based estimate. ~4 chars per token works well for English; we round up.
+/// Conservative char-class-aware text estimate: ~4 chars per token for ASCII, ~1 token per char
+/// for non-ASCII (CJK and similar scripts tokenize close to one token per character). Rounds up.
+pub fn estimate_text_tokens(s: &str) -> u64 {
+    let mut ascii = 0u64;
+    let mut non_ascii = 0u64;
+    for c in s.chars() {
+        if c.is_ascii() {
+            ascii += 1;
+        } else {
+            non_ascii += 1;
+        }
+    }
+    ascii.div_ceil(4) + non_ascii
+}
+
+/// Conservative per-message estimate built on [`estimate_text_tokens`].
 pub fn estimate_tokens(message: &AgentMessage) -> u64 {
-    let mut chars = 0usize;
     match message {
         AgentMessage::Llm(PiMessage::User(u)) => match &u.content {
-            pie_ai::UserContent::Text(s) => chars += s.len(),
-            pie_ai::UserContent::Blocks(blocks) => {
-                for b in blocks {
-                    chars += user_block_chars(b);
-                }
-            }
+            pie_ai::UserContent::Text(s) => estimate_text_tokens(s),
+            pie_ai::UserContent::Blocks(blocks) => blocks.iter().map(user_block_tokens).sum(),
         },
         AgentMessage::Llm(PiMessage::Assistant(a)) => {
-            for b in &a.content {
-                chars += content_block_chars(b);
-            }
+            a.content.iter().map(content_block_tokens).sum()
         }
         AgentMessage::Llm(PiMessage::ToolResult(tr)) => {
-            chars += tr.tool_name.len();
-            for b in &tr.content {
-                chars += user_block_chars(b);
-            }
+            estimate_text_tokens(&tr.tool_name)
+                + tr.content.iter().map(user_block_tokens).sum::<u64>()
         }
         AgentMessage::Custom(c) => {
-            chars += c.role.len();
-            chars += c.payload.to_string().len();
+            estimate_text_tokens(&c.role) + estimate_text_tokens(&c.payload.to_string())
         }
     }
-    // Round up: ~4 chars per token.
-    chars.div_ceil(4) as u64
 }
 
-fn user_block_chars(b: &pie_ai::UserContentBlock) -> usize {
+fn user_block_tokens(b: &pie_ai::UserContentBlock) -> u64 {
     match b {
-        pie_ai::UserContentBlock::Text(t) => t.text.len(),
-        // Images are weighted as a flat 768 tokens (~3072 chars) — matches Anthropic's pricing
-        // approximation. TS uses a similar heuristic.
-        pie_ai::UserContentBlock::Image(_) => 3072,
+        pie_ai::UserContentBlock::Text(t) => estimate_text_tokens(&t.text),
+        // Images are weighted as a flat 768 tokens — matches Anthropic's pricing approximation.
+        // TS uses a similar heuristic.
+        pie_ai::UserContentBlock::Image(_) => 768,
     }
 }
 
-fn content_block_chars(b: &pie_ai::ContentBlock) -> usize {
+fn content_block_tokens(b: &pie_ai::ContentBlock) -> u64 {
     match b {
-        pie_ai::ContentBlock::Text(t) => t.text.len(),
-        pie_ai::ContentBlock::Thinking(t) => t.thinking.len(),
-        pie_ai::ContentBlock::Image(_) => 3072,
+        pie_ai::ContentBlock::Text(t) => estimate_text_tokens(&t.text),
+        pie_ai::ContentBlock::Thinking(t) => estimate_text_tokens(&t.thinking),
+        pie_ai::ContentBlock::Image(_) => 768,
         pie_ai::ContentBlock::ToolCall(tc) => {
-            tc.name.len()
-                + serde_json::Value::Object(tc.arguments.clone())
-                    .to_string()
-                    .len()
+            estimate_text_tokens(&tc.name)
+                + estimate_text_tokens(&serde_json::Value::Object(tc.arguments.clone()).to_string())
         }
     }
 }
@@ -340,31 +341,58 @@ pub fn serialize_conversation(messages: &[AgentMessage]) -> String {
     out
 }
 
+/// Prompt framing slack (message wrappers, the omission-note message, provider envelope).
+const SUMMARY_PROMPT_FRAMING_TOKENS: u64 = 512;
+/// Floor for the overflow-retry budget halving in [`compact`].
+const MIN_SUMMARY_PROMPT_BUDGET_TOKENS: u64 = 1_024;
+/// Maximum provider-overflow retries before compaction gives up.
+const MAX_SUMMARY_OVERFLOW_RETRIES: u32 = 3;
+
+/// Output cap sent as `max_tokens` on the summarizer call. Providers fall back to
+/// `model.max_tokens` when unset, and `input + max_tokens > context_window` is a hard 400 on
+/// Anthropic — so the summarizer must always send an explicit, bounded value.
+fn summary_output_tokens(model: &Model, settings: &CompactionSettings) -> u32 {
+    let reserve = if settings.reserve_tokens > 0 {
+        settings.reserve_tokens
+    } else {
+        DEFAULT_COMPACTION_SETTINGS.reserve_tokens
+    };
+    let mut output = if model.max_tokens > 0 {
+        model.max_tokens.min(reserve)
+    } else {
+        reserve
+    };
+    if model.context_window > 0 {
+        output = output.min(model.context_window / 4).max(1);
+    }
+    output
+}
+
 fn summarization_prompt_budget(model: &Model, settings: &CompactionSettings) -> u64 {
     if model.context_window == 0 {
         return DEFAULT_SUMMARY_PROMPT_TOKEN_BUDGET;
     }
-    let available = model.context_window.saturating_sub(settings.reserve_tokens);
-    if available > 0 {
-        available as u64
-    } else {
-        (model.context_window as u64)
-            .saturating_mul(4)
-            .saturating_div(5)
-    }
+    let window = model.context_window as u64;
+    let output = summary_output_tokens(model, settings) as u64;
+    // Keep 20% slack below (window - output): the char-class token estimate can undercount on
+    // code-heavy or mixed-script content, and Anthropic rejects input + max_tokens > window.
+    window.saturating_sub(output).saturating_mul(4) / 5
+}
+
+fn summary_prompt_overhead_tokens(custom_instructions: Option<&str>) -> u64 {
+    SUMMARY_PROMPT_FRAMING_TOKENS
+        + estimate_text_tokens(SUMMARIZATION_SYSTEM_PROMPT)
+        + custom_instructions
+            .map(estimate_text_tokens)
+            .unwrap_or_default()
 }
 
 fn summarize_prompt_estimate_tokens(
     messages: &[AgentMessage],
     custom_instructions: Option<&str>,
 ) -> u64 {
-    let custom = custom_instructions
-        .map(|s| s.len().div_ceil(4) as u64)
-        .unwrap_or_default();
-    let framing = 512;
-    let system = SUMMARIZATION_SYSTEM_PROMPT.len().div_ceil(4) as u64;
     let conversation: u64 = messages.iter().map(estimate_tokens).sum();
-    framing + system + custom + conversation
+    summary_prompt_overhead_tokens(custom_instructions) + conversation
 }
 
 fn trim_messages_for_summary_budget(
@@ -377,11 +405,7 @@ fn trim_messages_for_summary_budget(
     }
 
     let mut kept = Vec::new();
-    let mut total = 512
-        + SUMMARIZATION_SYSTEM_PROMPT.len().div_ceil(4) as u64
-        + custom_instructions
-            .map(|s| s.len().div_ceil(4) as u64)
-            .unwrap_or_default();
+    let mut total = summary_prompt_overhead_tokens(custom_instructions);
     for message in messages.iter().rev() {
         let message_tokens = estimate_tokens(message);
         if !kept.is_empty() && total + message_tokens > budget_tokens {
@@ -410,6 +434,28 @@ fn trim_messages_for_summary_budget(
     kept
 }
 
+/// Byte index where the suffix of `s` last fits within `budget_tokens` by the char-class
+/// estimate. Always lands on a char boundary.
+fn suffix_start_for_token_budget(s: &str, budget_tokens: u64) -> usize {
+    let mut ascii = 0u64;
+    let mut non_ascii = 0u64;
+    let mut start = s.len();
+    for (idx, c) in s.char_indices().rev() {
+        let (next_ascii, next_non_ascii) = if c.is_ascii() {
+            (ascii + 1, non_ascii)
+        } else {
+            (ascii, non_ascii + 1)
+        };
+        if next_ascii.div_ceil(4) + next_non_ascii > budget_tokens {
+            break;
+        }
+        ascii = next_ascii;
+        non_ascii = next_non_ascii;
+        start = idx;
+    }
+    start
+}
+
 fn serialize_conversation_for_summary_budget(
     messages: &[AgentMessage],
     budget_tokens: u64,
@@ -417,32 +463,24 @@ fn serialize_conversation_for_summary_budget(
 ) -> String {
     let messages = trim_messages_for_summary_budget(messages, budget_tokens, custom_instructions);
     let conversation = serialize_conversation(&messages);
-    let overhead_tokens = 512
-        + SUMMARIZATION_SYSTEM_PROMPT.len().div_ceil(4) as u64
-        + custom_instructions
-            .map(|s| s.len().div_ceil(4) as u64)
-            .unwrap_or_default();
-    let available_chars = budget_tokens
-        .saturating_sub(overhead_tokens)
-        .saturating_mul(4) as usize;
-    let note = "[compaction note: omitted older serialized content before summarization because the session exceeded the summarizer prompt budget]\n\n";
-    if conversation.len() <= available_chars {
+    let available_tokens =
+        budget_tokens.saturating_sub(summary_prompt_overhead_tokens(custom_instructions));
+    if estimate_text_tokens(&conversation) <= available_tokens {
         return conversation;
     }
-    if available_chars <= note.len() {
-        return note.chars().take(available_chars).collect();
+
+    let note = "[compaction note: omitted older serialized content before summarization because the session exceeded the summarizer prompt budget]\n\n";
+    let note_tokens = estimate_text_tokens(note);
+    if available_tokens <= note_tokens {
+        // The note is ASCII, so ~4 chars per token.
+        return note
+            .chars()
+            .take(available_tokens.saturating_mul(4) as usize)
+            .collect();
     }
 
-    let keep_chars = available_chars - note.len();
-    let suffix: String = conversation
-        .chars()
-        .rev()
-        .take(keep_chars)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    format!("{note}{suffix}")
+    let start = suffix_start_for_token_budget(&conversation, available_tokens - note_tokens);
+    format!("{note}{}", &conversation[start..])
 }
 
 #[derive(Clone)]
@@ -451,6 +489,9 @@ pub struct GenerateSummaryRequest {
     pub messages: Vec<AgentMessage>,
     pub custom_instructions: Option<String>,
     pub prompt_budget_tokens: Option<u64>,
+    /// Explicit `max_tokens` for the summarizer call. Providers fall back to `model.max_tokens`
+    /// when `None`, which can push `input + max_tokens` past the context window.
+    pub max_output_tokens: Option<u32>,
     /// Override stream function; falls back to `pie_ai::stream_simple` when `None`.
     pub stream_fn: Option<StreamFn>,
 }
@@ -494,6 +535,7 @@ pub async fn generate_summary(
     let stream_fn = request.stream_fn.unwrap_or_else(default_stream_fn);
     let mut options = SimpleStreamOptions::default();
     options.base.abort = Some(cancel.clone());
+    options.base.max_tokens = request.max_output_tokens;
 
     let mut stream = stream_fn(&request.model, &context, Some(&options));
     let mut last: Option<AssistantMessage> = None;
@@ -504,11 +546,17 @@ pub async fn generate_summary(
         match ev {
             AssistantMessageEvent::Done { message, .. } => last = Some(message),
             AssistantMessageEvent::Error { error, .. } => {
-                return Err(SummarizeError::Provider(
-                    error
-                        .error_message
-                        .unwrap_or_else(|| "summarization failed".into()),
-                ));
+                let window = (request.model.context_window > 0)
+                    .then_some(request.model.context_window as u64);
+                let overflowed = pie_ai::is_context_overflow(&error, window);
+                let message = error
+                    .error_message
+                    .unwrap_or_else(|| "summarization failed".into());
+                return Err(if overflowed {
+                    SummarizeError::ContextOverflow(message)
+                } else {
+                    SummarizeError::Provider(message)
+                });
             }
             _ => {}
         }
@@ -535,6 +583,8 @@ pub enum SummarizeError {
     Aborted,
     #[error("provider error: {0}")]
     Provider(String),
+    #[error("summarizer prompt overflowed the model context window: {0}")]
+    ContextOverflow(String),
     #[error("summarizer produced no message")]
     Empty,
 }
@@ -608,17 +658,38 @@ pub async fn compact(
             _ => None,
         })
         .collect();
-    let out = generate_summary(
-        GenerateSummaryRequest {
-            prompt_budget_tokens: Some(summarization_prompt_budget(&model, settings)),
-            model,
-            messages,
-            custom_instructions,
-            stream_fn,
-        },
-        cancel,
-    )
-    .await?;
+    // The prompt budget is a char-class estimate, so the provider can still reject the call as a
+    // context overflow. Halve the budget and retry instead of failing the whole compaction.
+    let max_output_tokens = summary_output_tokens(&model, settings);
+    let mut budget = summarization_prompt_budget(&model, settings);
+    let mut attempts = 0u32;
+    let out = loop {
+        let result = generate_summary(
+            GenerateSummaryRequest {
+                model: model.clone(),
+                messages: messages.clone(),
+                custom_instructions: custom_instructions.clone(),
+                prompt_budget_tokens: Some(budget),
+                max_output_tokens: Some(max_output_tokens),
+                stream_fn: stream_fn.clone(),
+            },
+            cancel.clone(),
+        )
+        .await;
+        match result {
+            Ok(out) => break out,
+            Err(SummarizeError::ContextOverflow(message)) => {
+                attempts += 1;
+                if attempts > MAX_SUMMARY_OVERFLOW_RETRIES
+                    || budget <= MIN_SUMMARY_PROMPT_BUDGET_TOKENS
+                {
+                    return Err(SummarizeError::ContextOverflow(message));
+                }
+                budget = (budget / 2).max(MIN_SUMMARY_PROMPT_BUDGET_TOKENS);
+            }
+            Err(e) => return Err(e),
+        }
+    };
     Ok(CompactionResult {
         summary: out.summary,
         first_kept_entry_id: prep.cut.first_kept_entry_id,
@@ -640,7 +711,7 @@ mod tests {
         }))
     }
 
-    fn model_with_context_window(context_window: u32) -> Model {
+    fn model_with_limits(context_window: u32, max_tokens: u32) -> Model {
         Model {
             id: "faux".into(),
             name: "Faux".into(),
@@ -652,10 +723,47 @@ mod tests {
             input: vec![],
             cost: pie_ai::ModelCost::default(),
             context_window,
-            max_tokens: 0,
+            max_tokens,
             headers: None,
             compat: None,
         }
+    }
+
+    fn model_with_context_window(context_window: u32) -> Model {
+        model_with_limits(context_window, 0)
+    }
+
+    fn done_message(text: &str) -> AssistantMessage {
+        AssistantMessage {
+            role: pie_ai::AssistantRole::Assistant,
+            content: vec![pie_ai::ContentBlock::text(text)],
+            api: pie_ai::Api::from("faux"),
+            provider: pie_ai::Provider::from("faux"),
+            model: "faux".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            usage: Usage::default(),
+            stop_reason: pie_ai::StopReason::Stop,
+            error_message: None,
+            timestamp: 0,
+        }
+    }
+
+    fn oversized_entries(count: usize) -> Vec<SessionTreeEntry> {
+        let mut entries = Vec::new();
+        let mut parent_id = None;
+        for i in 0..count {
+            let id = format!("entry-{i}");
+            entries.push(SessionTreeEntry::Message {
+                id: id.clone(),
+                parent_id: parent_id.clone(),
+                timestamp: "t".into(),
+                message: user(&format!("old-msg-{i} {}", "x".repeat(1600))),
+            });
+            parent_id = Some(id);
+        }
+        entries
     }
 
     fn assistant(text: &str, stop: pie_ai::StopReason, usage: Usage) -> AgentMessage {
@@ -786,6 +894,153 @@ mod tests {
         assert!(
             conversation.starts_with("[compaction note: omitted older serialized content"),
             "single-message truncation must disclose omitted content"
+        );
+    }
+
+    #[tokio::test]
+    async fn summarizer_request_sets_bounded_max_tokens() {
+        // Claude-4.x shape: 200k window, 64k default max output. The provider falls back to
+        // model.max_tokens when options don't set one, which would make input+output overflow
+        // the window. The summarizer must send an explicit, bounded max_tokens.
+        let entries = oversized_entries(10);
+        let captured_max_tokens = Arc::new(Mutex::new(None::<u32>));
+        let captured_clone = captured_max_tokens.clone();
+        let stream_fn: StreamFn = Arc::new(move |_, _, options| {
+            *captured_clone.lock().unwrap() = options.and_then(|o| o.base.max_tokens);
+            let (stream, mut sender) = pie_ai::AssistantMessageEventStream::new();
+            tokio::spawn(async move {
+                sender.push(AssistantMessageEvent::Done {
+                    reason: pie_ai::DoneReason::Stop,
+                    message: done_message("summary"),
+                });
+            });
+            stream
+        });
+
+        compact(
+            model_with_limits(200_000, 64_000),
+            &entries,
+            &CompactionSettings {
+                enabled: true,
+                reserve_tokens: 16_384,
+                keep_recent_tokens: 1,
+            },
+            None,
+            Some(stream_fn),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("compaction should succeed");
+
+        let max_tokens = captured_max_tokens.lock().unwrap().take();
+        assert_eq!(
+            max_tokens,
+            Some(16_384),
+            "summarizer must cap output at reserve_tokens instead of inheriting model.max_tokens"
+        );
+    }
+
+    #[test]
+    fn summary_budget_leaves_room_for_output_and_estimate_error() {
+        let model = model_with_limits(200_000, 64_000);
+        let settings = CompactionSettings {
+            enabled: true,
+            reserve_tokens: 16_384,
+            keep_recent_tokens: 20_000,
+        };
+        let budget = summarization_prompt_budget(&model, &settings);
+        assert!(budget > 0);
+        // The char-based token estimate can undercount by ~20-30% on code or CJK text, so the
+        // prompt budget must keep slack below (window - reserved output) rather than using it all.
+        assert!(
+            budget <= (200_000 - 16_384) * 4 / 5,
+            "budget {budget} leaves no slack for token-estimate error"
+        );
+    }
+
+    #[test]
+    fn cjk_truncation_respects_token_budget() {
+        // CJK chars are ~1 token each but 3 UTF-8 bytes; a bytes/4 estimate undercounts ~3x.
+        let conversation =
+            serialize_conversation_for_summary_budget(&[user(&"夏".repeat(50_000))], 2_000, None);
+        let ascii = conversation.chars().filter(char::is_ascii).count() as u64;
+        let non_ascii = conversation.chars().count() as u64 - ascii;
+        let estimated_tokens = ascii.div_ceil(4) + non_ascii;
+        assert!(
+            estimated_tokens <= 2_000,
+            "CJK-heavy prompt must fit the token budget; estimated {estimated_tokens} tokens"
+        );
+        assert!(
+            conversation.contains("[compaction note: omitted"),
+            "truncation must disclose omitted content"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_retries_with_smaller_budget_on_provider_overflow() {
+        // Even a bounded estimate can undercount real tokens; when the provider still rejects
+        // the summarizer call as context overflow, compaction must retry with a smaller prompt
+        // instead of failing the whole compaction.
+        let entries = oversized_entries(80);
+        let prompt_lens = Arc::new(Mutex::new(Vec::<usize>::new()));
+        let prompt_lens_clone = prompt_lens.clone();
+        let stream_fn: StreamFn = Arc::new(move |_, context, _| {
+            let text = match &context.messages[0] {
+                PiMessage::User(user) => match &user.content {
+                    pie_ai::UserContent::Text(text) => text.clone(),
+                    _ => String::new(),
+                },
+                _ => String::new(),
+            };
+            let call_index = {
+                let mut lens = prompt_lens_clone.lock().unwrap();
+                lens.push(text.len());
+                lens.len()
+            };
+            let (stream, mut sender) = pie_ai::AssistantMessageEventStream::new();
+            tokio::spawn(async move {
+                if call_index == 1 {
+                    let mut error = done_message("");
+                    error.stop_reason = pie_ai::StopReason::Error;
+                    error.error_message =
+                        Some("prompt is too long: 5500 tokens > 5000 maximum".into());
+                    sender.push(AssistantMessageEvent::Error {
+                        reason: pie_ai::ErrorReason::Error,
+                        error,
+                    });
+                } else {
+                    sender.push(AssistantMessageEvent::Done {
+                        reason: pie_ai::DoneReason::Stop,
+                        message: done_message("summary after retry"),
+                    });
+                }
+            });
+            stream
+        });
+
+        let result = compact(
+            model_with_context_window(5_000),
+            &entries,
+            &CompactionSettings {
+                enabled: true,
+                reserve_tokens: 1_000,
+                keep_recent_tokens: 1,
+            },
+            None,
+            Some(stream_fn),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("compaction should survive one provider overflow rejection");
+
+        assert_eq!(result.summary, "summary after retry");
+        let lens = prompt_lens.lock().unwrap();
+        assert_eq!(lens.len(), 2, "expected exactly one retry");
+        assert!(
+            lens[1] < lens[0],
+            "retry must shrink the prompt: {} -> {}",
+            lens[0],
+            lens[1]
         );
     }
 
