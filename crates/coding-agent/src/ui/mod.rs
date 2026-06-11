@@ -158,6 +158,9 @@ pub struct App {
     // Remote relay (issue #22). The channels exist from construction so the event loops
     // can always select on them; they only carry traffic while a relay is connected.
     relay: Option<relay::RelayHandle>,
+    /// Render a QR code of the relay URL into the feed on connect. Only useful where a
+    /// real terminal shows the feed (TUI); off for web/headless modes.
+    relay_qr_in_feed: bool,
     relay_prompt_tx: UnboundedSender<String>,
     relay_prompt_rx: Option<UnboundedReceiver<String>>,
     relay_abort_tx: UnboundedSender<()>,
@@ -205,6 +208,7 @@ impl App {
             last_ctrlc: None,
             quit: false,
             relay: None,
+            relay_qr_in_feed: false,
             relay_prompt_tx,
             relay_prompt_rx: Some(relay_prompt_rx),
             relay_abort_tx,
@@ -324,6 +328,7 @@ impl App {
         if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
             return self.run_headless().await;
         }
+        self.relay_qr_in_feed = true;
         enter_tui()?;
         let backend = CrosstermBackend::new(std::io::stdout());
         let mut terminal = Terminal::new(backend)?;
@@ -462,6 +467,21 @@ impl App {
                             "warning: anyone with this URL can watch the full conversation AND \
                              send prompts to this agent until /web-disconnect",
                         );
+                        if self.relay_qr_in_feed {
+                            match relay::qr_lines(&handle.url) {
+                                Ok(lines) => {
+                                    self.feed.push_plain_untimed("", Level::Output);
+                                    for line in lines {
+                                        self.feed.push_plain_untimed(line, Level::Output);
+                                    }
+                                    self.feed.push_plain_untimed(
+                                        "scan with your phone to open the session",
+                                        Level::System,
+                                    );
+                                }
+                                Err(e) => self.system_line(format!("qr render skipped: {e}")),
+                            }
+                        }
                         self.relay = Some(handle);
                         self.push_relay_snapshot();
                     }

@@ -135,6 +135,22 @@ pub(crate) fn viewer_url(base_url: &str, view_token: &str) -> String {
     format!("{}/session/{view_token}/", base_url.trim_end_matches('/'))
 }
 
+/// Render the viewer URL as a scannable QR code for the TUI feed. Unicode half-block
+/// rendering, inverted so modules read dark-on-light on dark terminal themes (phone
+/// cameras accept inverted QR codes).
+pub(crate) fn qr_lines(url: &str) -> Result<Vec<String>> {
+    use qrcode::render::unicode;
+    let code =
+        qrcode::QrCode::new(url.as_bytes()).map_err(|e| anyhow::anyhow!("qr encode: {e}"))?;
+    let rendered = code
+        .render::<unicode::Dense1x2>()
+        .dark_color(unicode::Dense1x2::Light)
+        .light_color(unicode::Dense1x2::Dark)
+        .quiet_zone(true)
+        .build();
+    Ok(rendered.lines().map(str::to_string).collect())
+}
+
 /// Start the relay task. `prompt_tx` receives remote prompt text; the caller's event
 /// loop injects it through the same path as local submissions.
 pub fn start(
@@ -337,6 +353,29 @@ mod tests {
             viewer_url("http://127.0.0.1:8787/", "tok123"),
             "http://127.0.0.1:8787/session/tok123/"
         );
+    }
+
+    #[test]
+    fn qr_lines_render_a_scannable_block_grid() {
+        let lines =
+            qr_lines("https://pie.0xfefe.me/session/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/")
+                .expect("urls of this shape must encode");
+        assert!(
+            lines.len() > 10,
+            "expected a QR-sized grid, got {}",
+            lines.len()
+        );
+        let width = lines[0].chars().count();
+        assert!(width > 10);
+        assert!(
+            lines.iter().all(|l| l.chars().count() == width),
+            "all QR lines must be equal width"
+        );
+        let blocks: usize = lines
+            .iter()
+            .map(|l| l.chars().filter(|c| "█▀▄".contains(*c)).count())
+            .sum();
+        assert!(blocks > 50, "expected block characters, got {blocks}");
     }
 
     #[test]
