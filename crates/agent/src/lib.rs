@@ -67,7 +67,8 @@ pub use harness::{
         },
         session::{
             BranchSummaryInput, JsonlSessionMetadata, Session, SessionContext, SessionContextModel,
-            SessionMetadata, SessionStorage, SessionTreeEntry, build_session_context,
+            SessionImportOrigin, SessionMetadata, SessionStorage, SessionTreeEntry,
+            build_session_context,
         },
         uuid::uuidv7,
     },

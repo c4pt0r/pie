@@ -53,8 +53,11 @@ restoring runtime state and should not be reused as the backup format.
 
 ## Artifact format
 
-Use one file with a deterministic, inspectable layout. The first implementation can use a tar
-archive compressed with zstd or gzip:
+Use one file with a deterministic, inspectable layout. v1 (implemented) is an **uncompressed**
+tar archive. Compression is deferred: because `manifest.json` lives inside the archive, a v2
+that adds zstd/gzip must detect the framing by magic bytes, not by manifest fields. The archive
+file is created owner-only (0600) — it carries the full transcript — and export refuses to
+overwrite an existing output file instead of truncating it.
 
 ```text
 pie-session-<session-id>.piesession
@@ -62,7 +65,7 @@ pie-session-<session-id>.piesession
   session.jsonl
   sidecars/triggers.json       optional
   sidecars/cron.toml           optional
-  sidecars/endpoints.json      optional, inert by default
+  sidecars/endpoints.json      deferred; not emitted in v1
   attachments/                 reserved; empty in v1 unless image/file blobs become session-owned
 ```
 
@@ -86,9 +89,11 @@ pie-session-<session-id>.piesession
     "has_cron": true,
     "has_endpoints": false
   },
-  "redaction": {
-    "credentials_included": false,
-    "raw_external_payloads_included": false
+  "sensitivity": {
+    "session_transcript_preserved": true,
+    "separate_auth_stores_included": false,
+    "provider_credentials_included": false,
+    "mcp_config_included": false
   }
 }
 ```
@@ -98,17 +103,24 @@ paths. Import chooses a destination under the current environment's session repo
 
 ## Runtime architecture
 
-Add a small runtime-layer package module in `pie-agent-core`, separate from the human-readable
-markdown export:
+The module lives in the coding-agent crate, not `pie-agent-core` as originally sketched:
+import has to rewrite trigger/cron sidecar semantics (disable rules, clear stale cron state),
+and those sidecar types are defined in `crates/coding-agent/src/triggers/`. Moving the module
+into the agent crate would either invert that dependency or force the runtime layer to treat
+sidecars as opaque bytes it cannot rewrite.
 
 ```text
-crates/agent/src/harness/session/export.rs
-  SessionExportManifest
-  SessionExportBundle
-  export_session_bundle(...)
-  validate_session_bundle(...)
-  import_session_bundle(...)
+crates/coding-agent/src/session_archive.rs
+  Manifest
+  export_session(...)
+  import_session(...)
+  commit_import(...)
 ```
+
+The only agent-crate surface is `JsonlSessionMetadata.imported_from`
+(`SessionImportOrigin`): an imported session's header records the original session id, original
+cwd, export timestamp, and exporting pie version, so provenance survives in the session file
+itself.
 
 Responsibilities:
 
@@ -134,13 +146,18 @@ Default import is safe and inert:
 - Conversation/session tree is restored and resumable.
 - Dynamic trigger rules, including both enabled and disabled definitions, export by default as
   part of a complete backup. Import keeps all dynamic trigger rules disabled unless the user
-  passes `--activate-triggers=on`. `ask` is reserved and currently unsupported until the
-  CLI/TUI confirmation path exists.
-- Cron jobs are imported disabled by default. `running_trace_id`, `last_due_at`, and overlap
-  counters should be cleared or marked as imported/stale so a moved session does not immediately
-  fire old work.
-- Endpoint bindings are imported as metadata only and disabled/unbound by default. Public URLs,
-  remote endpoint IDs, and hub credentials must not be assumed valid in the new environment.
+  passes `--activate-triggers=on`. Activation never widens what the source had: `on` restores
+  each rule's own `enabled` flag (a rule the user disabled at the source stays disabled), it
+  does not force-enable everything. `fired_at` history is preserved in every mode so a
+  fire-once rule that already fired does not re-fire after import. `ask` is reserved and
+  currently unsupported until the CLI/TUI confirmation path exists.
+- Cron jobs follow the same activation rule (`on` restores per-job `enabled`, never widens).
+  `running_trace_id`, `last_due_at`, `last_error`, and overlap counters are cleared so a moved
+  session does not immediately fire old work; `last_fired_at` / `last_completed_at` are kept as
+  history.
+- Endpoint bindings are deferred in v1: `sidecars/endpoints.json` is not exported. When added,
+  they import as metadata only and disabled/unbound by default — public URLs, remote endpoint
+  IDs, and hub credentials must not be assumed valid in the new environment.
 - Tool call history is replayed only as transcript/context. Import must not re-run prior tool
   calls automatically.
 
@@ -157,9 +174,9 @@ existing replay semantics.
 | User/assistant/tool transcript | yes | context replay only; no tool re-execution |
 | Model/thinking changes | yes | preserve as session entries |
 | Compaction summaries | yes | preserve and replay through `build_context()` |
-| Dynamic triggers | yes, enabled and disabled definitions by default | import disabled by default; enable only with `--activate-triggers=on`; `ask` reserved/unsupported |
-| Cron jobs | yes | import disabled by default; clear stale running state |
-| Endpoint bindings | optional metadata | disabled/unbound by default |
+| Dynamic triggers | yes, enabled and disabled definitions by default | import disabled by default; `--activate-triggers=on` restores per-rule `enabled` (never widens); `fired_at` preserved; `ask` reserved/unsupported |
+| Cron jobs | yes | import disabled by default; `on` restores per-job `enabled`; clear stale running state, keep fired/completed history |
+| Endpoint bindings | deferred in v1 (not exported) | when added: metadata only, disabled/unbound by default |
 | Skills/templates installed on disk | manifest references only in v1 | warn if missing; do not bundle by default |
 | Provider/API credentials | no | user must login/configure locally |
 | MCP server config | no in v1 | warn if referenced tools are unavailable |
@@ -168,12 +185,16 @@ existing replay semantics.
 
 ## Stability and failure modes
 
-- Validate before writing. Import should unpack into a temp dir, validate checksums/schema, then
-  atomically create the destination session and sidecars.
+- Validate before writing. Import extracts to memory (sizes are capped per archive member),
+  validates checksums/schema/graph and parses sidecars first, then commits: the session is
+  staged at a `.jsonl.tmp` path (invisible to repo listings), replay-validated via
+  `build_context()`, sidecars are written, and the rename of the staged session into place is
+  the commit point. Any failure removes everything written — a failed import leaves no orphan
+  or partial session.
 - Fail closed on malformed JSONL, parent graph cycles, missing parent IDs, checksum mismatch,
   unsafe archive paths, duplicate destination session id, or sidecar parse failure.
-- Never partially activate triggers/crons. If session import succeeds but a sidecar fails, the
-  command should either abort before writing or write only the session and report sidecar skipped.
+- Never partially activate triggers/crons. Sidecars are parsed and rewritten before any file is
+  created, so a sidecar problem aborts the import as a whole.
 - Keep artifact extraction path-safe: reject absolute paths, `..`, symlinks, hardlinks, devices,
   and unknown top-level files unless explicitly allowed by a future schema.
 - Redact output summaries. Do not print full session JSONL, full sidecars, tool arguments, or

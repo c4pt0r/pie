@@ -210,6 +210,25 @@ pub struct JsonlSessionMetadata {
         rename = "parentSessionPath"
     )]
     pub parent_session_path: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "importedFrom"
+    )]
+    pub imported_from: Option<SessionImportOrigin>,
+}
+
+/// Provenance of a session created by importing a `.piesession` archive. The importing
+/// environment assigns a fresh id; this records where the transcript originally came from.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionImportOrigin {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    pub cwd: String,
+    #[serde(rename = "exportedAt")]
+    pub exported_at: String,
+    #[serde(rename = "pieVersion")]
+    pub pie_version: String,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────────────────

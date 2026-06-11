@@ -170,7 +170,7 @@ pub async fn export_session(
     let trigger_for_tar = trigger_bytes.clone();
     let cron_for_tar = cron_bytes.clone();
     tokio::task::spawn_blocking(move || -> Result<()> {
-        let file = File::create(&output).with_context(|| format!("create {}", output.display()))?;
+        let file = create_archive_file(&output)?;
         let mut tar = tar::Builder::new(file);
         append_bytes(&mut tar, MANIFEST_PATH, &manifest_bytes)?;
         append_bytes(&mut tar, SESSION_PATH, &session_bytes)?;
@@ -249,41 +249,31 @@ pub async fn import_session(
     if tokio::fs::try_exists(&session_path).await? {
         bail!("import destination already exists");
     }
-    let rewritten = rewrite_session_jsonl(&parsed, &new_id, cwd, &session_path)?;
-    tokio::fs::write(&session_path, rewritten)
-        .await
-        .with_context(|| format!("write {}", session_path.display()))?;
+    let rewritten = rewrite_session_jsonl(&parsed, &manifest, &new_id, cwd, &session_path)?;
+    let temp_path = repo.root().join(format!("{new_id}.jsonl.tmp"));
 
-    let imported = repo.open(&session_path).await?;
-    imported
-        .build_context()
-        .await
-        .context("validate imported session")?;
-
-    let triggers_imported = match trigger_sidecar {
+    let mut sidecars: Vec<(PathBuf, String)> = Vec::new();
+    let triggers_imported = match &trigger_sidecar {
         Some(rules) => {
-            let count = rules.rules.len();
-            let path = crate::session::trigger_sidecar_path(&session_path);
-            let text = serde_json::to_string_pretty(&rules)?;
-            tokio::fs::write(&path, text)
-                .await
-                .with_context(|| format!("write {}", path.display()))?;
-            count
+            sidecars.push((
+                crate::session::trigger_sidecar_path(&session_path),
+                serde_json::to_string_pretty(rules)?,
+            ));
+            rules.rules.len()
         }
         None => 0,
     };
-    let cron_imported = match cron_sidecar {
+    let cron_imported = match &cron_sidecar {
         Some(jobs) => {
-            let count = jobs.jobs.len();
-            let path = crate::session::cron_sidecar_path(&session_path);
-            let text = toml::to_string_pretty(&jobs)?;
-            tokio::fs::write(&path, text)
-                .await
-                .with_context(|| format!("write {}", path.display()))?;
-            count
+            sidecars.push((
+                crate::session::cron_sidecar_path(&session_path),
+                toml::to_string_pretty(jobs)?,
+            ));
+            jobs.jobs.len()
         }
         None => 0,
     };
+    commit_import(repo, &session_path, &temp_path, &rewritten, &sidecars).await?;
 
     Ok(ImportSummary {
         session_id: new_id,
@@ -352,6 +342,7 @@ fn parse_session_jsonl(text: &str) -> Result<ParsedSession> {
 
 fn rewrite_session_jsonl(
     parsed: &ParsedSession,
+    manifest: &Manifest,
     new_id: &str,
     cwd: &Path,
     path: &Path,
@@ -364,6 +355,12 @@ fn rewrite_session_jsonl(
         cwd: cwd.to_string_lossy().to_string(),
         path: path.to_string_lossy().to_string(),
         parent_session_path: None,
+        imported_from: Some(pie_agent_core::SessionImportOrigin {
+            session_id: manifest.source.session_id.clone(),
+            cwd: manifest.source.cwd.clone(),
+            exported_at: manifest.created_at.clone(),
+            pie_version: manifest.pie_version.clone(),
+        }),
     };
     let mut out = serde_json::to_string(&metadata)?;
     out.push('\n');
@@ -372,6 +369,67 @@ fn rewrite_session_jsonl(
         out.push('\n');
     }
     Ok(out)
+}
+
+/// Write all imported files with the session rename as the commit point. The session is
+/// staged at `temp_path` (a non-`.jsonl` name, invisible to repo listings), replay-validated
+/// there, and only renamed into place after every sidecar landed. Any failure removes
+/// everything written so a failed import leaves no orphan or partial session behind.
+async fn commit_import(
+    repo: &JsonlSessionRepo,
+    session_path: &Path,
+    temp_path: &Path,
+    session_content: &str,
+    sidecars: &[(PathBuf, String)],
+) -> Result<()> {
+    let result = async {
+        tokio::fs::write(temp_path, session_content)
+            .await
+            .with_context(|| format!("write {}", temp_path.display()))?;
+        let staged = repo.open(temp_path).await?;
+        staged
+            .build_context()
+            .await
+            .context("validate imported session")?;
+        for (path, content) in sidecars {
+            tokio::fs::write(path, content)
+                .await
+                .with_context(|| format!("write {}", path.display()))?;
+        }
+        tokio::fs::rename(temp_path, session_path)
+            .await
+            .with_context(|| format!("rename into {}", session_path.display()))
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(temp_path).await;
+        for (path, _) in sidecars {
+            let _ = tokio::fs::remove_file(path).await;
+        }
+    }
+    result
+}
+
+/// The archive carries the full transcript, so it is created owner-only and never
+/// truncates an existing file.
+fn create_archive_file(path: &Path) -> Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::AlreadyExists {
+            anyhow!(
+                "output already exists: {} (remove it or pass a different path)",
+                path.display()
+            )
+        } else {
+            anyhow::Error::new(err).context(format!("create {}", path.display()))
+        }
+    })
 }
 
 async fn read_optional_sidecar(path: &Path) -> Result<Option<Vec<u8>>> {
@@ -447,23 +505,22 @@ fn validate_archive_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn rewrite_trigger_sidecar(bytes: &[u8], enabled: bool) -> Result<DynamicTriggerFile> {
+/// Activation never widens what the source had: `activate` ANDs with each rule's own
+/// `enabled` flag, and `fired_at` history is preserved so fire-once rules don't re-fire.
+fn rewrite_trigger_sidecar(bytes: &[u8], activate: bool) -> Result<DynamicTriggerFile> {
     let mut file: DynamicTriggerFile =
         serde_json::from_slice(bytes).context("parse trigger sidecar")?;
     for rule in &mut file.rules {
-        rule.enabled = enabled;
-        if !enabled {
-            rule.fired_at = None;
-        }
+        rule.enabled = rule.enabled && activate;
     }
     Ok(file)
 }
 
-fn rewrite_cron_sidecar(bytes: &[u8], enabled: bool) -> Result<CronJobsFile> {
+fn rewrite_cron_sidecar(bytes: &[u8], activate: bool) -> Result<CronJobsFile> {
     let text = std::str::from_utf8(bytes).context("cron sidecar is not UTF-8")?;
     let mut file: CronJobsFile = toml::from_str(text).context("parse cron sidecar")?;
     for job in &mut file.jobs {
-        job.enabled = enabled;
+        job.enabled = job.enabled && activate;
         job.running_trace_id = None;
         job.last_due_at = None;
         job.last_error = None;
@@ -582,7 +639,9 @@ mod tests {
         let imported_trigger_file: DynamicTriggerFile =
             serde_json::from_str(&imported_triggers).unwrap();
         assert!(!imported_trigger_file.rules[0].enabled);
-        assert!(imported_trigger_file.rules[0].fired_at.is_none());
+        // fired_at is history: a fire-once rule that already fired must not re-fire after a
+        // later manual enable, so import preserves it in every activation mode.
+        assert!(imported_trigger_file.rules[0].fired_at.is_some());
 
         let imported_cron =
             tokio::fs::read_to_string(crate::session::cron_sidecar_path(&imported.session_path))
@@ -759,6 +818,250 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("active leaf"), "{err}");
+    }
+
+    async fn make_exported_session(
+        temp: &Path,
+        rules: Vec<DynamicTriggerRule>,
+        jobs: Vec<CronJob>,
+    ) -> (String, PathBuf) {
+        let source_cwd = temp.join("source");
+        tokio::fs::create_dir_all(&source_cwd).await.unwrap();
+        let source_repo = JsonlSessionRepo::new(temp.join("source-sessions"));
+        let source = source_repo
+            .create(source_cwd.to_string_lossy().to_string())
+            .await
+            .unwrap();
+        source
+            .append_custom("entry", Some(serde_json::json!({"n": 1})))
+            .await
+            .unwrap();
+        let source_meta = source.storage().get_metadata_json().await.unwrap();
+        let source_path = PathBuf::from(source_meta["path"].as_str().unwrap());
+        if !rules.is_empty() {
+            let trigger_file = DynamicTriggerFile { version: 1, rules };
+            tokio::fs::write(
+                crate::session::trigger_sidecar_path(&source_path),
+                serde_json::to_string_pretty(&trigger_file).unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+        if !jobs.is_empty() {
+            let cron_file = CronJobsFile { jobs };
+            tokio::fs::write(
+                crate::session::cron_sidecar_path(&source_path),
+                toml::to_string_pretty(&cron_file).unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+        let archive = temp.join("backup.piesession");
+        let export = export_session(&source_path, &archive, false).await.unwrap();
+        (export.session_id, archive)
+    }
+
+    fn test_trigger_rule(id: &str, enabled: bool, fired: bool) -> DynamicTriggerRule {
+        DynamicTriggerRule {
+            id: id.into(),
+            condition: "when something happens".into(),
+            action: "do work".into(),
+            enabled,
+            fire_once: true,
+            fired_at: fired.then(Utc::now),
+            promote_to_chat: false,
+            created_at: Utc::now(),
+        }
+    }
+
+    fn test_cron_job(id: &str, enabled: bool) -> CronJob {
+        CronJob {
+            id: id.into(),
+            schedule: "0 * * * *".into(),
+            action: "hourly work".into(),
+            enabled,
+            running_trace_id: None,
+            last_due_at: None,
+            last_fired_at: None,
+            last_completed_at: None,
+            last_error: None,
+            skipped_overlap_count: 0,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn export_archive_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = tempfile::tempdir().unwrap();
+        let (_, archive) = make_exported_session(temp.path(), vec![], vec![]).await;
+        let mode = std::fs::metadata(&archive).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "archive mode {mode:o}");
+    }
+
+    #[tokio::test]
+    async fn export_refuses_to_overwrite_existing_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_, archive) = make_exported_session(temp.path(), vec![], vec![]).await;
+        let source_path = {
+            let source_repo = JsonlSessionRepo::new(temp.path().join("source-sessions"));
+            source_repo.list().await.unwrap().pop().unwrap()
+        };
+        let err = export_session(&source_path, &archive, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exists"), "{err}");
+        let original = tokio::fs::read(&archive).await.unwrap();
+        assert!(
+            !original.is_empty(),
+            "existing archive must not be truncated"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_records_source_provenance_in_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let (source_id, archive) = make_exported_session(temp.path(), vec![], vec![]).await;
+        let dest_cwd = temp.path().join("dest");
+        tokio::fs::create_dir_all(&dest_cwd).await.unwrap();
+        let dest_repo = JsonlSessionRepo::new(temp.path().join("dest-sessions"));
+        let imported = import_session(&dest_repo, &archive, &dest_cwd, ActivateTriggers::Off)
+            .await
+            .unwrap();
+
+        let session = dest_repo.open(&imported.session_path).await.unwrap();
+        let meta = session.storage().get_metadata_json().await.unwrap();
+        let origin = &meta["importedFrom"];
+        assert_eq!(origin["sessionId"].as_str(), Some(source_id.as_str()));
+        assert_eq!(
+            origin["cwd"].as_str().map(PathBuf::from),
+            Some(temp.path().join("source"))
+        );
+        assert!(origin["exportedAt"].as_str().is_some_and(|s| !s.is_empty()));
+        assert!(origin["pieVersion"].as_str().is_some_and(|s| !s.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn activation_on_preserves_source_disabled_automation() {
+        let temp = tempfile::tempdir().unwrap();
+        let rules = vec![
+            test_trigger_rule("was-enabled", true, true),
+            test_trigger_rule("was-disabled", false, false),
+        ];
+        let jobs = vec![
+            test_cron_job("job-on", true),
+            test_cron_job("job-off", false),
+        ];
+        let (_, archive) = make_exported_session(temp.path(), rules, jobs).await;
+        let dest_cwd = temp.path().join("dest");
+        tokio::fs::create_dir_all(&dest_cwd).await.unwrap();
+        let dest_repo = JsonlSessionRepo::new(temp.path().join("dest-sessions"));
+        let imported = import_session(&dest_repo, &archive, &dest_cwd, ActivateTriggers::On)
+            .await
+            .unwrap();
+
+        let triggers =
+            tokio::fs::read_to_string(crate::session::trigger_sidecar_path(&imported.session_path))
+                .await
+                .unwrap();
+        let trigger_file: DynamicTriggerFile = serde_json::from_str(&triggers).unwrap();
+        let enabled_rule = trigger_file
+            .rules
+            .iter()
+            .find(|r| r.id == "was-enabled")
+            .unwrap();
+        let disabled_rule = trigger_file
+            .rules
+            .iter()
+            .find(|r| r.id == "was-disabled")
+            .unwrap();
+        assert!(enabled_rule.enabled);
+        assert!(
+            enabled_rule.fired_at.is_some(),
+            "fire-once history must survive activation"
+        );
+        assert!(
+            !disabled_rule.enabled,
+            "a rule the user disabled at the source must stay disabled"
+        );
+
+        let cron =
+            tokio::fs::read_to_string(crate::session::cron_sidecar_path(&imported.session_path))
+                .await
+                .unwrap();
+        let cron_file: CronJobsFile = toml::from_str(&cron).unwrap();
+        let job_on = cron_file.jobs.iter().find(|j| j.id == "job-on").unwrap();
+        let job_off = cron_file.jobs.iter().find(|j| j.id == "job-off").unwrap();
+        assert!(job_on.enabled);
+        assert!(
+            !job_off.enabled,
+            "a job the user disabled at the source must stay disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_sidecar_write_cleans_up_partial_import() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let repo = JsonlSessionRepo::new(&root);
+
+        // Valid one-line session content for the destination.
+        let staging = JsonlSessionRepo::new(temp.path().join("staging"));
+        let session = staging.create("/tmp").await.unwrap();
+        let meta = session.storage().get_metadata_json().await.unwrap();
+        let content = tokio::fs::read_to_string(meta["path"].as_str().unwrap())
+            .await
+            .unwrap();
+
+        let session_path = root.join("imported.jsonl");
+        let temp_path = root.join("imported.jsonl.tmp");
+        let good_sidecar = root.join("imported.triggers.json");
+        // A directory at the cron sidecar path makes its write fail mid-commit.
+        let bad_sidecar = root.join("imported.cron.toml");
+        tokio::fs::create_dir_all(&bad_sidecar).await.unwrap();
+
+        let sidecars = vec![
+            (
+                good_sidecar.clone(),
+                "{\"version\":1,\"rules\":[]}".to_string(),
+            ),
+            (bad_sidecar.clone(), "jobs = []".to_string()),
+        ];
+        let err = commit_import(&repo, &session_path, &temp_path, &content, &sidecars)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("imported.cron.toml"), "{err}");
+
+        assert!(
+            !tokio::fs::try_exists(&session_path).await.unwrap(),
+            "no orphan session may remain after a failed import"
+        );
+        assert!(!tokio::fs::try_exists(&temp_path).await.unwrap());
+        assert!(
+            !tokio::fs::try_exists(&good_sidecar).await.unwrap(),
+            "sidecars written before the failure must be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_import_leaves_no_temp_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_, archive) = make_exported_session(temp.path(), vec![], vec![]).await;
+        let dest_cwd = temp.path().join("dest");
+        tokio::fs::create_dir_all(&dest_cwd).await.unwrap();
+        let dest_repo = JsonlSessionRepo::new(temp.path().join("dest-sessions"));
+        import_session(&dest_repo, &archive, &dest_cwd, ActivateTriggers::Off)
+            .await
+            .unwrap();
+        let mut dir = tokio::fs::read_dir(dest_repo.root()).await.unwrap();
+        while let Some(entry) = dir.next_entry().await.unwrap() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            assert!(!name.ends_with(".tmp"), "leftover temp file {name}");
+        }
     }
 
     fn manifest_from_archive(path: &Path) -> Manifest {

@@ -51,6 +51,7 @@ impl JsonlSessionStorage {
             cwd: cwd.into(),
             path: path.to_string_lossy().to_string(),
             parent_session_path: None,
+            imported_from: None,
         };
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await.map_err(io_err)?;
