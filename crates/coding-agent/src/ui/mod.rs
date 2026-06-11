@@ -167,7 +167,18 @@ pub struct App {
     relay_abort_rx: Option<UnboundedReceiver<()>>,
     relay_resolve_tx: UnboundedSender<bool>,
     relay_resolve_rx: Option<UnboundedReceiver<bool>>,
+    /// Imported-but-disabled automation awaiting the user's "activate now?" answer on the
+    /// shared confirm surface (TUI keys, local web modal, or the relay viewer).
+    pending_import_activation: Option<PendingImportActivation>,
 }
+
+struct PendingImportActivation {
+    session_path: PathBuf,
+    trigger_ids: Vec<String>,
+    cron_ids: Vec<String>,
+}
+
+const IMPORT_ACTIVATION_PROMPT_ID: &str = "session-import-activation";
 
 impl App {
     pub fn new(config: AppConfig) -> Self {
@@ -218,6 +229,7 @@ impl App {
             relay_abort_rx: Some(relay_abort_rx),
             relay_resolve_tx,
             relay_resolve_rx: Some(relay_resolve_rx),
+            pending_import_activation: None,
         }
     }
 
@@ -523,6 +535,50 @@ impl App {
         }
     }
 
+    /// `/session import` brought automation that the source had enabled. Raise the
+    /// shared confirm surface; approval restores exactly the source enablement.
+    fn prompt_import_activation(
+        &mut self,
+        session_path: PathBuf,
+        trigger_ids: Vec<String>,
+        cron_ids: Vec<String>,
+    ) {
+        if self.control_plane_prompt.is_some() {
+            // A real tool prompt is pending; don't fight over the surface. Leave the
+            // automation disabled — /triggers enable and /cron enable still work.
+            self.system_line(
+                "imported automation left disabled (another approval is pending); enable via /triggers enable and /cron enable",
+            );
+            return;
+        }
+        let label = format!(
+            "activate imported automation? ({} trigger(s), {} cron job(s) were enabled at the source)",
+            trigger_ids.len(),
+            cron_ids.len()
+        );
+        let (responder, _discarded) = tokio::sync::oneshot::channel();
+        let prompt = crate::control_plane_prompt::UiControlPlanePrompt {
+            request: pie_agent_core::ControlPlanePromptRequest {
+                tool_call_id: IMPORT_ACTIVATION_PROMPT_ID.to_string(),
+                tool_name: "SessionImport".to_string(),
+                args_hash: String::new(),
+                label,
+                payload: serde_json::json!({
+                    "triggers": trigger_ids,
+                    "cron_jobs": cron_ids,
+                }),
+                reason: "re-enable automation imported from a session archive".to_string(),
+            },
+            responder,
+        };
+        self.pending_import_activation = Some(PendingImportActivation {
+            session_path,
+            trigger_ids,
+            cron_ids,
+        });
+        self.show_control_plane_prompt(prompt);
+    }
+
     /// Resolve a pending control-plane prompt from the relay — first-class, identical
     /// to a local confirmation (owner decision 2026-06-11).
     fn resolve_from_relay(&mut self, approve: bool) {
@@ -598,8 +654,28 @@ impl App {
                 format!("control-plane action timed out: {label}")
             }
         };
+        let is_import_activation = prompt.request.tool_call_id == IMPORT_ACTIVATION_PROMPT_ID;
+        let approved = matches!(decision, pie_agent_core::ControlPlanePromptDecision::Allow);
         prompt.resolve(decision);
         self.system_line(message);
+        if is_import_activation && let Some(pending) = self.pending_import_activation.take() {
+            if approved {
+                match crate::session_archive::activate_imported(
+                    &pending.session_path,
+                    &pending.trigger_ids,
+                    &pending.cron_ids,
+                ) {
+                    Ok((triggers, cron)) => self.system_line(format!(
+                        "activated imported automation: {triggers} trigger(s), {cron} cron job(s) re-enabled"
+                    )),
+                    Err(e) => self.error_line(format!("activate imported automation: {e}")),
+                }
+            } else {
+                self.system_line(
+                    "imported automation stays disabled; enable later via /triggers enable and /cron enable",
+                );
+            }
+        }
     }
 
     // ── event handling ──────────────────────────────────────────────────────────────────
@@ -1019,6 +1095,11 @@ impl App {
                 }
             }
             CommandOutcome::WebRelay(action) => self.handle_web_relay(action).await,
+            CommandOutcome::SessionImportActivation {
+                session_path,
+                trigger_ids,
+                cron_ids,
+            } => self.prompt_import_activation(session_path, trigger_ids, cron_ids),
             CommandOutcome::LoginSecret {
                 provider,
                 storage_key,
@@ -1834,6 +1915,11 @@ impl App {
                     }
                     CommandOutcome::WebRelay(_) => {
                         eprintln!("error: /web-connect requires the interactive TUI or --web mode");
+                    }
+                    CommandOutcome::SessionImportActivation { .. } => {
+                        println!(
+                            "imported automation left disabled (no interactive confirm in this mode); re-import with `pie session import --activate-triggers=on` or enable via /triggers enable and /cron enable"
+                        );
                     }
                     _ => {}
                 }

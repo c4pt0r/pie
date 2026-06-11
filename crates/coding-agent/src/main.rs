@@ -314,13 +314,15 @@ async fn run_session_cli_command(
             };
             let target_cwd = import_cwd.clone().unwrap_or_else(|| cwd.to_path_buf());
             print_session_archive_warning();
-            let summary = session_archive::import_session(
-                repo,
-                &archive_path,
-                &target_cwd,
-                (*activate_triggers).into(),
-            )
-            .await?;
+            // `ask` imports disabled first, then offers to restore the source enablement
+            // interactively — never pass Ask down to the archive layer.
+            let effective = match activate_triggers {
+                ActivateTriggersArg::Ask => session_archive::ActivateTriggers::Off,
+                other => (*other).into(),
+            };
+            let summary =
+                session_archive::import_session(repo, &archive_path, &target_cwd, effective)
+                    .await?;
             println!("imported session: {}", short_id(&summary.session_id));
             println!("path: {}", summary.session_path.display());
             println!(
@@ -334,6 +336,36 @@ async fn run_session_cli_command(
                     "disabled"
                 }
             );
+            if *activate_triggers == ActivateTriggersArg::Ask
+                && (!summary.originally_enabled_triggers.is_empty()
+                    || !summary.originally_enabled_cron.is_empty())
+            {
+                if std::io::stdin().is_terminal() {
+                    print!(
+                        "archive had {} trigger(s) and {} cron job(s) enabled — activate them now? [y/N] ",
+                        summary.originally_enabled_triggers.len(),
+                        summary.originally_enabled_cron.len()
+                    );
+                    use std::io::Write as _;
+                    std::io::stdout().flush().ok();
+                    let mut answer = String::new();
+                    std::io::stdin().read_line(&mut answer).ok();
+                    if matches!(answer.trim(), "y" | "Y" | "yes" | "YES") {
+                        let (triggers, cron) = session_archive::activate_imported(
+                            &summary.session_path,
+                            &summary.originally_enabled_triggers,
+                            &summary.originally_enabled_cron,
+                        )?;
+                        println!("activated: {triggers} trigger(s), {cron} cron job(s) re-enabled");
+                    } else {
+                        println!("automation stays disabled");
+                    }
+                } else {
+                    println!(
+                        "automation left disabled (no TTY to confirm); re-import with --activate-triggers=on to enable"
+                    );
+                }
+            }
             println!("resume with: pie --resume-id {}", summary.session_id);
             Ok(())
         }
@@ -1441,7 +1473,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cli_session_import_ask_activation_is_explicitly_unsupported() {
+    async fn cli_session_import_ask_imports_disabled_first() {
+        // `ask` must never reach the archive layer as Ask: the import itself runs with
+        // Off, and the interactive offer happens afterwards (TTY only). With a missing
+        // archive the failure is the archive read — not an "ask unsupported" error.
         let temp = tempfile::tempdir().unwrap();
         let repo = JsonlSessionRepo::new(temp.path().join("sessions"));
         let command = SessionCliCommand::Import {
@@ -1453,8 +1488,11 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(err.contains("activate-triggers=ask"), "{err}");
-        assert!(err.contains("not implemented"), "{err}");
+        assert!(
+            !err.contains("not implemented"),
+            "ask is implemented now: {err}"
+        );
+        assert!(err.contains("missing.piesession"), "{err}");
     }
 
     #[test]

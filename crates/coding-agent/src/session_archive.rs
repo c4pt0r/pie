@@ -51,6 +51,11 @@ pub struct ImportSummary {
     pub triggers_imported: usize,
     pub cron_imported: usize,
     pub automation_enabled: bool,
+    /// Ids that were enabled in the source archive. A disabled-by-default import keeps
+    /// these so an interactive "activate now?" answer can restore exactly the source
+    /// state (same semantics as `--activate-triggers=on`).
+    pub originally_enabled_triggers: Vec<String>,
+    pub originally_enabled_cron: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -240,6 +245,29 @@ pub async fn import_session(
         .get(CRON_PATH)
         .map(|bytes| rewrite_cron_sidecar(bytes, automation_enabled))
         .transpose()?;
+    let originally_enabled_triggers = files
+        .get(TRIGGERS_PATH)
+        .and_then(|bytes| serde_json::from_slice::<DynamicTriggerFile>(bytes).ok())
+        .map(|file| {
+            file.rules
+                .iter()
+                .filter(|rule| rule.enabled)
+                .map(|rule| rule.id.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    let originally_enabled_cron = files
+        .get(CRON_PATH)
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .and_then(|text| toml::from_str::<CronJobsFile>(text).ok())
+        .map(|file| {
+            file.jobs
+                .iter()
+                .filter(|job| job.enabled)
+                .map(|job| job.id.clone())
+                .collect()
+        })
+        .unwrap_or_default();
 
     tokio::fs::create_dir_all(repo.root())
         .await
@@ -282,7 +310,51 @@ pub async fn import_session(
         triggers_imported,
         cron_imported,
         automation_enabled,
+        originally_enabled_triggers,
+        originally_enabled_cron,
     })
+}
+
+/// Re-enable the given trigger/cron ids on an imported session's sidecars — the second
+/// half of the interactive "activate imported automation now?" flow. Sync IO: callers run
+/// from UI resolution paths; the sidecars are small.
+pub fn activate_imported(
+    session_path: &Path,
+    trigger_ids: &[String],
+    cron_ids: &[String],
+) -> Result<(usize, usize)> {
+    let mut triggers_enabled = 0usize;
+    if !trigger_ids.is_empty() {
+        let path = crate::session::trigger_sidecar_path(session_path);
+        let text =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let mut file: DynamicTriggerFile =
+            serde_json::from_str(&text).context("parse trigger sidecar")?;
+        for rule in &mut file.rules {
+            if trigger_ids.contains(&rule.id) && !rule.enabled {
+                rule.enabled = true;
+                triggers_enabled += 1;
+            }
+        }
+        std::fs::write(&path, serde_json::to_string_pretty(&file)?)
+            .with_context(|| format!("write {}", path.display()))?;
+    }
+    let mut cron_enabled = 0usize;
+    if !cron_ids.is_empty() {
+        let path = crate::session::cron_sidecar_path(session_path);
+        let text =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let mut file: CronJobsFile = toml::from_str(&text).context("parse cron sidecar")?;
+        for job in &mut file.jobs {
+            if cron_ids.contains(&job.id) && !job.enabled {
+                job.enabled = true;
+                cron_enabled += 1;
+            }
+        }
+        std::fs::write(&path, toml::to_string_pretty(&file)?)
+            .with_context(|| format!("write {}", path.display()))?;
+    }
+    Ok((triggers_enabled, cron_enabled))
 }
 
 pub fn default_export_path(cwd: &Path, session_id: &str) -> PathBuf {
@@ -1044,6 +1116,77 @@ mod tests {
         assert!(
             !tokio::fs::try_exists(&good_sidecar).await.unwrap(),
             "sidecars written before the failure must be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_summary_records_originally_enabled_automation_and_activates_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let rules = vec![
+            test_trigger_rule("was-enabled", true, false),
+            test_trigger_rule("was-disabled", false, false),
+        ];
+        let jobs = vec![
+            test_cron_job("job-on", true),
+            test_cron_job("job-off", false),
+        ];
+        let (_, archive) = make_exported_session(temp.path(), rules, jobs).await;
+        let dest_cwd = temp.path().join("dest");
+        tokio::fs::create_dir_all(&dest_cwd).await.unwrap();
+        let dest_repo = JsonlSessionRepo::new(temp.path().join("dest-sessions"));
+        let imported = import_session(&dest_repo, &archive, &dest_cwd, ActivateTriggers::Off)
+            .await
+            .unwrap();
+
+        assert_eq!(imported.originally_enabled_triggers, vec!["was-enabled"]);
+        assert_eq!(imported.originally_enabled_cron, vec!["job-on"]);
+
+        let (t, c) = activate_imported(
+            &imported.session_path,
+            &imported.originally_enabled_triggers,
+            &imported.originally_enabled_cron,
+        )
+        .expect("activation rewrites sidecars");
+        assert_eq!((t, c), (1, 1));
+
+        let triggers =
+            tokio::fs::read_to_string(crate::session::trigger_sidecar_path(&imported.session_path))
+                .await
+                .unwrap();
+        let trigger_file: DynamicTriggerFile = serde_json::from_str(&triggers).unwrap();
+        let on = trigger_file
+            .rules
+            .iter()
+            .find(|r| r.id == "was-enabled")
+            .unwrap();
+        let off = trigger_file
+            .rules
+            .iter()
+            .find(|r| r.id == "was-disabled")
+            .unwrap();
+        assert!(on.enabled, "originally-enabled rule must be re-enabled");
+        assert!(!off.enabled, "originally-disabled rule must stay disabled");
+
+        let cron =
+            tokio::fs::read_to_string(crate::session::cron_sidecar_path(&imported.session_path))
+                .await
+                .unwrap();
+        let cron_file: CronJobsFile = toml::from_str(&cron).unwrap();
+        assert!(
+            cron_file
+                .jobs
+                .iter()
+                .find(|j| j.id == "job-on")
+                .unwrap()
+                .enabled
+        );
+        assert!(
+            !cron_file
+                .jobs
+                .iter()
+                .find(|j| j.id == "job-off")
+                .unwrap()
+                .enabled
         );
     }
 

@@ -472,6 +472,11 @@ impl App {
                 }
             }
             CommandOutcome::WebRelay(action) => self.handle_web_relay(action).await,
+            CommandOutcome::SessionImportActivation {
+                session_path,
+                trigger_ids,
+                cron_ids,
+            } => self.prompt_import_activation(session_path, trigger_ids, cron_ids),
             CommandOutcome::LoginSecret {
                 provider,
                 recovery_command,

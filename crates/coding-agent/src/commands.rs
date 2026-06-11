@@ -102,6 +102,13 @@ pub enum CommandOutcome {
     /// `/web-connect` family — the relay lives on the UI `App`, so the REPL layer
     /// performs the action (issue #22).
     WebRelay(WebRelayAction),
+    /// A `/session import` brought disabled automation along; ask the user (via the
+    /// shared confirm surface) whether to re-enable what the source had enabled.
+    SessionImportActivation {
+        session_path: std::path::PathBuf,
+        trigger_ids: Vec<String>,
+        cron_ids: Vec<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -149,6 +156,16 @@ impl std::fmt::Debug for CommandOutcome {
                 .field("recovery_command", recovery_command)
                 .finish(),
             Self::WebRelay(action) => f.debug_tuple("WebRelay").field(action).finish(),
+            Self::SessionImportActivation {
+                session_path,
+                trigger_ids,
+                cron_ids,
+            } => f
+                .debug_struct("SessionImportActivation")
+                .field("session_path", session_path)
+                .field("trigger_ids", &trigger_ids.len())
+                .field("cron_ids", &cron_ids.len())
+                .finish(),
         }
     }
 }
@@ -1797,6 +1814,15 @@ async fn session_import_command(argv: &[String], ctx: &CommandCtx<'_>) -> Comman
                 }
             );
             cprintln!("resume with: pie --resume-id {}", summary.session_id);
+            if !summary.originally_enabled_triggers.is_empty()
+                || !summary.originally_enabled_cron.is_empty()
+            {
+                return CommandOutcome::SessionImportActivation {
+                    session_path: summary.session_path,
+                    trigger_ids: summary.originally_enabled_triggers,
+                    cron_ids: summary.originally_enabled_cron,
+                };
+            }
             CommandOutcome::Handled
         }
         Err(err) => CommandOutcome::Error(format!("session import failed: {err}")),
