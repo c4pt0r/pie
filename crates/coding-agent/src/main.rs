@@ -21,6 +21,7 @@ mod history;
 mod hooks;
 #[allow(dead_code)]
 mod images;
+mod inbox;
 mod local_models;
 mod logging;
 mod lsp;
@@ -1030,8 +1031,10 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
     let _unsub_dynamic_fire_once = harness.subscribe_harness(triggers::fire_once_harness_listener(
         dynamic_trigger_registry.clone(),
     ));
-    let _unsub_cron =
-        harness.subscribe_harness(triggers::cron_harness_listener(cron_registry.clone()));
+    let _unsub_cron = harness.subscribe_harness(triggers::cron_harness_listener(
+        cron_registry.clone(),
+        inbox::default_inbox_path(),
+    ));
     let _unsub_hooks = harness.agent().subscribe(hooks.runner.listener());
     let _unsub_harness_hooks = harness.subscribe_harness(hooks.runner.harness_listener());
 

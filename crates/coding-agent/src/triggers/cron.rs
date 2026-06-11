@@ -52,6 +52,10 @@ pub struct CronJob {
     pub last_error: Option<String>,
     #[serde(default)]
     pub skipped_overlap_count: u64,
+    /// Loop mode (issue #23): run in a fresh sub-agent with persistent cross-run state
+    /// and the inbox output protocol instead of injecting into the parent conversation.
+    #[serde(default)]
+    pub stateful: bool,
     pub created_at: DateTime<Utc>,
 }
 
@@ -103,7 +107,19 @@ impl CronRegistry {
         self.inner.lock().jobs.clone()
     }
 
+    /// Convenience wrapper (non-stateful). Production paths pass `stateful` explicitly
+    /// via [`Self::add_job_full`]; unit tests use this shorthand.
+    #[allow(dead_code)]
     pub fn add_job(&self, schedule: &str, action: &str) -> Result<CronJob, AddCronJobError> {
+        self.add_job_full(schedule, action, false)
+    }
+
+    pub fn add_job_full(
+        &self,
+        schedule: &str,
+        action: &str,
+        stateful: bool,
+    ) -> Result<CronJob, AddCronJobError> {
         let schedule = schedule.trim();
         let action = action.trim();
         if action.is_empty() {
@@ -126,6 +142,7 @@ impl CronRegistry {
             last_completed_at: None,
             last_error: None,
             skipped_overlap_count: 0,
+            stateful,
             created_at: Utc::now(),
         };
         self.insert_job(job)
@@ -221,6 +238,17 @@ impl CronRegistry {
             state.jobs = next;
         }
         due
+    }
+
+    /// Job currently running under `trace_id`, if any. Must be called before
+    /// `mark_completed`, which clears the trace binding.
+    pub fn job_for_trace(&self, trace_id: &str) -> Option<CronJob> {
+        self.inner
+            .lock()
+            .jobs
+            .iter()
+            .find(|job| job.running_trace_id.as_deref() == Some(trace_id))
+            .cloned()
     }
 
     pub fn mark_completed(&self, trace_id: &str, error: Option<String>) {
@@ -360,8 +388,12 @@ impl AgentTool for NewCronJobTool {
             .get("action")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AgentToolError::from("missing required arg: action"))?;
+        let stateful = params
+            .get("stateful")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let job = global_cron_registry()
-            .add_job(&schedule, action)
+            .add_job_full(&schedule, action, stateful)
             .map_err(|e| AgentToolError::Message(e.to_string()))?;
 
         let audit_entry_id =
@@ -379,6 +411,7 @@ impl AgentTool for NewCronJobTool {
                 "schedule": job.schedule,
                 "action": job.action,
                 "enabled": job.enabled,
+                "stateful": job.stateful,
                 "scope": "session",
                 "audit_entry_id": audit_entry_id,
             }),
@@ -575,6 +608,7 @@ impl AgentTool for SetCronJobStateTool {
                 "id": job.id,
                 "schedule": job.schedule,
                 "enabled": job.enabled,
+                "stateful": job.stateful,
                 "scope": "session",
                 "audit_entry_id": audit_entry_id,
             }),
@@ -691,6 +725,125 @@ fn cron_trigger_for_job(job: &CronJob, due_at: DateTime<Utc>, trace_id: String) 
     }
 }
 
+/// Cap on persisted loop state.
+const LOOP_STATE_MAX_CHARS: usize = 2000;
+/// At most this many `<inbox>` findings are honored per run.
+const INBOX_TAGS_PER_RUN: usize = 16;
+
+/// `<sess>.cron.toml` + `cron-abcdef…` → `<sess>.loop-cron-abcdef12.md` (8-char id prefix
+/// after the `cron-` marker keeps names short but unambiguous in practice).
+pub(crate) fn loop_state_path(cron_sidecar: &Path, job_id: &str) -> PathBuf {
+    let stem = cron_sidecar
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(".cron.toml"))
+        .unwrap_or("session");
+    let short: String = job_id.chars().take(13).collect(); // "cron-" + 8 hex
+    let file = format!("{stem}.loop-{short}.md");
+    cron_sidecar.with_file_name(file)
+}
+
+pub(crate) fn read_loop_state(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path).ok().map(|text| {
+        let trimmed = text.trim();
+        if trimmed.chars().count() > LOOP_STATE_MAX_CHARS {
+            let mut capped: String = trimmed.chars().take(LOOP_STATE_MAX_CHARS).collect();
+            capped.push('…');
+            capped
+        } else {
+            trimmed.to_string()
+        }
+    })
+}
+
+pub(crate) fn write_loop_state(path: &Path, state: &str) -> std::io::Result<()> {
+    let trimmed = state.trim();
+    let capped: String = if trimmed.chars().count() > LOOP_STATE_MAX_CHARS {
+        let mut capped: String = trimmed.chars().take(LOOP_STATE_MAX_CHARS).collect();
+        capped.push('…');
+        capped
+    } else {
+        trimmed.to_string()
+    };
+    std::fs::write(path, capped)
+}
+
+/// Assemble the stateful-loop prompt: previous state, the job's action, and the output
+/// protocol the listener parses afterwards.
+pub(crate) fn compose_stateful_prompt(action: &str, state: Option<&str>) -> String {
+    format!(
+        "[loop-state] (your notes from the previous run of this recurring job)\n{}\n[/loop-state]\n\n{}\n\nOutput protocol (mandatory):\n- End your reply with <loop-state>notes for the next run</loop-state> — it REPLACES the saved state; keep it under 2000 characters and make it the information your next run needs (baselines, ids already seen, watermarks).\n- For each finding a human should act on, emit <inbox>one concise line</inbox>. No findings → no inbox tags; do not invent work.\n- Keep everything after the last tool call short so the tags are not truncated.",
+        state.unwrap_or("(first run)"),
+        action
+    )
+}
+
+/// Remove `<loop-state>`/`<inbox>` protocol blocks for display: the listener persists
+/// them; UI lines should show only the human-facing remainder.
+pub fn strip_loop_protocol_tags(text: &str) -> String {
+    let mut out = String::from(text);
+    let mut stripped = false;
+    for tag in ["loop-state", "inbox"] {
+        let open = format!("<{tag}>");
+        let close = format!("</{tag}>");
+        while let Some(start) = out.find(&open) {
+            let Some(end_rel) = out[start..].find(&close) else {
+                break;
+            };
+            out.replace_range(start..start + end_rel + close.len(), "");
+            stripped = true;
+        }
+    }
+    if !stripped {
+        // No protocol tags: leave the text untouched so multi-line summaries render as-is.
+        return out;
+    }
+    // Collapse the blank residue the removed blocks leave behind.
+    let mut result = String::new();
+    let mut prev_blank = false;
+    for line in out.lines().map(str::trim_end) {
+        let blank = line.trim().is_empty();
+        if blank && prev_blank {
+            continue;
+        }
+        if !result.is_empty() {
+            result.push('\n');
+        }
+        result.push_str(line);
+        prev_blank = blank;
+    }
+    result.trim().to_string()
+}
+
+/// Last `<tag>…</tag>` block in `text`, trimmed. Unclosed tags are ignored.
+pub(crate) fn extract_tag_block(text: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = text.rfind(&open)?;
+    let rest = &text[start + open.len()..];
+    let end = rest.find(&close)?;
+    Some(rest[..end].trim().to_string())
+}
+
+/// Every `<tag>…</tag>` block in order, capped at `max`.
+pub(crate) fn extract_tag_all(text: &str, tag: &str, max: usize) -> Vec<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let mut out = Vec::new();
+    let mut rest = text;
+    while out.len() < max {
+        let Some(start) = rest.find(&open) else { break };
+        let after = &rest[start + open.len()..];
+        let Some(end) = after.find(&close) else { break };
+        let body = after[..end].trim();
+        if !body.is_empty() {
+            out.push(body.to_string());
+        }
+        rest = &after[end + close.len()..];
+    }
+    out
+}
+
 pub fn cron_action_hook(
     registry: CronRegistry,
     inner: BeforeTriggerActionHook,
@@ -719,6 +872,21 @@ pub fn cron_action_hook(
                 let Some(job) = registry.list().into_iter().find(|job| job.id == job_id) else {
                     return TriggerAction::default_for(&ctx.trigger);
                 };
+                if job.stateful {
+                    // Loop mode (issue #23): fresh sub-agent, state injected, findings
+                    // routed to the inbox by the harness listener — the main
+                    // conversation is never interrupted.
+                    let state = registry
+                        .storage_path()
+                        .map(|sidecar| loop_state_path(&sidecar, &job.id))
+                        .and_then(|path| read_loop_state(&path));
+                    return TriggerAction {
+                        prompt: compose_stateful_prompt(&job.action, state.as_deref()),
+                        promote: PromoteAction::None,
+                        promote_requires_approval: false,
+                        delivery: TriggerDelivery::SubAgent,
+                    };
+                }
                 TriggerAction {
                     prompt: job.action,
                     promote: PromoteAction::None,
@@ -730,10 +898,45 @@ pub fn cron_action_hook(
     )
 }
 
-pub fn cron_harness_listener(registry: CronRegistry) -> HarnessListener {
+pub fn cron_harness_listener(registry: CronRegistry, inbox_path: PathBuf) -> HarnessListener {
     Arc::new(move |event| match event {
-        HarnessEvent::TriggerCompleted { trace_id, .. } => {
+        HarnessEvent::TriggerCompleted {
+            trace_id, summary, ..
+        } => {
+            // Resolve the job BEFORE mark_completed clears the trace binding.
+            let job = registry.job_for_trace(&trace_id);
             registry.mark_completed(&trace_id, None);
+            let (Some(job), Some(summary)) = (job, summary) else {
+                return;
+            };
+            if !job.stateful {
+                return;
+            }
+            if let Some(state) = extract_tag_block(&summary, "loop-state")
+                && let Some(sidecar) = registry.storage_path()
+            {
+                let path = loop_state_path(&sidecar, &job.id);
+                if let Err(err) = write_loop_state(&path, &state) {
+                    tracing::warn!(error = %err, job = %job.id, "loop state write failed");
+                }
+            }
+            let session_stem = registry
+                .storage_path()
+                .and_then(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .and_then(|n| n.strip_suffix(".cron.toml"))
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+            let source = format!("cron:{}", job.id.chars().take(13).collect::<String>());
+            for finding in extract_tag_all(&summary, "inbox", INBOX_TAGS_PER_RUN) {
+                if let Err(err) =
+                    crate::inbox::append(&inbox_path, &source, &finding, &trace_id, &session_stem)
+                {
+                    tracing::warn!(error = %err, "inbox append failed");
+                }
+            }
         }
         HarnessEvent::TriggerFailed { trace_id, reason } => {
             registry.mark_completed(&trace_id, Some(reason.clone()));
@@ -1084,6 +1287,11 @@ static NEW_CRON_JOB_TOOL: once_cell::sync::Lazy<Tool> = once_cell::sync::Lazy::n
             "action": {
                 "type": "string",
                 "description": "Natural-language instruction to run when the schedule is due."
+            },
+            "stateful": {
+                "type": "boolean",
+                "default": false,
+                "description": "Loop mode: run in a fresh sub-agent that keeps persistent notes across runs (injected each time) and routes findings to the triage inbox instead of the chat. Use for recurring watch/triage jobs like \"check for new issues and report only what changed\"."
             }
         },
         "required": ["schedule", "action"],
@@ -1205,6 +1413,100 @@ mod tests {
     }
 
     #[test]
+    fn tag_extraction_handles_present_absent_truncated_and_caps() {
+        let text = "did work\n<inbox>finding one</inbox>\nmore\n<inbox>finding two</inbox>\n<loop-state>seen: a,b</loop-state>";
+        assert_eq!(
+            extract_tag_block(text, "loop-state").as_deref(),
+            Some("seen: a,b")
+        );
+        assert_eq!(
+            extract_tag_all(text, "inbox", 16),
+            vec!["finding one".to_string(), "finding two".to_string()]
+        );
+        assert_eq!(extract_tag_block("no tags here", "loop-state"), None);
+        // Truncated open tag (summary cap can cut mid-stream): fail quiet.
+        assert_eq!(
+            extract_tag_block("x <loop-state>cut off", "loop-state"),
+            None
+        );
+        // Cap honored.
+        let many: String = (0..30).map(|i| format!("<inbox>f{i}</inbox>")).collect();
+        assert_eq!(extract_tag_all(&many, "inbox", 16).len(), 16);
+    }
+
+    #[test]
+    fn stateful_prompt_injects_previous_state_and_protocol() {
+        let prompt = compose_stateful_prompt("check the issues", Some("baseline: #1 #2"));
+        assert!(prompt.contains("[loop-state]"), "{prompt}");
+        assert!(prompt.contains("baseline: #1 #2"), "{prompt}");
+        assert!(prompt.contains("check the issues"), "{prompt}");
+        assert!(
+            prompt.contains("<loop-state>"),
+            "protocol instructions: {prompt}"
+        );
+        assert!(
+            prompt.contains("<inbox>"),
+            "protocol instructions: {prompt}"
+        );
+        let first = compose_stateful_prompt("check", None);
+        assert!(first.contains("(first run)"), "{first}");
+    }
+
+    #[test]
+    fn loop_state_paths_and_write_cap() {
+        let dir = tempdir().unwrap();
+        let sidecar = dir.path().join("019abc.cron.toml");
+        let path = loop_state_path(&sidecar, "cron-1234567890abcdef");
+        assert_eq!(
+            path.file_name().unwrap().to_str().unwrap(),
+            "019abc.loop-cron-12345678.md"
+        );
+        write_loop_state(&path, &"x".repeat(5000)).unwrap();
+        let read = read_loop_state(&path).unwrap();
+        assert!(read.chars().count() <= 2001, "state capped");
+        assert!(read_loop_state(&dir.path().join("missing.md")).is_none());
+    }
+
+    #[test]
+    fn listener_persists_state_and_inbox_for_stateful_job_completion() {
+        let dir = tempdir().unwrap();
+        let sidecar = dir.path().join("sess1.cron.toml");
+        let inbox_path = dir.path().join("inbox.jsonl");
+        let registry = CronRegistry::new();
+        registry.load_from_path(&sidecar).unwrap();
+        let job = registry
+            .add_job_full("* * * * *", "watch things", true)
+            .unwrap();
+        assert!(job.stateful);
+        // Fire it so a running trace exists (listener resolves trace -> job).
+        let since = Utc.with_ymd_and_hms(2026, 5, 26, 22, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 5, 26, 22, 1, 5).unwrap();
+        let due = registry.due_jobs(since, now);
+        let trace_id = due[0].0.running_trace_id.clone().unwrap();
+
+        let listener = cron_harness_listener(registry.clone(), inbox_path.clone());
+        listener(HarnessEvent::TriggerCompleted {
+            trace_id: trace_id.clone(),
+            summary: Some(
+                "checked. <inbox>issue #9 looks stuck</inbox> done <loop-state>seen: #9</loop-state>"
+                    .into(),
+            ),
+            cost_usd: None,
+            details: serde_json::Value::Null,
+        });
+
+        let state_path = loop_state_path(&sidecar, &job.id);
+        assert_eq!(read_loop_state(&state_path).as_deref(), Some("seen: #9"));
+        let entries = crate::inbox::list_new(&inbox_path).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].text.contains("issue #9"), "{:?}", entries[0]);
+        assert!(entries[0].source.starts_with("cron:"), "{:?}", entries[0]);
+        assert_eq!(entries[0].trace_id, trace_id);
+        // Job marked completed (running state cleared).
+        assert!(registry.list()[0].running_trace_id.is_none());
+    }
+
+    #[test]
     fn due_jobs_tick_writes_sidecar_only_when_state_changed() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("cron.toml");
@@ -1309,7 +1611,10 @@ mod tests {
             .running_trace_id
             .clone()
             .unwrap();
-        let listener = cron_harness_listener(registry.clone());
+        let listener = cron_harness_listener(
+            registry.clone(),
+            std::env::temp_dir().join("unused-inbox.jsonl"),
+        );
         listener(HarnessEvent::TriggerCompleted {
             trace_id,
             summary: None,

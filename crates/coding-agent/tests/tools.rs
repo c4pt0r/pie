@@ -21,6 +21,9 @@ mod config;
 #[path = "../src/export.rs"]
 #[allow(dead_code)]
 mod export;
+#[path = "../src/inbox.rs"]
+#[allow(dead_code)]
+mod inbox;
 #[path = "../src/skills_state.rs"]
 #[allow(dead_code)]
 mod skills_state;

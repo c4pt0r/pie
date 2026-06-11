@@ -239,6 +239,7 @@ impl Registry {
         r.register(Arc::new(TriggersCommand));
         r.register(Arc::new(NewTriggerCommand));
         r.register(Arc::new(CronCommand));
+        r.register(Arc::new(InboxCommand));
         r
     }
 
@@ -2350,18 +2351,36 @@ impl SlashCommand for CronCommand {
                 CommandOutcome::Handled
             }
             "add" => {
-                if argv.len() < 3 {
+                let mut rest: Vec<&String> = argv[1..].iter().collect();
+                let stateful = rest
+                    .iter()
+                    .position(|arg| arg.as_str() == "--stateful")
+                    .map(|idx| {
+                        rest.remove(idx);
+                    })
+                    .is_some();
+                if rest.len() < 2 {
                     return CommandOutcome::Error(
-                        "usage: /cron add \"<minute hour dom month dow>\" <prompt>".into(),
+                        "usage: /cron add [--stateful] \"<minute hour dom month dow>\" <prompt>"
+                            .into(),
                     );
                 }
-                let schedule = &argv[1];
-                let action = argv[2..].join(" ");
-                match crate::triggers::global_cron_registry().add_job(schedule, &action) {
+                let schedule = rest[0];
+                let action = rest[1..]
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                match crate::triggers::global_cron_registry()
+                    .add_job_full(schedule, &action, stateful)
+                {
                     Ok(job) => {
                         write_cron_control_plane_audit(ctx, "add", None, Some(&job)).await;
                         cprintln!("added cron job {}", job.id);
                         cprintln!("  schedule: {}", job.schedule);
+                        if job.stateful {
+                            cprintln!("  mode: stateful loop (findings go to /inbox)");
+                        }
                         cprintln!("  action: {}", preview_cron_action(&job.action));
                         CommandOutcome::Handled
                     }
@@ -2470,6 +2489,137 @@ async fn automation_elsewhere_hint_for_ctx(ctx: &CommandCtx<'_>) -> Option<Strin
     crate::session::automation_elsewhere_hint(&repo, current.as_deref()).await
 }
 
+struct InboxCommand;
+
+#[async_trait]
+impl SlashCommand for InboxCommand {
+    fn name(&self) -> &'static str {
+        "inbox"
+    }
+    fn description(&self) -> &'static str {
+        "triage findings from loops (stateful cron jobs)"
+    }
+    fn usage(&self) -> &'static str {
+        "[all|claim <id|n>|dismiss <id|n>|clear]"
+    }
+    async fn run(&self, argv: &[String], _ctx: &CommandCtx<'_>) -> CommandOutcome {
+        let path = crate::inbox::default_inbox_path();
+        match argv.first().map(String::as_str) {
+            None | Some("list") => {
+                let entries = match crate::inbox::list_new(&path) {
+                    Ok(entries) => entries,
+                    Err(e) => return CommandOutcome::Error(format!("inbox: {e}")),
+                };
+                if entries.is_empty() {
+                    cprintln!(
+                        "inbox: empty — stateful loops (/cron add --stateful) report findings here"
+                    );
+                    return CommandOutcome::Handled;
+                }
+                cprintln!("Inbox ({} new):", entries.len());
+                for (idx, entry) in entries.iter().enumerate() {
+                    cprintln!(
+                        "  {}. [{}] {}  ({}, {})",
+                        idx + 1,
+                        entry.id.chars().take(12).collect::<String>(),
+                        entry.text,
+                        entry.source,
+                        entry.created_at.chars().take(16).collect::<String>()
+                    );
+                }
+                cprintln!("claim with /inbox claim <n>, dismiss with /inbox dismiss <n>");
+                CommandOutcome::Handled
+            }
+            Some("all") => {
+                let entries = match crate::inbox::list(&path) {
+                    Ok(entries) => entries,
+                    Err(e) => return CommandOutcome::Error(format!("inbox: {e}")),
+                };
+                cprintln!("Inbox history ({} total):", entries.len());
+                for entry in &entries {
+                    let status = match entry.status {
+                        crate::inbox::InboxStatus::New => "new",
+                        crate::inbox::InboxStatus::Claimed => "claimed",
+                        crate::inbox::InboxStatus::Dismissed => "dismissed",
+                    };
+                    cprintln!("  [{status}] {}  ({})", entry.text, entry.source);
+                }
+                CommandOutcome::Handled
+            }
+            Some("claim") => match resolve_inbox_target(&path, argv.get(1)) {
+                Ok(entry) => {
+                    if let Err(e) = crate::inbox::set_status(
+                        &path,
+                        &entry.id,
+                        crate::inbox::InboxStatus::Claimed,
+                    ) {
+                        return CommandOutcome::Error(format!("inbox: {e}"));
+                    }
+                    CommandOutcome::RunAgentPrompt {
+                        prompt: format!(
+                            "A recurring loop ({}) reported this finding — investigate and address it:\n{}",
+                            entry.source, entry.text
+                        ),
+                        error_context: "inbox claim",
+                    }
+                }
+                Err(e) => CommandOutcome::Error(e),
+            },
+            Some("dismiss") => match resolve_inbox_target(&path, argv.get(1)) {
+                Ok(entry) => {
+                    match crate::inbox::set_status(
+                        &path,
+                        &entry.id,
+                        crate::inbox::InboxStatus::Dismissed,
+                    ) {
+                        Ok(_) => {
+                            cprintln!("dismissed: {}", entry.text);
+                            CommandOutcome::Handled
+                        }
+                        Err(e) => CommandOutcome::Error(format!("inbox: {e}")),
+                    }
+                }
+                Err(e) => CommandOutcome::Error(e),
+            },
+            Some("clear") => match crate::inbox::dismiss_all_new(&path) {
+                Ok(n) => {
+                    cprintln!(
+                        "dismissed {n} inbox entr{}",
+                        if n == 1 { "y" } else { "ies" }
+                    );
+                    CommandOutcome::Handled
+                }
+                Err(e) => CommandOutcome::Error(format!("inbox: {e}")),
+            },
+            Some(other) => CommandOutcome::Error(format!(
+                "unknown /inbox subcommand: {other}; usage: /inbox [all|claim <n>|dismiss <n>|clear]"
+            )),
+        }
+    }
+}
+
+/// Resolve `<n>` (1-based position in the `new` list) or an `inb-…` id (prefix ok).
+fn resolve_inbox_target(
+    path: &std::path::Path,
+    arg: Option<&String>,
+) -> Result<crate::inbox::InboxEntry, String> {
+    let Some(arg) = arg else {
+        return Err("usage: /inbox claim|dismiss <n or inb-id>".into());
+    };
+    let entries = crate::inbox::list_new(path).map_err(|e| format!("inbox: {e}"))?;
+    if let Ok(n) = arg.parse::<usize>() {
+        return entries
+            .get(n.saturating_sub(1))
+            .cloned()
+            .ok_or_else(|| format!("no inbox entry #{n} (have {})", entries.len()));
+    }
+    entries
+        .iter()
+        .find(|entry| entry.id.starts_with(arg.as_str()))
+        .cloned()
+        .ok_or_else(|| format!("no new inbox entry matching '{arg}'"))
+}
+
 pub(crate) fn render_cron_jobs(jobs: &[crate::triggers::cron::CronJob]) -> Vec<String> {
     if jobs.is_empty() {
         return vec!["Cron jobs (session): none".into()];
@@ -2482,9 +2632,10 @@ pub(crate) fn render_cron_jobs(jobs: &[crate::triggers::cron::CronJob]) -> Vec<S
             .as_ref()
             .map(|trace| format!(", running {trace}"))
             .unwrap_or_default();
+        let stateful = if job.stateful { "  [stateful]" } else { "" };
         lines.push(format!(
-            "  {}  {}  {}{}",
-            job.id, state, job.schedule, running
+            "  {}  {}  {}{}{}",
+            job.id, state, job.schedule, stateful, running
         ));
         lines.push(format!("    action: {}", preview_cron_action(&job.action)));
         if job.skipped_overlap_count > 0 {

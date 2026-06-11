@@ -1160,6 +1160,11 @@ function renderSkills(skills) {
 function renderSidebar(snapshot) {
   const side = snapshot.sidebar;
   const blocks = [];
+  if (side.inbox_new > 0) {
+    blocks.push(section('Inbox', side.inbox_new + ' new', node('div', { class: 'rows' }, [
+      node('div', { class: 'row', text: side.inbox_new + ' finding(s) from loops — /inbox to triage' })
+    ])));
+  }
   blocks.push(section('Skills', side.skills.total + ' total', renderSkills(side.skills)));
   blocks.push(section('Triggers', side.triggers.enabled + ' enabled / ' + side.triggers.disabled + ' disabled', renderRules(side.triggers.rules)));
 

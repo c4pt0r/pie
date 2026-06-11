@@ -669,6 +669,7 @@ mod tests {
                 last_completed_at: None,
                 last_error: Some("old error".into()),
                 skipped_overlap_count: 2,
+                stateful: false,
                 created_at: Utc::now(),
             }],
         };
@@ -958,6 +959,7 @@ mod tests {
             last_completed_at: None,
             last_error: None,
             skipped_overlap_count: 0,
+            stateful: false,
             created_at: Utc::now(),
         }
     }

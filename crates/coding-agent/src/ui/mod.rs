@@ -1657,6 +1657,15 @@ impl App {
         }
 
         lines.push(Line::raw(""));
+        let inbox_new = crate::inbox::new_count(&crate::inbox::default_inbox_path());
+        if inbox_new > 0 {
+            lines.push(panel_line(
+                format!("Inbox  {inbox_new} new — /inbox"),
+                Color::Yellow,
+                width,
+            ));
+            lines.push(panel_line(String::new(), Color::Reset, width));
+        }
         lines.push(panel_line("Cron (session)".to_string(), Color::Cyan, width));
         if cron_jobs.is_empty() {
             lines.push(panel_line("none".to_string(), Color::DarkGray, width));

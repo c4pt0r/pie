@@ -33,8 +33,11 @@ mod config;
 #[allow(dead_code)]
 #[path = "../src/export.rs"]
 mod export;
+#[path = "../src/inbox.rs"]
 #[allow(dead_code)]
+mod inbox;
 #[path = "../src/triggers/mod.rs"]
+#[allow(dead_code)]
 mod triggers;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());

@@ -86,6 +86,7 @@ pub(crate) struct WebControlPlanePromptSnapshot {
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct WebSidebarSnapshot {
+    inbox_new: usize,
     skills: WebSkillsSnapshot,
     triggers: WebTriggersSnapshot,
     cron: WebCronSnapshot,
@@ -568,6 +569,7 @@ impl App {
             .collect::<Vec<_>>();
 
         WebSidebarSnapshot {
+            inbox_new: crate::inbox::new_count(&crate::inbox::default_inbox_path()),
             skills: WebSkillsSnapshot {
                 total: skills.len(),
                 enabled,
@@ -1098,6 +1100,7 @@ mod tests {
 
     fn empty_sidebar_snapshot() -> WebSidebarSnapshot {
         WebSidebarSnapshot {
+            inbox_new: crate::inbox::new_count(&crate::inbox::default_inbox_path()),
             skills: WebSkillsSnapshot {
                 total: 0,
                 enabled: 0,

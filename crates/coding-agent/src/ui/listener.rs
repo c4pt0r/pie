@@ -153,7 +153,14 @@ fn map_harness_event(
         HarnessEvent::TriggerCompleted {
             trace_id, summary, ..
         } => {
-            let summary = summary.as_deref().unwrap_or("completed");
+            // Loop-protocol tags are persisted by the cron listener; keep them out of
+            // the conversation line.
+            let summary = summary
+                .as_deref()
+                .map(crate::triggers::cron::strip_loop_protocol_tags)
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "completed".to_string());
+            let summary = summary.as_str();
             let was_quiet = quiet.lock().remove(trace_id);
             if !debug && was_quiet && is_no_match_dynamic_summary(summary) {
                 return Some(dynamic_poll_status_update(
