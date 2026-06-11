@@ -240,6 +240,10 @@ impl App {
             .relay_abort_rx
             .take()
             .expect("relay_abort_rx taken once");
+        let mut relay_resolve_rx = self
+            .relay_resolve_rx
+            .take()
+            .expect("relay_resolve_rx taken once");
         let mut turn = TurnState::default();
         self.refresh_goal_state().await;
         self.publish_snapshot(&latest, &snapshot_tx).await;
@@ -276,6 +280,10 @@ impl App {
                         self.request_abort(&mut turn);
                         self.publish_snapshot(&latest, &snapshot_tx).await;
                     }
+                }
+                Some(approve) = relay_resolve_rx.recv() => {
+                    self.resolve_from_relay(approve);
+                    self.publish_snapshot(&latest, &snapshot_tx).await;
                 }
                 Some(prompt) = async {
                     match control_plane_prompt_rx.as_mut() {

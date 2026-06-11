@@ -48,9 +48,18 @@ pub(crate) enum AgentFrame {
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum WorkerFrame {
-    Prompt { text: String },
+    Prompt {
+        text: String,
+    },
     Abort,
-    Viewers { count: u64 },
+    /// Remote approval of a pending control-plane prompt — first-class, identical to a
+    /// local TUI confirmation (owner decision 2026-06-11; the capability URL grants it).
+    ControlPlaneResolve {
+        approve: bool,
+    },
+    Viewers {
+        count: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -157,6 +166,7 @@ pub fn start(
     base_url: &str,
     prompt_tx: mpsc::UnboundedSender<String>,
     abort_tx: mpsc::UnboundedSender<()>,
+    resolve_tx: mpsc::UnboundedSender<bool>,
 ) -> Result<RelayHandle> {
     let view_token = new_token();
     let agent_key = new_token();
@@ -177,6 +187,7 @@ pub fn start(
         snapshot_rx,
         prompt_tx,
         abort_tx,
+        resolve_tx,
         cancel.clone(),
         shared.clone(),
     ));
@@ -189,12 +200,14 @@ pub fn start(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn relay_task(
     ws_url: String,
     agent_key: String,
     mut snapshot_rx: mpsc::UnboundedReceiver<WebSnapshot>,
     prompt_tx: mpsc::UnboundedSender<String>,
     abort_tx: mpsc::UnboundedSender<()>,
+    resolve_tx: mpsc::UnboundedSender<bool>,
     cancel: CancellationToken,
     shared: Arc<Mutex<RelayShared>>,
 ) {
@@ -280,6 +293,9 @@ async fn relay_task(
                                 }
                                 Ok(WorkerFrame::Abort) => {
                                     let _ = abort_tx.send(());
+                                }
+                                Ok(WorkerFrame::ControlPlaneResolve { approve }) => {
+                                    let _ = resolve_tx.send(approve);
                                 }
                                 Ok(WorkerFrame::Viewers { count }) => {
                                     shared.lock().viewers = count;
@@ -392,5 +408,8 @@ mod tests {
         assert_eq!(viewers, WorkerFrame::Viewers { count: 3 });
         let abort: WorkerFrame = serde_json::from_str(r#"{"type":"abort"}"#).unwrap();
         assert_eq!(abort, WorkerFrame::Abort);
+        let resolve: WorkerFrame =
+            serde_json::from_str(r#"{"type":"control_plane_resolve","approve":true}"#).unwrap();
+        assert_eq!(resolve, WorkerFrame::ControlPlaneResolve { approve: true });
     }
 }

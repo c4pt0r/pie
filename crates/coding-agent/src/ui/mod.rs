@@ -165,6 +165,8 @@ pub struct App {
     relay_prompt_rx: Option<UnboundedReceiver<String>>,
     relay_abort_tx: UnboundedSender<()>,
     relay_abort_rx: Option<UnboundedReceiver<()>>,
+    relay_resolve_tx: UnboundedSender<bool>,
+    relay_resolve_rx: Option<UnboundedReceiver<bool>>,
 }
 
 impl App {
@@ -173,6 +175,7 @@ impl App {
             SlashCompleter::from_registry_and_skills(&config.registry, &config.harness.skills());
         let (relay_prompt_tx, relay_prompt_rx) = tokio::sync::mpsc::unbounded_channel();
         let (relay_abort_tx, relay_abort_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (relay_resolve_tx, relay_resolve_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             kernel: ReplKernel::new(config.harness, config.retry),
             registry: config.registry,
@@ -213,6 +216,8 @@ impl App {
             relay_prompt_rx: Some(relay_prompt_rx),
             relay_abort_tx,
             relay_abort_rx: Some(relay_abort_rx),
+            relay_resolve_tx,
+            relay_resolve_rx: Some(relay_resolve_rx),
         }
     }
 
@@ -355,6 +360,10 @@ impl App {
             .relay_abort_rx
             .take()
             .expect("relay_abort_rx taken once");
+        let mut relay_resolve_rx = self
+            .relay_resolve_rx
+            .take()
+            .expect("relay_resolve_rx taken once");
         let mut turn = TurnState::default();
         self.refresh_goal_state().await;
 
@@ -393,6 +402,9 @@ impl App {
                         self.system_line("[web] abort requested");
                         self.request_abort(&mut turn);
                     }
+                }
+                Some(approve) = relay_resolve_rx.recv() => {
+                    self.resolve_from_relay(approve);
                 }
                 Some(prompt) = async {
                     match control_plane_prompt_rx.as_mut() {
@@ -460,12 +472,13 @@ impl App {
                     &base,
                     self.relay_prompt_tx.clone(),
                     self.relay_abort_tx.clone(),
+                    self.relay_resolve_tx.clone(),
                 ) {
                     Ok(handle) => {
                         self.system_line(format!("web relay: {}", handle.url));
                         self.system_line(
-                            "warning: anyone with this URL can watch the full conversation AND \
-                             send prompts to this agent until /web-disconnect",
+                            "warning: anyone with this URL can watch the full conversation, \
+                             send prompts, AND approve permission requests until /web-disconnect",
                         );
                         if self.relay_qr_in_feed {
                             match relay::qr_lines(&handle.url) {
@@ -508,6 +521,22 @@ impl App {
         if let Some(active) = &self.relay {
             active.push_snapshot(self.web_snapshot());
         }
+    }
+
+    /// Resolve a pending control-plane prompt from the relay — first-class, identical
+    /// to a local confirmation (owner decision 2026-06-11).
+    fn resolve_from_relay(&mut self, approve: bool) {
+        if self.control_plane_prompt.is_none() {
+            return;
+        }
+        let decision = if approve {
+            pie_agent_core::ControlPlanePromptDecision::Allow
+        } else {
+            pie_agent_core::ControlPlanePromptDecision::Deny {
+                reason: Some("denied via web relay".into()),
+            }
+        };
+        self.resolve_control_plane_prompt(decision);
     }
 
     /// Inject a prompt that arrived over the relay through the same path as local

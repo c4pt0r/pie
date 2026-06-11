@@ -143,6 +143,33 @@ test("relay agent route forwards to the durable object as /agent", async () => {
   assert.deepEqual(log, [{ token: TOKEN, path: "/agent" }]);
 });
 
+test("control-plane resolve validates input and reports agent_offline without a socket", async () => {
+  const { SessionRelay } = await import("../dist/index.js");
+  const relay = new SessionRelay();
+  const bad = await relay.fetch(
+    new Request(`${BASE}/control-plane/resolve`, { method: "POST", body: "not json" }),
+  );
+  assert.equal(bad.status, 400);
+  const notBool = await relay.fetch(
+    new Request(`${BASE}/control-plane/resolve`, {
+      method: "POST",
+      body: JSON.stringify({ approve: "yes" }),
+    }),
+  );
+  assert.equal(notBool.status, 400);
+  // Valid approval with no live agent socket: forwarded path reports offline, not 403 —
+  // remote approval is first-class now.
+  const offline = await relay.fetch(
+    new Request(`${BASE}/control-plane/resolve`, {
+      method: "POST",
+      body: JSON.stringify({ approve: true }),
+    }),
+  );
+  assert.equal(offline.status, 503);
+  const body = await offline.json();
+  assert.equal(body.error, "agent_offline");
+});
+
 test("legacy hub paths still return 410 with the relay enabled", async () => {
   const app = createTestApp("v", fakeRelayNamespace([]));
   for (const path of ["/auth/start", "/chat", "/mcp", "/login"]) {

@@ -71,7 +71,7 @@ GET  /session/<token>/events             SSE: snapshot frames + offline/online e
 POST /session/<token>/prompt             {text} → forwarded to agent WS
 POST /session/<token>/abort              forwarded (same trust level as prompt)
 POST /session/<token>/complete           200 with empty completions (not relayed)
-POST /session/<token>/control-plane/resolve   403 — see security boundary
+POST /session/<token>/control-plane/resolve   {approve} → forwarded (first-class, since 2026-06-11)
 ```
 
 - `SessionRelay` DO: keeps the agent WS, the pinned agent key, the latest snapshot,
@@ -88,14 +88,15 @@ relative `state` / `events` / `prompt` endpoints, so it works unchanged under th
 session prefix; endpoints the relay doesn't support degrade gracefully (empty
 completions, 403 approvals → the page shows "approve locally").
 
-## Security boundary (decided 2026-06-11)
+## Security boundary (revised 2026-06-11, owner decision)
 
-- The capability URL grants **watch + prompt + abort**, not approval. Control-plane
-  prompts (permission confirmations) can only be resolved locally (terminal or local
-  web UI). A leaked link can ask the agent to do something dangerous but cannot
-  approve it under the default permission policy.
-- A future `/web-connect --allow-remote-approval` may relax this per-connection; not
-  in v1.
+- The capability URL grants **watch + prompt + abort + approve**: remote confirmation
+  of control-plane prompts is first-class and behaves exactly like a local TUI
+  confirmation (same `resolve_control_plane_prompt` path; remote denials carry a
+  "denied via web relay" reason). v1 originally shipped approval as local-only; the
+  owner upgraded it the same day for phone-first workflows. Treat the URL accordingly:
+  a leaked link is full control until `/web-disconnect`.
+- Remote slash commands remain refused.
 - The relay never carries provider credentials, auth.json contents, or session files —
   only rendered snapshots and prompt text.
 - Worker accepts relay creation from anyone (it is the owner's deployment); abuse

@@ -145,10 +145,7 @@ export class SessionRelay {
       case "/complete":
         return json({ completions: [] });
       case "/control-plane/resolve":
-        return json(
-          { ok: false, error: "remote_approval_disabled", message: "approve from the local pie session" },
-          403,
-        );
+        return this.forwardResolve(request);
       default:
         return json({ ok: false, error: "not_found" }, 404);
     }
@@ -255,6 +252,21 @@ export class SessionRelay {
       return json({ ok: false, error: "prompt_too_long" }, 413);
     }
     return this.forward({ type: "prompt", text });
+  }
+
+  private async forwardResolve(request: Request): Promise<Response> {
+    // First-class remote approval (owner decision 2026-06-11): the capability URL
+    // grants the same confirmation power as the local TUI.
+    let body: { approve?: unknown };
+    try {
+      body = (await request.json()) as { approve?: unknown };
+    } catch {
+      return json({ ok: false, error: "invalid_json" }, 400);
+    }
+    if (typeof body.approve !== "boolean") {
+      return json({ ok: false, error: "approve_must_be_boolean" }, 400);
+    }
+    return this.forward({ type: "control_plane_resolve", approve: body.approve });
   }
 
   private forward(frame: { type: string; [k: string]: unknown }): Response {
