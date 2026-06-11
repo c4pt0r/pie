@@ -865,7 +865,7 @@ const approvalPayload = document.getElementById('approvalPayload');
 const approveApproval = document.getElementById('approveApproval');
 const denyApproval = document.getElementById('denyApproval');
 const THEME_KEY = 'pie-web-theme';
-const SIDEBAR_KEY = 'pie-web-sidebar';
+const SIDEBAR_KEY = 'pie-web-sidebar-v2';
 const MAX_IMAGE_ATTACHMENTS = 10;
 let completionItems = [];
 let completionIndex = 0;
@@ -896,7 +896,7 @@ function currentSidebarHidden() {
   return app.dataset.sidebar === 'hidden';
 }
 
-function applySidebarHidden(hidden) {
+function applySidebarHidden(hidden, persist) {
   if (hidden) {
     app.dataset.sidebar = 'hidden';
     sidebarToggle.textContent = '◧';
@@ -910,7 +910,9 @@ function applySidebarHidden(hidden) {
     sidebarToggle.setAttribute('aria-label', 'Hide sidebar');
     sidebarToggle.setAttribute('aria-pressed', 'false');
   }
-  try { localStorage.setItem(SIDEBAR_KEY, hidden ? 'hidden' : 'visible'); } catch (_) {}
+  if (persist) {
+    try { localStorage.setItem(SIDEBAR_KEY, hidden ? 'hidden' : 'visible'); } catch (_) {}
+  }
 }
 
 let savedSidebar = null;
@@ -919,9 +921,9 @@ if (savedSidebar !== 'hidden' && savedSidebar !== 'visible') {
   // No explicit preference: phones get the conversation, not the panels.
   savedSidebar = window.matchMedia('(max-width: 860px)').matches ? 'hidden' : 'visible';
 }
-applySidebarHidden(savedSidebar === 'hidden');
+applySidebarHidden(savedSidebar === 'hidden', false);
 sidebarToggle.addEventListener('click', () => {
-  applySidebarHidden(!currentSidebarHidden());
+  applySidebarHidden(!currentSidebarHidden(), true);
 });
 
 function node(tag, attrs = {}, children = []) {
