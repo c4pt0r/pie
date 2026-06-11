@@ -1855,6 +1855,7 @@ fn print_headless_update(update: &FeedUpdate, at_line_start: &mut bool) {
             *at_line_start = true;
         }
         FeedUpdate::TriggerPollStatus(_) => {}
+        FeedUpdate::SkillsReloaded { .. } => {}
         FeedUpdate::TurnStart => {}
         FeedUpdate::TurnEnd => {
             if !*at_line_start {

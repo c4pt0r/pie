@@ -60,6 +60,12 @@ pub enum FeedUpdate {
         level: Level,
     },
     TriggerPollStatus(TriggerPollStatus),
+    /// The skill catalog was hot-reloaded. Display-only: appends no feed block, but the
+    /// update itself drives a TUI repaint / web snapshot republish so sidebars showing the
+    /// catalog never go stale.
+    SkillsReloaded {
+        total: usize,
+    },
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -354,6 +360,7 @@ impl Feed {
             } => self.upsert_tool_result(tool_call_id, lines, is_error),
             FeedUpdate::Plain { text, level } => self.push_plain(text, level),
             FeedUpdate::TriggerPollStatus(_) => {}
+            FeedUpdate::SkillsReloaded { .. } => {}
         }
     }
 

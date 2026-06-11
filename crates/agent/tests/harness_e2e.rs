@@ -354,6 +354,7 @@ async fn harness_event_bus_delivers_session_and_branch() {
             HarnessEvent::TriggerRequestsMainRun { .. } => "TriggerRequestsMainRun",
             HarnessEvent::PromotionPending { .. } => "PromotionPending",
             HarnessEvent::TurnEnded { .. } => "TurnEnded",
+            HarnessEvent::SkillsReloaded { .. } => "SkillsReloaded",
         })
         .collect();
     assert!(
@@ -4779,6 +4780,55 @@ async fn reload_skills_from_disk_invokes_loader_and_replaces_catalog() {
     assert!(
         !prompt.contains("the skill we ship with"),
         "original skill description must not leak into rebuilt prompt: {prompt}",
+    );
+}
+
+/// The UI sidebar repaints off harness events — a catalog hot-reload that emits nothing
+/// leaves the skills panel stale (e.g. a sub-agent installing a skill while the parent
+/// is idle). Every successful reload must announce itself.
+#[tokio::test]
+async fn reload_skills_from_disk_emits_skills_reloaded_event() {
+    use pie_agent_core::{LoadSkillsOutput, Skill};
+    use std::sync::Mutex;
+
+    let storage = Arc::new(MemorySessionStorage::new());
+    let session = Session::new(storage.clone() as Arc<dyn SessionStorage>);
+    let mut opts = AgentHarnessOptions::new(faux_model(), session.clone());
+    opts.reload_skills_fn = Some(Arc::new(move || {
+        Box::pin(async move {
+            LoadSkillsOutput {
+                skills: vec![Skill {
+                    name: "fresh-one".into(),
+                    content: "after install".into(),
+                    description: "newly installed".into(),
+                    disable_model_invocation: false,
+                    source: SkillSource::User,
+                    file_path: "/tmp/fresh-one".into(),
+                }],
+                diagnostics: Vec::new(),
+            }
+        })
+    }));
+    let harness = AgentHarness::new(opts);
+
+    let received: Arc<Mutex<Vec<HarnessEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let received_for_listener = received.clone();
+    let _unsubscribe = harness.subscribe_harness(Arc::new(move |event| {
+        received_for_listener.lock().unwrap().push(event);
+    }));
+
+    harness
+        .reload_skills_from_disk()
+        .await
+        .expect("loader configured");
+
+    let events = received.lock().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, HarnessEvent::SkillsReloaded { total: 1 })),
+        "reload must emit SkillsReloaded with the new catalog size; got {} event(s)",
+        events.len()
     );
 }
 

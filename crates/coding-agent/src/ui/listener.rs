@@ -231,6 +231,12 @@ fn map_harness_event(
             }),
             _ => None,
         },
+        // Display-only sidebar refresh: the catalog can change with no other feed
+        // activity (sub-agent installs a skill while the parent is idle), so the reload
+        // must drive a repaint itself.
+        HarnessEvent::SkillsReloaded { total } => {
+            Some(FeedUpdate::SkillsReloaded { total: *total })
+        }
         _ => None,
     }
 }
@@ -404,6 +410,18 @@ mod tests {
         assert!(
             args.is_empty(),
             "Skill tool args should not be rendered: {args}"
+        );
+    }
+
+    /// A catalog hot-reload must reach the UI as an update (so the skills sidebar
+    /// repaints and the web snapshot republishes) without appending a conversation line.
+    #[test]
+    fn skills_reloaded_maps_to_sidebar_refresh_update() {
+        let update = map_harness_event_for_test(&HarnessEvent::SkillsReloaded { total: 3 })
+            .expect("skills reload must produce a feed update");
+        assert!(
+            matches!(update, FeedUpdate::SkillsReloaded { total: 3 }),
+            "got {update:?}"
         );
     }
 

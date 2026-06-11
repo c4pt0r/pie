@@ -216,6 +216,11 @@ pub enum HarnessEvent {
         reason: Option<String>,
         next_prompt_preview: Option<String>,
     },
+    /// The skill catalog was hot-reloaded via [`AgentHarness::reload_skills_from_disk`]
+    /// (`InstallSkill`, `SkillBuilder`, `/skills reload`, …). UIs that display the catalog
+    /// repaint off this — a reload can happen with no other feed activity (e.g. a trigger
+    /// or cron sub-agent installing a skill while the parent sits idle).
+    SkillsReloaded { total: usize },
 }
 
 /// Listener for [`HarnessEvent`]. Shape mirrors `crate::agent::AgentListener` so the same Fn
@@ -1540,6 +1545,9 @@ impl AgentHarness {
             .clone();
         let out = loader().await;
         self.replace_skills(out.skills.clone());
+        self.emit_harness_event(HarnessEvent::SkillsReloaded {
+            total: out.skills.len(),
+        });
         Ok(out)
     }
 
