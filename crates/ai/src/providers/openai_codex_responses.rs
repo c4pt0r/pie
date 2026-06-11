@@ -188,7 +188,7 @@ async fn run(
 
 fn build_request_body(model: &Model, context: &Context, options: &StreamOptions) -> Value {
     // Codex omits the system message and uses `instructions` instead.
-    let messages = convert_messages(&context.messages, None);
+    let messages = convert_messages(&context.messages, None, false);
     let mut body = json!({
         "model": model.id,
         "store": false,

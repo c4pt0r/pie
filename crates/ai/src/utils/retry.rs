@@ -138,7 +138,9 @@ fn retry_send_error(error: AbortErrorOrReqwest) -> RetrySendError {
 
 fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     let c = status.as_u16();
-    c == 408 || c == 425 || c == 429 || (500..600).contains(&c)
+    // 409: local inference servers (ds4) ask the client to replay the full
+    // history; pie always sends the full history, so a plain retry is that replay.
+    c == 408 || c == 409 || c == 425 || c == 429 || (500..600).contains(&c)
 }
 
 fn is_retryable_reqwest_error(e: &reqwest::Error) -> bool {
@@ -180,6 +182,14 @@ mod tests {
         assert!(!is_retryable_status(reqwest::StatusCode::UNAUTHORIZED));
         assert!(!is_retryable_status(reqwest::StatusCode::FORBIDDEN));
         assert!(!is_retryable_status(reqwest::StatusCode::OK));
+    }
+
+    #[test]
+    fn conflict_is_retryable() {
+        // Local inference servers (e.g. ds4) return 409 when live continuation
+        // state was evicted; the documented recovery is to replay the full
+        // history, which is exactly what resending the same request does.
+        assert!(is_retryable_status(reqwest::StatusCode::CONFLICT));
     }
 
     #[test]

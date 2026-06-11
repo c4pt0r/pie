@@ -34,6 +34,11 @@ const OPENAI_BASE_URL: &str = "https://api.openai.com";
 pub(crate) struct Compat {
     pub send_session_id_header: bool,
     pub supports_long_cache_retention: bool,
+    /// Replay assistant thinking content as `{"type":"reasoning"}` input items.
+    /// Needed by servers that do byte-exact KV prefix matching on the rendered
+    /// history (e.g. ds4 / DeepSeek V4 local): omitting the reasoning changes
+    /// the rendered prefix and invalidates their cache checkpoints.
+    pub replay_reasoning_content: bool,
 }
 
 pub(crate) fn resolve_compat(model: &Model) -> Compat {
@@ -48,6 +53,7 @@ pub(crate) fn resolve_compat(model: &Model) -> Compat {
     Compat {
         send_session_id_header: read_bool("sendSessionIdHeader", true),
         supports_long_cache_retention: read_bool("supportsLongCacheRetention", true),
+        replay_reasoning_content: read_bool("requiresReasoningContentOnAssistantMessages", false),
     }
 }
 
@@ -546,6 +552,14 @@ fn update_usage(usage: &mut Usage, val: &Value) {
     {
         usage.cache_read += n;
     }
+    // Non-standard but reported by local inference servers (ds4): tokens newly
+    // written into the prompt cache this request.
+    if let Some(n) = val
+        .pointer("/input_tokens_details/cache_write_tokens")
+        .and_then(|v| v.as_u64())
+    {
+        usage.cache_write += n;
+    }
     usage.total_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
 }
 
@@ -559,7 +573,11 @@ pub(crate) fn build_request_body(
     options: &StreamOptions,
     compat: &Compat,
 ) -> Result<Value, String> {
-    let messages = convert_messages(&context.messages, context.system_prompt.as_deref());
+    let messages = convert_messages(
+        &context.messages,
+        context.system_prompt.as_deref(),
+        compat.replay_reasoning_content,
+    );
     let mut body = json!({
         "model": model.id,
         "input": messages,
@@ -641,7 +659,11 @@ pub(crate) fn serialize_tools(tools: &[Tool]) -> Vec<Value> {
         .collect()
 }
 
-pub(crate) fn convert_messages(msgs: &[Message], system_prompt: Option<&str>) -> Vec<Value> {
+pub(crate) fn convert_messages(
+    msgs: &[Message],
+    system_prompt: Option<&str>,
+    replay_reasoning: bool,
+) -> Vec<Value> {
     let mut out = Vec::with_capacity(msgs.len() + 1);
     if let Some(sys) = system_prompt {
         out.push(json!({
@@ -664,6 +686,17 @@ pub(crate) fn convert_messages(msgs: &[Message], system_prompt: Option<&str>) ->
                             "type": "output_text",
                             "text": t.text,
                         })),
+                        // Servers that consume reasoning items merge them into
+                        // the *following* assistant message, so this must be
+                        // emitted before the message / function_call items.
+                        ContentBlock::Thinking(th)
+                            if replay_reasoning && !th.thinking.is_empty() =>
+                        {
+                            out.push(json!({
+                                "type": "reasoning",
+                                "summary": [{ "type": "summary_text", "text": th.thinking }],
+                            }));
+                        }
                         ContentBlock::Thinking(_) => {}
                         ContentBlock::ToolCall(tc) => {
                             function_calls.push(json!({
@@ -891,6 +924,100 @@ mod tests {
         assert_eq!(body["reasoning"]["effort"], "high");
         assert_eq!(body["reasoning"]["summary"], "auto");
         assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+    }
+
+    fn assistant_msg_with_thinking() -> Message {
+        Message::Assistant(AssistantMessage {
+            role: AssistantRole::Assistant,
+            content: vec![
+                ContentBlock::Thinking(ThinkingContent {
+                    thinking: "let me check".into(),
+                    thinking_signature: None,
+                    redacted: false,
+                }),
+                ContentBlock::Text(TextContent {
+                    text: "done".into(),
+                    text_signature: None,
+                }),
+            ],
+            api: Api::known(KnownApi::OpenAIResponses),
+            provider: Provider::from("openai"),
+            model: "gpt-5".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: 0,
+        })
+    }
+
+    #[test]
+    fn thinking_replayed_as_reasoning_item_when_compat_requires() {
+        // ds4 (DeepSeek V4 local server) does byte-exact KV prefix matching on
+        // the rendered history; it accepts `{"type":"reasoning"}` input items
+        // and merges them into the following assistant message. Replaying the
+        // thinking text keeps the rendered prefix identical to what the server
+        // sampled, so disk KV checkpoints stay valid after eviction/restart.
+        let mut m = mk_model();
+        m.compat = Some(json!({ "requiresReasoningContentOnAssistantMessages": true }));
+        let ctx = Context {
+            system_prompt: None,
+            messages: vec![assistant_msg_with_thinking()],
+            tools: None,
+        };
+        let body = build_request_body(&m, &ctx, &Default::default(), &resolve_compat(&m)).unwrap();
+        let input = body["input"].as_array().unwrap();
+        let reasoning_idx = input
+            .iter()
+            .position(|v| v["type"] == "reasoning")
+            .expect("reasoning input item");
+        assert_eq!(
+            input[reasoning_idx]["summary"],
+            json!([{ "type": "summary_text", "text": "let me check" }])
+        );
+        let assistant_idx = input
+            .iter()
+            .position(|v| v["role"] == "assistant")
+            .expect("assistant message item");
+        assert!(
+            reasoning_idx < assistant_idx,
+            "reasoning item must precede the assistant message it belongs to"
+        );
+    }
+
+    #[test]
+    fn thinking_dropped_without_compat_flag() {
+        let m = mk_model();
+        let ctx = Context {
+            system_prompt: None,
+            messages: vec![assistant_msg_with_thinking()],
+            tools: None,
+        };
+        let body = build_request_body(&m, &ctx, &Default::default(), &resolve_compat(&m)).unwrap();
+        let input = body["input"].as_array().unwrap();
+        assert!(input.iter().all(|v| v["type"] != "reasoning"));
+    }
+
+    #[test]
+    fn usage_reads_cached_and_cache_write_tokens() {
+        // ds4 reports both cached_tokens (KV prefix hits) and cache_write_tokens
+        // (new suffix written into the live KV) under input_tokens_details.
+        let mut usage = Usage::default();
+        update_usage(
+            &mut usage,
+            &json!({
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "input_tokens_details": {
+                    "cached_tokens": 80,
+                    "cache_write_tokens": 20,
+                },
+            }),
+        );
+        assert_eq!(usage.cache_read, 80);
+        assert_eq!(usage.cache_write, 20);
     }
 
     #[test]
