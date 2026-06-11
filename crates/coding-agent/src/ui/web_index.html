@@ -832,8 +832,12 @@ function applySidebarHidden(hidden) {
   try { localStorage.setItem(SIDEBAR_KEY, hidden ? 'hidden' : 'visible'); } catch (_) {}
 }
 
-let savedSidebar = 'visible';
-try { savedSidebar = localStorage.getItem(SIDEBAR_KEY) || 'visible'; } catch (_) {}
+let savedSidebar = null;
+try { savedSidebar = localStorage.getItem(SIDEBAR_KEY); } catch (_) {}
+if (savedSidebar !== 'hidden' && savedSidebar !== 'visible') {
+  // No explicit preference: phones get the conversation, not the panels.
+  savedSidebar = window.matchMedia('(max-width: 860px)').matches ? 'hidden' : 'visible';
+}
 applySidebarHidden(savedSidebar === 'hidden');
 sidebarToggle.addEventListener('click', () => {
   applySidebarHidden(!currentSidebarHidden());
@@ -1562,6 +1566,13 @@ events.addEventListener('relay_status', (event) => {
   }
   banner.style.display = status.agent_online ? 'none' : 'block';
 });
+
+// On phones, tapping a form button first blurs the textarea, which dismisses the
+// soft keyboard and relayouts the page before the click is dispatched — the tap lands
+// on nothing and "send" appears dead. Suppress focus steal so the click always lands.
+for (const formButton of form.querySelectorAll('button')) {
+  formButton.addEventListener('pointerdown', (event) => event.preventDefault());
+}
 
 form.addEventListener('submit', async (event) => {
   event.preventDefault();
