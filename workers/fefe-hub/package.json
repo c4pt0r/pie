@@ -4,10 +4,11 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "embed-html": "node scripts/embed-html.mjs",
+    "build": "npm run embed-html && tsc -p tsconfig.json",
     "test": "npm run build && node --test tests/*.test.mjs",
-    "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
+    "dev": "npm run embed-html && wrangler dev",
+    "deploy": "npm run embed-html && wrangler deploy",
     "d1:migrate:local": "wrangler d1 migrations apply pie_fefe_hub --local",
     "d1:migrate:remote": "wrangler d1 migrations apply pie_fefe_hub --remote"
   },

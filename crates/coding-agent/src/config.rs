@@ -56,9 +56,46 @@ pub fn parse_trigger_poll_interval_secs(toml_text: &str) -> Result<Option<u64>, 
     Ok(Some(secs))
 }
 
+/// Default public relay endpoint for `/web-connect` (issue #22). Override with
+/// `[relay] base_url` in `~/.pie/config.toml` (e.g. a wrangler dev instance).
+pub const DEFAULT_RELAY_BASE_URL: &str = "https://pie.0xfefe.me";
+
+/// Parse `[relay] base_url` from config.toml text. Returns the default when absent.
+pub fn parse_relay_base_url(toml_text: &str) -> Result<String, String> {
+    let parsed: ConfigFile =
+        toml::from_str(toml_text).map_err(|e| format!("parse config.toml: {e}"))?;
+    let Some(url) = parsed.relay.and_then(|section| section.base_url) else {
+        return Ok(DEFAULT_RELAY_BASE_URL.to_string());
+    };
+    let trimmed = url.trim().trim_end_matches('/').to_string();
+    if !trimmed.starts_with("https://") && !trimmed.starts_with("http://") {
+        return Err("`[relay] base_url` must start with http(s)://".into());
+    }
+    Ok(trimmed)
+}
+
+/// Read the relay base URL from `<base_dir>/config.toml`, falling back to the default
+/// on missing file. Parse errors are returned so the command can surface them.
+pub async fn relay_base_url() -> Result<String, String> {
+    let path = base_dir().join("config.toml");
+    match tokio::fs::read_to_string(&path).await {
+        Ok(text) => parse_relay_base_url(&text),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Ok(DEFAULT_RELAY_BASE_URL.to_string())
+        }
+        Err(err) => Err(format!("read {}: {err}", path.display())),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ConfigFile {
     triggers: Option<TriggerConfigSection>,
+    relay: Option<RelayConfigSection>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RelayConfigSection {
+    base_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -82,6 +119,14 @@ poll_interval_secs = 15
     #[test]
     fn parse_trigger_poll_interval_defaults_when_missing() {
         assert_eq!(parse_trigger_poll_interval_secs("").unwrap(), None);
+    }
+
+    #[test]
+    fn parse_relay_base_url_reads_override_and_defaults() {
+        assert_eq!(parse_relay_base_url("").unwrap(), DEFAULT_RELAY_BASE_URL);
+        let text = "[relay]\nbase_url = \"http://127.0.0.1:8787/\"\n";
+        assert_eq!(parse_relay_base_url(text).unwrap(), "http://127.0.0.1:8787");
+        assert!(parse_relay_base_url("[relay]\nbase_url = \"ftp://x\"\n").is_err());
     }
 
     #[test]

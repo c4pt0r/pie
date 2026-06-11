@@ -99,6 +99,16 @@ pub enum CommandOutcome {
         storage_key: Option<String>,
         recovery_command: Option<String>,
     },
+    /// `/web-connect` family — the relay lives on the UI `App`, so the REPL layer
+    /// performs the action (issue #22).
+    WebRelay(WebRelayAction),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WebRelayAction {
+    Connect,
+    Status,
+    Disconnect,
 }
 
 impl std::fmt::Debug for CommandOutcome {
@@ -138,6 +148,7 @@ impl std::fmt::Debug for CommandOutcome {
                 .field("storage_key", storage_key)
                 .field("recovery_command", recovery_command)
                 .finish(),
+            Self::WebRelay(action) => f.debug_tuple("WebRelay").field(action).finish(),
         }
     }
 }
@@ -198,6 +209,8 @@ impl Registry {
         r.register(Arc::new(BugReportCommand));
         r.register(Arc::new(NameCommand));
         r.register(Arc::new(SessionCommand));
+        r.register(Arc::new(WebConnectCommand));
+        r.register(Arc::new(WebDisconnectCommand));
         r.register(Arc::new(SessionsCommand));
         r.register(Arc::new(ShareCommand));
         r.register(Arc::new(LoginCommand));
@@ -1802,6 +1815,43 @@ fn short_id(id: &str) -> String {
 
 fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
+}
+
+struct WebConnectCommand;
+
+#[async_trait]
+impl SlashCommand for WebConnectCommand {
+    fn name(&self) -> &'static str {
+        "web-connect"
+    }
+    fn description(&self) -> &'static str {
+        "mount this session at the public relay (watch + prompt via secret URL)"
+    }
+    fn usage(&self) -> &'static str {
+        "[status]"
+    }
+    async fn run(&self, argv: &[String], _ctx: &CommandCtx<'_>) -> CommandOutcome {
+        match argv.first().map(String::as_str) {
+            None => CommandOutcome::WebRelay(WebRelayAction::Connect),
+            Some("status") => CommandOutcome::WebRelay(WebRelayAction::Status),
+            Some(other) => CommandOutcome::Error(format!("unknown /web-connect argument: {other}")),
+        }
+    }
+}
+
+struct WebDisconnectCommand;
+
+#[async_trait]
+impl SlashCommand for WebDisconnectCommand {
+    fn name(&self) -> &'static str {
+        "web-disconnect"
+    }
+    fn description(&self) -> &'static str {
+        "disconnect the public relay and invalidate the session URL"
+    }
+    async fn run(&self, _argv: &[String], _ctx: &CommandCtx<'_>) -> CommandOutcome {
+        CommandOutcome::WebRelay(WebRelayAction::Disconnect)
+    }
 }
 
 struct SessionsCommand;

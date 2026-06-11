@@ -52,6 +52,8 @@ Every sub-issue below MUST address the same five axes in its design write-up bef
 - [ ] **#10 — Skills loader (first-class) + extension/plugin system** (priority — Part A first)
 - [x] **#21 — `SkillBuilder` builtin tool: author user skills from structured fields**. See
   [[21-skill-builder-tool]].
+- [x] **#22 — Web relay: mount a live session at pie.0xfefe.me/session/&lt;token&gt;**. See
+  [[22-web-relay]].
 - [ ] #9 — MCP (Model Context Protocol) client
 - [ ] #11 — Subagent / Task delegation
 - [ ] #12 — Built-in capability tools: web fetch, web search, git, compile-error feedback loop

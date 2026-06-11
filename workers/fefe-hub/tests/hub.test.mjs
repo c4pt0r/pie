@@ -17,6 +17,7 @@ test("health reports disabled tombstone metadata", async () => {
     ok: true,
     service: "pie-hub",
     status: "disabled",
+    relay: "unconfigured",
     version: "test-version",
     protocol_version: "2025-03-26",
   });

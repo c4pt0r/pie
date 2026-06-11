@@ -15,6 +15,14 @@ migrations_dir = "migrations"
 name = "MAILBOX"
 class_name = "AgentMailbox"
 
+[[durable_objects.bindings]]
+name = "SESSION_RELAY"
+class_name = "SessionRelay"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["AgentMailbox"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["SessionRelay"]

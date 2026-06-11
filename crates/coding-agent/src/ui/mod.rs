@@ -26,6 +26,7 @@
 pub mod feed;
 pub(crate) mod kernel;
 pub mod listener;
+pub(crate) mod relay;
 pub(crate) mod web;
 
 pub use feed::FeedUpdate;
@@ -53,7 +54,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Padding, Paragraph, Wrap};
 use regex::Regex;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tui_textarea::TextArea;
 
 use crate::agent_session::RetrySettings;
@@ -153,12 +154,22 @@ pub struct App {
     spinner_frame: usize,
     last_ctrlc: Option<Instant>,
     quit: bool,
+
+    // Remote relay (issue #22). The channels exist from construction so the event loops
+    // can always select on them; they only carry traffic while a relay is connected.
+    relay: Option<relay::RelayHandle>,
+    relay_prompt_tx: UnboundedSender<String>,
+    relay_prompt_rx: Option<UnboundedReceiver<String>>,
+    relay_abort_tx: UnboundedSender<()>,
+    relay_abort_rx: Option<UnboundedReceiver<()>>,
 }
 
 impl App {
     pub fn new(config: AppConfig) -> Self {
         let completer =
             SlashCompleter::from_registry_and_skills(&config.registry, &config.harness.skills());
+        let (relay_prompt_tx, relay_prompt_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (relay_abort_tx, relay_abort_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             kernel: ReplKernel::new(config.harness, config.retry),
             registry: config.registry,
@@ -193,6 +204,11 @@ impl App {
             spinner_frame: 0,
             last_ctrlc: None,
             quit: false,
+            relay: None,
+            relay_prompt_tx,
+            relay_prompt_rx: Some(relay_prompt_rx),
+            relay_abort_tx,
+            relay_abort_rx: Some(relay_abort_rx),
         }
     }
 
@@ -326,11 +342,20 @@ impl App {
         let mut feed_rx = self.feed_rx.take().expect("feed_rx taken once");
         let mut main_run_rx = self.main_run_rx.take().expect("main_run_rx taken once");
         let mut control_plane_prompt_rx = self.control_plane_prompt_rx.take();
+        let mut relay_prompt_rx = self
+            .relay_prompt_rx
+            .take()
+            .expect("relay_prompt_rx taken once");
+        let mut relay_abort_rx = self
+            .relay_abort_rx
+            .take()
+            .expect("relay_abort_rx taken once");
         let mut turn = TurnState::default();
         self.refresh_goal_state().await;
 
         loop {
             terminal.draw(|f| self.render(f))?;
+            self.push_relay_snapshot();
             if self.quit {
                 break;
             }
@@ -354,6 +379,15 @@ impl App {
                 }
                 Some(trace_id) = main_run_rx.recv(), if turn.fut.is_none() => {
                     self.start_triggered_turn(trace_id, &mut turn);
+                }
+                Some(text) = relay_prompt_rx.recv() => {
+                    self.submit_remote_text(text, &mut turn);
+                }
+                Some(()) = relay_abort_rx.recv() => {
+                    if turn.fut.is_some() {
+                        self.system_line("[web] abort requested");
+                        self.request_abort(&mut turn);
+                    }
                 }
                 Some(prompt) = async {
                     match control_plane_prompt_rx.as_mut() {
@@ -399,6 +433,83 @@ impl App {
         turn.prefix = "";
         self.refresh_goal_state().await;
         self.start_next_queued_turn(turn);
+    }
+
+    /// Handle `/web-connect` family outcomes. Shared by the TUI and web event loops.
+    async fn handle_web_relay(&mut self, action: commands::WebRelayAction) {
+        use commands::WebRelayAction;
+        match action {
+            WebRelayAction::Connect => {
+                if let Some(active) = &self.relay {
+                    self.system_line(format!("web relay already active: {}", active.url));
+                    return;
+                }
+                let base = match crate::config::relay_base_url().await {
+                    Ok(base) => base,
+                    Err(e) => {
+                        self.error_line(format!("web-connect: {e}"));
+                        return;
+                    }
+                };
+                match relay::start(
+                    &base,
+                    self.relay_prompt_tx.clone(),
+                    self.relay_abort_tx.clone(),
+                ) {
+                    Ok(handle) => {
+                        self.system_line(format!("web relay: {}", handle.url));
+                        self.system_line(
+                            "warning: anyone with this URL can watch the full conversation AND \
+                             send prompts to this agent until /web-disconnect",
+                        );
+                        self.relay = Some(handle);
+                        self.push_relay_snapshot();
+                    }
+                    Err(e) => self.error_line(format!("web-connect: {e}")),
+                }
+            }
+            WebRelayAction::Status => match &self.relay {
+                Some(active) => self.system_line(active.status_line()),
+                None => self.system_line("web relay is off — start one with /web-connect"),
+            },
+            WebRelayAction::Disconnect => match self.relay.take() {
+                Some(active) => {
+                    active.shutdown();
+                    self.system_line("web relay disconnected; the session URL is now invalid");
+                }
+                None => self.system_line("web relay is not active"),
+            },
+        }
+    }
+
+    /// Queue the current state to the relay, if one is connected. Cheap when off; the
+    /// relay task debounces actual sends.
+    fn push_relay_snapshot(&self) {
+        if let Some(active) = &self.relay {
+            active.push_snapshot(self.web_snapshot());
+        }
+    }
+
+    /// Inject a prompt that arrived over the relay through the same path as local
+    /// input. Remote slash commands are refused — the capability URL grants prompting,
+    /// not REPL control.
+    fn submit_remote_text(&mut self, text: String, turn: &mut TurnState) {
+        let trimmed = text.trim().to_string();
+        if trimmed.is_empty() {
+            return;
+        }
+        if trimmed.starts_with('/') {
+            self.system_line("[web] remote slash command refused");
+            return;
+        }
+        let display = format!("[web] {trimmed}");
+        self.follow = true;
+        if turn.fut.is_some() {
+            self.queue_user_prompt(display, trimmed, Vec::new());
+        } else {
+            self.feed.push_user(display);
+            self.start_user_prompt_turn(trimmed, Vec::new(), turn);
+        }
     }
 
     fn apply_feed_update(&mut self, update: FeedUpdate) {
@@ -858,6 +969,7 @@ impl App {
                     self.start_compaction_turn(custom, turn);
                 }
             }
+            CommandOutcome::WebRelay(action) => self.handle_web_relay(action).await,
             CommandOutcome::LoginSecret {
                 provider,
                 storage_key,
@@ -1670,6 +1782,9 @@ impl App {
                             Ok(false) => println!("nothing to compact"),
                             Err(e) => eprintln!("error: compaction failed: {e}"),
                         }
+                    }
+                    CommandOutcome::WebRelay(_) => {
+                        eprintln!("error: /web-connect requires the interactive TUI or --web mode");
                     }
                     _ => {}
                 }
