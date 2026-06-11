@@ -14,6 +14,7 @@ pub struct SessionEntry {
     pub id: String,
     pub created_at: String,
     pub preview: Option<String>,
+    pub automation: AutomationCounts,
 }
 
 pub async fn open_repo(cwd: &std::path::Path) -> JsonlSessionRepo {
@@ -112,11 +113,13 @@ pub async fn list_entries(repo: &JsonlSessionRepo) -> Result<Vec<SessionEntry>> 
             .unwrap_or("?")
             .to_string();
         let preview = first_user_text(&session).await;
+        let automation = automation_counts(&path).await;
         out.push(SessionEntry {
             path,
             id,
             created_at,
             preview,
+            automation,
         });
     }
     Ok(out)
@@ -227,10 +230,236 @@ pub async fn newest_path(repo: &JsonlSessionRepo) -> Result<Option<PathBuf>> {
     Ok(files.last().cloned())
 }
 
+/// Enabled/total counts of a session's automation sidecars (cron jobs + dynamic trigger
+/// rules). Cron jobs and triggers are session-scoped, so after exiting a session this is
+/// the only record that automation exists at all.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AutomationCounts {
+    pub cron_enabled: usize,
+    pub cron_total: usize,
+    pub trigger_enabled: usize,
+    pub trigger_total: usize,
+}
+
+impl AutomationCounts {
+    pub fn is_empty(&self) -> bool {
+        self.cron_total == 0 && self.trigger_total == 0
+    }
+
+    pub fn any_enabled(&self) -> bool {
+        self.cron_enabled > 0 || self.trigger_enabled > 0
+    }
+
+    /// Short badge for session listings: enabled counts ("2 cron, 1 trigger"), or
+    /// "automation off" when everything present is disabled. `None` when there is nothing.
+    pub fn badge(&self) -> Option<String> {
+        if self.is_empty() {
+            return None;
+        }
+        let mut parts = Vec::new();
+        if self.cron_enabled > 0 {
+            parts.push(format!("{} cron", self.cron_enabled));
+        }
+        if self.trigger_enabled > 0 {
+            parts.push(format!("{} trigger", self.trigger_enabled));
+        }
+        if parts.is_empty() {
+            return Some("automation off".into());
+        }
+        Some(parts.join(", "))
+    }
+}
+
+/// Minimal sidecar shapes for counting: only `enabled` matters here, every other field is
+/// ignored so format growth in the real types can't break listings.
+#[derive(serde::Deserialize)]
+struct EnabledOnly {
+    #[serde(default)]
+    enabled: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct CronSidecarLite {
+    #[serde(default)]
+    jobs: Vec<EnabledOnly>,
+}
+
+#[derive(serde::Deserialize)]
+struct TriggerSidecarLite {
+    #[serde(default)]
+    rules: Vec<EnabledOnly>,
+}
+
+/// Count automation in the sidecars next to `session_path`. Missing or unparsable sidecar
+/// files degrade to zero counts — this feeds listings and hints, never hard errors.
+pub async fn automation_counts(session_path: &std::path::Path) -> AutomationCounts {
+    let mut counts = AutomationCounts::default();
+    if let Ok(text) = tokio::fs::read_to_string(cron_sidecar_path(session_path)).await
+        && let Ok(file) = toml::from_str::<CronSidecarLite>(&text)
+    {
+        counts.cron_total = file.jobs.len();
+        counts.cron_enabled = file.jobs.iter().filter(|j| j.enabled).count();
+    }
+    if let Ok(text) = tokio::fs::read_to_string(trigger_sidecar_path(session_path)).await
+        && let Ok(file) = serde_json::from_str::<TriggerSidecarLite>(&text)
+    {
+        counts.trigger_total = file.rules.len();
+        counts.trigger_enabled = file.rules.iter().filter(|r| r.enabled).count();
+    }
+    counts
+}
+
+/// When other sessions in this repo hold *enabled* automation, return a one-line hint
+/// naming the newest such session so the user can resume it. `current` (the active
+/// session's transcript path) is excluded from the scan.
+pub async fn automation_elsewhere_hint(
+    repo: &JsonlSessionRepo,
+    current: Option<&std::path::Path>,
+) -> Option<String> {
+    let files = repo.list().await.ok()?;
+    let current_stem = current.and_then(|p| p.file_stem()).map(|s| s.to_owned());
+    let mut holders = Vec::new();
+    for path in files {
+        if current_stem.is_some() && path.file_stem().map(|s| s.to_owned()) == current_stem {
+            continue;
+        }
+        let counts = automation_counts(&path).await;
+        if counts.any_enabled() {
+            holders.push((path, counts));
+        }
+    }
+    let extra = holders.len().saturating_sub(1);
+    // repo.list() is ascending by UUIDv7, so the last holder is the newest.
+    let (path, counts) = holders.pop()?;
+    let short_id: String = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default()
+        .chars()
+        .take(16)
+        .collect();
+    let badge = counts.badge().unwrap_or_default();
+    let more = if extra > 0 {
+        format!(" (+{extra} more session(s))")
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "automation is session-scoped: session {short_id} has {badge} enabled{more}; resume it with `pie --resume-id {short_id}`"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn automation_counts_reads_enabled_and_total_from_sidecars() {
+        let dir = tempdir().unwrap();
+        let session_path = dir.path().join("s.jsonl");
+
+        let counts = automation_counts(&session_path).await;
+        assert!(counts.is_empty(), "missing sidecars must count as zero");
+        assert_eq!(counts.badge(), None);
+
+        std::fs::write(
+            trigger_sidecar_path(&session_path),
+            r#"{"version":1,"rules":[{"enabled":true},{"enabled":false}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cron_sidecar_path(&session_path),
+            "[[jobs]]\nenabled = true\n\n[[jobs]]\nenabled = false\n\n[[jobs]]\nenabled = true\n",
+        )
+        .unwrap();
+        let counts = automation_counts(&session_path).await;
+        assert_eq!(counts.cron_total, 3);
+        assert_eq!(counts.cron_enabled, 2);
+        assert_eq!(counts.trigger_total, 2);
+        assert_eq!(counts.trigger_enabled, 1);
+        assert!(counts.any_enabled());
+        assert_eq!(counts.badge().as_deref(), Some("2 cron, 1 trigger"));
+
+        // Corrupt sidecars degrade to zeros: listings/hints must never hard-fail on them.
+        std::fs::write(cron_sidecar_path(&session_path), "not toml [").unwrap();
+        std::fs::write(trigger_sidecar_path(&session_path), "{oops").unwrap();
+        let counts = automation_counts(&session_path).await;
+        assert!(counts.is_empty());
+    }
+
+    #[test]
+    fn automation_badge_renders_each_shape() {
+        let only_cron = AutomationCounts {
+            cron_enabled: 2,
+            cron_total: 2,
+            ..Default::default()
+        };
+        assert_eq!(only_cron.badge().as_deref(), Some("2 cron"));
+        let only_trigger = AutomationCounts {
+            trigger_enabled: 1,
+            trigger_total: 3,
+            ..Default::default()
+        };
+        assert_eq!(only_trigger.badge().as_deref(), Some("1 trigger"));
+        let all_disabled = AutomationCounts {
+            cron_total: 2,
+            trigger_total: 1,
+            ..Default::default()
+        };
+        assert_eq!(all_disabled.badge().as_deref(), Some("automation off"));
+    }
+
+    #[tokio::test]
+    async fn automation_elsewhere_hint_names_newest_session_with_enabled_automation() {
+        let dir = tempdir().unwrap();
+        let repo = JsonlSessionRepo::new(dir.path());
+        let older = repo.create("/cwd").await.unwrap();
+        let older_meta = older.storage().get_metadata_json().await.unwrap();
+        let older_path = PathBuf::from(older_meta["path"].as_str().unwrap());
+        let older_id = older_meta["id"].as_str().unwrap().to_string();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let newer = repo.create("/cwd").await.unwrap();
+        let newer_path = PathBuf::from(
+            newer.storage().get_metadata_json().await.unwrap()["path"]
+                .as_str()
+                .unwrap(),
+        );
+
+        assert!(
+            automation_elsewhere_hint(&repo, Some(&newer_path))
+                .await
+                .is_none(),
+            "no automation anywhere must produce no hint"
+        );
+
+        std::fs::write(cron_sidecar_path(&older_path), "[[jobs]]\nenabled = true\n").unwrap();
+        let hint = automation_elsewhere_hint(&repo, Some(&newer_path))
+            .await
+            .expect("enabled automation in the older session must be surfaced");
+        let short: String = older_id.chars().take(16).collect();
+        assert!(hint.contains(&short), "{hint}");
+        assert!(hint.contains("--resume-id"), "{hint}");
+
+        assert!(
+            automation_elsewhere_hint(&repo, Some(&older_path))
+                .await
+                .is_none(),
+            "the session holding the automation must not hint at itself"
+        );
+
+        // Disabled-only automation will not fire, so it is not worth a hint.
+        std::fs::write(
+            cron_sidecar_path(&older_path),
+            "[[jobs]]\nenabled = false\n",
+        )
+        .unwrap();
+        assert!(
+            automation_elsewhere_hint(&repo, Some(&newer_path))
+                .await
+                .is_none()
+        );
+    }
 
     #[tokio::test]
     async fn resume_matches_legacy_metadata_id_when_file_stem_differs() {

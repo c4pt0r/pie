@@ -2114,6 +2114,11 @@ impl SlashCommand for TriggersCommand {
                 for line in render_dynamic_trigger_rules(&rules, usize::MAX) {
                     cprintln!("{line}");
                 }
+                if rules.is_empty()
+                    && let Some(hint) = automation_elsewhere_hint_for_ctx(ctx).await
+                {
+                    cprintln!("{hint}");
+                }
                 CommandOutcome::Handled
             }
             "remove" | "rm" | "delete" => {
@@ -2257,8 +2262,14 @@ impl SlashCommand for CronCommand {
         let subcommand = argv.first().map(String::as_str).unwrap_or("list");
         match subcommand {
             "list" | "ls" | "status" => {
-                for line in render_cron_jobs(&crate::triggers::global_cron_registry().list()) {
+                let jobs = crate::triggers::global_cron_registry().list();
+                for line in render_cron_jobs(&jobs) {
                     cprintln!("{line}");
+                }
+                if jobs.is_empty()
+                    && let Some(hint) = automation_elsewhere_hint_for_ctx(ctx).await
+                {
+                    cprintln!("{hint}");
                 }
                 CommandOutcome::Handled
             }
@@ -2362,6 +2373,25 @@ async fn write_cron_control_plane_audit(
             "cron_control_plane audit write failed; slash cron change itself succeeded"
         );
     }
+}
+
+/// Hint at enabled automation living in sibling sessions of this cwd. Used by the empty
+/// states of `/cron list` and `/triggers rules`, where "none" otherwise reads as data loss
+/// when the user's jobs simply live in another session.
+async fn automation_elsewhere_hint_for_ctx(ctx: &CommandCtx<'_>) -> Option<String> {
+    let metadata = ctx
+        .harness
+        .session()
+        .storage()
+        .get_metadata_json()
+        .await
+        .ok()?;
+    let current = metadata
+        .get("path")
+        .and_then(|v| v.as_str())
+        .map(std::path::PathBuf::from);
+    let repo = crate::session::open_repo(ctx.cwd).await;
+    crate::session::automation_elsewhere_hint(&repo, current.as_deref()).await
 }
 
 pub(crate) fn render_cron_jobs(jobs: &[crate::triggers::cron::CronJob]) -> Vec<String> {

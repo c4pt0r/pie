@@ -212,10 +212,14 @@ impl CronRegistry {
             job.last_error = None;
             due.push((job.clone(), due_at));
         }
-        if let Some(path) = &state.storage_path {
-            let _ = write_jobs_file(path, &next);
+        // Ticks run every TICK_SECS for every session; only persist real state changes so
+        // idle sessions don't accrete empty/rewritten sidecar files.
+        if next != state.jobs {
+            if let Some(path) = &state.storage_path {
+                let _ = write_jobs_file(path, &next);
+            }
+            state.jobs = next;
         }
-        state.jobs = next;
         due
     }
 
@@ -1198,6 +1202,31 @@ mod tests {
         assert_eq!(jobs[0].schedule, "*/10 * * * *");
         assert_eq!(jobs[0].action, "say hello");
         assert!(!jobs[0].enabled);
+    }
+
+    #[test]
+    fn due_jobs_tick_writes_sidecar_only_when_state_changed() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cron.toml");
+        let registry = CronRegistry::new();
+        registry.load_from_path(&path).unwrap();
+        let since = Utc.with_ymd_and_hms(2026, 5, 26, 22, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 5, 26, 22, 1, 5).unwrap();
+
+        // Empty registry: an idle tick must not create the sidecar.
+        assert!(registry.due_jobs(since, now).is_empty());
+        assert!(!path.exists(), "idle tick created an empty sidecar");
+
+        // Job exists but is not due: tick must not rewrite the file.
+        registry.add_job("0 0 1 1 *", "yearly job").unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(registry.due_jobs(since, now).is_empty());
+        assert!(!path.exists(), "no-op tick rewrote the sidecar");
+
+        // A due job is a real state change and must persist.
+        registry.add_job("* * * * *", "every minute").unwrap();
+        assert_eq!(registry.due_jobs(since, now).len(), 1);
+        assert!(path.exists(), "firing tick must persist job state");
     }
 
     #[test]

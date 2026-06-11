@@ -396,10 +396,16 @@ async fn list_sessions_cmd(repo: &JsonlSessionRepo) -> Result<()> {
     println!("sessions in {}:", repo.root().display());
     for e in entries {
         let preview = e.preview.as_deref().unwrap_or("");
+        let badge = e
+            .automation
+            .badge()
+            .map(|b| format!("  [{b}]"))
+            .unwrap_or_default();
         println!(
-            "  {}  {}  {}",
+            "  {}  {}{}  {}",
             &e.id[..16.min(e.id.len())],
             e.created_at,
+            badge,
             preview
         );
     }
@@ -446,7 +452,15 @@ async fn list_all_sessions_cmd() -> Result<()> {
         let bucket_name = bucket.file_name().and_then(|n| n.to_str()).unwrap_or("?");
         let preview = e.preview.as_deref().unwrap_or("");
         let id_short: String = e.id.chars().take(16).collect();
-        println!("  {bucket_name}/{id_short}  {}  {preview}", e.created_at);
+        let badge = e
+            .automation
+            .badge()
+            .map(|b| format!("  [{b}]"))
+            .unwrap_or_default();
+        println!(
+            "  {bucket_name}/{id_short}  {}{badge}  {preview}",
+            e.created_at
+        );
     }
     Ok(())
 }
@@ -529,11 +543,17 @@ fn render_resume_session_menu(
     for (idx, entry) in entries.iter().enumerate() {
         let preview = entry.preview.as_deref().unwrap_or("");
         let id_short: String = entry.id.chars().take(16).collect();
+        let badge = entry
+            .automation
+            .badge()
+            .map(|b| format!("  [{b}]"))
+            .unwrap_or_default();
         out.push_str(&format!(
-            "  {}. {}  {}  {}\n",
+            "  {}. {}  {}{}  {}\n",
             idx + 1,
             id_short,
             entry.created_at,
+            badge,
             preview
         ));
     }
@@ -954,6 +974,20 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
             cron_registry.list().len(),
             location
         ));
+    }
+    // Cron jobs and trigger rules only run while their own session is open. If this session
+    // has none but a sibling session does, say so once — otherwise exiting that session
+    // silently stops the user's automation with no trace anywhere in the UI.
+    if dynamic_trigger_registry.list().is_empty() && cron_registry.list().is_empty() {
+        let current_session_path = session_metadata
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(std::path::PathBuf::from);
+        if let Some(hint) =
+            session::automation_elsewhere_hint(&repo, current_session_path.as_deref()).await
+        {
+            app.system_line(hint);
+        }
     }
     if !loaded_templates.templates.is_empty() {
         app.system_line(format!(
@@ -1549,12 +1583,19 @@ mod tests {
                 id: "0123456789abcdef-extra".into(),
                 created_at: "2026-06-03T09:00:00Z".into(),
                 preview: Some("fix parser".into()),
+                automation: session::AutomationCounts {
+                    cron_enabled: 2,
+                    cron_total: 2,
+                    trigger_enabled: 1,
+                    trigger_total: 1,
+                },
             },
             session::SessionEntry {
                 path: std::path::PathBuf::from("/tmp/session-b.jsonl"),
                 id: "fedcba9876543210-extra".into(),
                 created_at: "2026-06-03T10:00:00Z".into(),
                 preview: None,
+                automation: session::AutomationCounts::default(),
             },
         ];
         let menu = render_resume_session_menu(std::path::Path::new("/tmp/sessions"), &entries);
@@ -1564,7 +1605,12 @@ mod tests {
         assert!(menu.contains("1. 0123456789abcdef"), "{menu}");
         assert!(menu.contains("2026-06-03T09:00:00Z"), "{menu}");
         assert!(menu.contains("fix parser"), "{menu}");
+        assert!(menu.contains("[2 cron, 1 trigger]"), "{menu}");
         assert!(menu.contains("2. fedcba9876543210"), "{menu}");
+        assert!(
+            !menu.contains("fedcba9876543210-extra  2026-06-03T10:00:00Z  ["),
+            "sessions without automation must not get a badge: {menu}"
+        );
     }
 
     #[tokio::test]

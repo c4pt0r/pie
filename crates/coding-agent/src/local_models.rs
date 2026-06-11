@@ -299,6 +299,9 @@ mod tests {
 
     #[test]
     fn loads_and_registers_custom_model() {
+        // load_all_from_paths registers the ds4 default from DS4_* env vars, so every test
+        // that calls it must hold env_lock or it races the env-guarded ds4 tests.
+        let _lock = env_lock().blocking_lock();
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("models.json");
         std::fs::write(
@@ -328,6 +331,7 @@ mod tests {
 
     #[test]
     fn project_model_overrides_user_model_with_same_provider_and_id() {
+        let _lock = env_lock().blocking_lock();
         let dir = TempDir::new().unwrap();
         let user = dir.path().join("user.json");
         let project = dir.path().join("project.json");
@@ -361,6 +365,7 @@ mod tests {
 
     #[test]
     fn malformed_config_fails_closed_without_registering() {
+        let _lock = env_lock().blocking_lock();
         let dir = TempDir::new().unwrap();
         let bad = dir.path().join("bad.json");
         std::fs::write(&bad, r#"{ "models": [ { "provider": "broken" } ] }"#).unwrap();
@@ -372,6 +377,7 @@ mod tests {
 
     #[tokio::test]
     async fn loaded_openai_responses_model_streams_text_from_local_fixture() {
+        let _lock = env_lock().lock().await;
         let body = r#"data: {"type":"response.created","response":{"id":"resp_test","model":"model","output":[]}}
 
 data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_test","type":"message","status":"in_progress","role":"assistant","content":[]}}
@@ -422,6 +428,7 @@ data: {"type":"response.completed","response":{"id":"resp_test","status":"comple
 
     #[tokio::test]
     async fn loaded_openai_responses_model_streams_tool_call_from_local_fixture() {
+        let _lock = env_lock().lock().await;
         let body = r#"data: {"type":"response.created","response":{"id":"resp_test","model":"model","output":[]}}
 
 data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_test","type":"function_call","call_id":"call_1","name":"get_weather","arguments":""}}
