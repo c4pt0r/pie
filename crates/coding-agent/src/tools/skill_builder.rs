@@ -136,10 +136,22 @@ impl AgentTool for SkillBuilderTool {
         Some(ToolExecutionMode::Sequential)
     }
 
-    /// Persistent control-plane write that grows the model's skill surface — always route
-    /// through the prompt channel. The name is model-supplied, so it only enters the
-    /// bounded reason after passing the same charset shape the validator enforces.
+    /// The preview phase is a pure read (render + validate, no fs writes), so it runs
+    /// under `Allow` — the user-initiated "summarize recent work into a skill" flow costs
+    /// exactly one approval, on the `confirm: true` write. That write is a persistent
+    /// control-plane change growing the model's skill surface, so it always prompts. The
+    /// name is model-supplied and only enters the bounded reason after passing the same
+    /// charset shape the validator enforces. (Unlike InstallSkill — which prompts on
+    /// preview too because it fetches untrusted external content — SkillBuilder's preview
+    /// input is model-authored from the visible conversation.)
     fn permission_classification(&self, prepared_args: &Value) -> PermissionClassification {
+        let confirm = prepared_args
+            .get("confirm")
+            .and_then(|c| c.as_bool())
+            .unwrap_or(false);
+        if !confirm {
+            return PermissionClassification::Allow;
+        }
         let name = prepared_args
             .get("name")
             .and_then(|n| n.as_str())
@@ -329,13 +341,17 @@ static DEFINITION: Lazy<Tool> = Lazy::new(|| Tool {
     description:
         "Create a NEW user skill from structured fields and hot-reload the catalog. Use this \
          when the user asks to create, save, or codify a reusable skill, workflow, checklist, \
-         or convention; use InstallSkill instead when installing an existing SKILL.md from a \
-         URL, file, or pasted content. The tool renders canonical SKILL.md (frontmatter + \
-         sections) from name/description/instructions — do not hand-write frontmatter. \
-         Two-phase: first call without `confirm` validates and returns a preview (target \
-         path, hash, size, shadow warnings). Second call with `confirm: true` writes \
-         atomically to ~/.pie/skills/<name>/SKILL.md and reloads. A same-name skill with \
-         different content additionally requires `overwrite: true`."
+         or convention — including \"summarize the recent work / this conversation into a \
+         skill\": distill the generalizable workflow from the conversation (steps actually \
+         performed, commands used, pitfalls hit) and write instructions for the general case, \
+         not a transcript of this one instance. Use InstallSkill instead when installing an \
+         existing SKILL.md from a URL, file, or pasted content. The tool renders canonical \
+         SKILL.md (frontmatter + sections) from name/description/instructions — do not \
+         hand-write frontmatter. Two-phase: first call without `confirm` validates and \
+         returns a preview (target path, hash, size, shadow warnings); show the user the \
+         planned name/description and get their go-ahead, then call again with `confirm: \
+         true` to write atomically to ~/.pie/skills/<name>/SKILL.md and reload. A same-name \
+         skill with different content additionally requires `overwrite: true`."
             .into(),
     parameters: json!({
         "type": "object",
@@ -506,6 +522,37 @@ mod tests {
             "tricky: contains #yaml \"specials\" and a second line"
         );
         assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+    }
+
+    /// Preview is a pure read — it must not consume a user confirmation. Only the
+    /// `confirm: true` write phase routes through the control-plane prompt, so the
+    /// "summarize recent work into a skill" flow costs the user exactly one approval.
+    #[test]
+    fn preview_is_allowed_and_only_confirm_prompts() {
+        let cell: SkillHarnessCell = Arc::new(SyncOnceCell::new());
+        let tool = SkillBuilderTool::with_skills_root(cell, PathBuf::from("/tmp"));
+
+        let preview = tool.permission_classification(&build_args("alpha", false));
+        assert!(
+            matches!(preview, PermissionClassification::Allow),
+            "preview must not prompt: {preview:?}"
+        );
+
+        let confirm = tool.permission_classification(&build_args("alpha", true));
+        match confirm {
+            PermissionClassification::Prompt { reason } => {
+                assert!(reason.contains("alpha"), "{reason}");
+            }
+            other => panic!("confirm must prompt, got {other:?}"),
+        }
+
+        let bad_name = tool.permission_classification(&build_args("../etc", true));
+        match bad_name {
+            PermissionClassification::Prompt { reason } => {
+                assert!(reason.contains("<invalid name>"), "{reason}");
+            }
+            other => panic!("confirm must prompt, got {other:?}"),
+        }
     }
 
     #[tokio::test]

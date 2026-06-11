@@ -1249,7 +1249,7 @@ When the user asks to create a trigger, reminder, watcher, or automation, call N
 When the user asks to view, list, show, inspect, or find trigger ids, call ListTriggers. \
 When the user asks to pause, disable, enable, or resume a dynamic trigger, call SetTriggerState. \
 When the user asks to delete, remove, or clear dynamic triggers, call RemoveTrigger. \
-When the user asks to create, save, or codify a reusable skill, workflow, checklist, or convention (技能, 保存为技能), call SkillBuilder with structured name/description/instructions — first without confirm to preview, then with confirm=true after the user agrees. Use InstallSkill only for installing an existing SKILL.md from a URL, file, or pasted content."
+When the user asks to create, save, or codify a reusable skill, workflow, checklist, or convention, or to summarize recent work or this conversation into a skill (技能, 保存为技能, 把刚才的工作总结成 skill), call SkillBuilder with structured name/description/instructions. For summarize-into-skill requests, distill the generalizable steps from the conversation — what was actually done, the commands used, the pitfalls — not a transcript. Call once without confirm to preview and show the user the planned name and description, then call with confirm=true after they agree. Use InstallSkill only for installing an existing SKILL.md from a URL, file, or pasted content."
     )
 }
 
