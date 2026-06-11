@@ -30,6 +30,10 @@ pub enum Level {
     Note,
     /// Banner heading.
     Header,
+    /// Terminal-only block art (the /web-connect QR code). The TUI renders it; web
+    /// surfaces skip it — a browser viewer has already opened the page, and browser
+    /// line-height breaks the half-block grid anyway.
+    Qr,
 }
 
 /// A message sent from the agent/harness listeners (or the console sink) into the UI loop,
@@ -570,6 +574,7 @@ fn style_for_level(level: Level) -> Style {
         Level::Header => Style::default()
             .fg(Color::Magenta)
             .add_modifier(Modifier::BOLD),
+        Level::Qr => Style::default(),
     }
 }
 

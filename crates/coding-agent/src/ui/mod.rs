@@ -470,9 +470,9 @@ impl App {
                         if self.relay_qr_in_feed {
                             match relay::qr_lines(&handle.url) {
                                 Ok(lines) => {
-                                    self.feed.push_plain_untimed("", Level::Output);
+                                    self.feed.push_plain_untimed("", Level::Qr);
                                     for line in lines {
-                                        self.feed.push_plain_untimed(line, Level::Output);
+                                        self.feed.push_plain_untimed(line, Level::Qr);
                                     }
                                     self.feed.push_plain_untimed(
                                         "scan with your phone to open the session",

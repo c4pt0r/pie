@@ -1504,6 +1504,7 @@ function renderFeedBlocks(blocks) {
     if (block.kind === 'assistant') {
       nodes.push(renderMarkdownBlock(block, 'feed-assistant', ''));
     } else if (block.kind === 'plain') {
+      if (block.level === 'qr') continue; // terminal-only QR art; the browser is already here
       nodes.push(node('article', { class: 'feed-block feed-plain level_' + block.level, title: block.timestamp || '' }, [
         feedHead(block, '', block.text || ''),
         node('div', { class: 'feed-body', text: block.text || '' })
