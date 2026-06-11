@@ -15,6 +15,7 @@ pub mod read;
 pub mod remove_skill;
 pub mod set_skill_state;
 pub mod skill;
+pub mod skill_builder;
 pub mod task;
 pub mod truncate;
 pub mod web_fetch;
@@ -89,6 +90,15 @@ pub fn skill_tool(harness_cell: skill::SkillHarnessCell) -> Arc<dyn AgentTool> {
 /// `PermissionCategory::ControlPlaneWrite` plumbing.
 pub fn install_skill_tool(harness_cell: skill::SkillHarnessCell) -> Arc<dyn AgentTool> {
     Arc::new(install_skill::InstallSkillTool::new(harness_cell))
+}
+
+/// Build the `SkillBuilder` tool (author a NEW user skill from structured fields). Same
+/// harness-cell wiring as `install_skill_tool` — it shares InstallSkill's validation and
+/// atomic-write path and hot-reloads the catalog after writing. Where InstallSkill ingests
+/// an existing `SKILL.md`, SkillBuilder renders the canonical template itself. See
+/// `skill_builder::SkillBuilderTool` for the two-phase preview → confirm model.
+pub fn skill_builder_tool(harness_cell: skill::SkillHarnessCell) -> Arc<dyn AgentTool> {
+    Arc::new(skill_builder::SkillBuilderTool::new(harness_cell))
 }
 
 /// Build the `SetSkillState` tool (enable/disable a loaded skill at runtime). Same

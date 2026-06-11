@@ -50,6 +50,8 @@ Every sub-issue below MUST address the same five axes in its design write-up bef
 
 - [ ] **#17 — AgentHarness expansion: first-class skills, templates, hooks, branch summarization** (priority)
 - [ ] **#10 — Skills loader (first-class) + extension/plugin system** (priority — Part A first)
+- [x] **#21 — `SkillBuilder` builtin tool: author user skills from structured fields**. See
+  [[21-skill-builder-tool]].
 - [ ] #9 — MCP (Model Context Protocol) client
 - [ ] #11 — Subagent / Task delegation
 - [ ] #12 — Built-in capability tools: web fetch, web search, git, compile-error feedback loop

@@ -110,7 +110,7 @@ impl InstallSkillTool {
 /// Production skills root: `${PIE_DIR:-$HOME/.pie}/skills`. Inlined so this module can be
 /// included by integration tests that pull `tools/mod.rs` via `#[path = ...]` and don't have
 /// access to `crate::config`.
-fn default_skills_root() -> PathBuf {
+pub(crate) fn default_skills_root() -> PathBuf {
     if let Ok(p) = std::env::var("PIE_DIR") {
         return PathBuf::from(p).join("skills");
     }
@@ -529,19 +529,28 @@ fn is_private_or_local_host(host: &str) -> bool {
 // Parse + validate
 // ──────────────────────────────────────────────────────────────────────────────────────────
 
-struct ParsedSkill {
-    name: String,
-    description: String,
-    normalized_content: String,
-    content_hash: String,
-    size: usize,
-    warnings: Vec<String>,
+pub(crate) struct ParsedSkill {
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) normalized_content: String,
+    pub(crate) content_hash: String,
+    pub(crate) size: usize,
+    pub(crate) warnings: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct Frontmatter {
     name: Option<String>,
     description: Option<String>,
+}
+
+/// Validate complete `SKILL.md` text (frontmatter + body) and normalize it. Shared with
+/// `SkillBuilder`, which renders its own content and runs it through here so authored and
+/// installed skills obey identical rules.
+pub(crate) fn parse_and_validate_skill_md(content: &str) -> Result<ParsedSkill, AgentToolError> {
+    parse_and_validate(&Fetched {
+        content: content.to_string(),
+    })
 }
 
 fn parse_and_validate(fetched: &Fetched) -> Result<ParsedSkill, AgentToolError> {
@@ -681,7 +690,7 @@ fn validate_name(name: &str) -> Result<(), AgentToolError> {
 /// normalization the new-content hash uses, so an idempotent re-install (same bytes already
 /// on disk) does not require `overwrite: true`. Returns `None` if the file doesn't exist or
 /// can't be read.
-async fn on_disk_skill_hash(target_path: &Path) -> Option<String> {
+pub(crate) async fn on_disk_skill_hash(target_path: &Path) -> Option<String> {
     let bytes = tokio::fs::read(target_path).await.ok()?;
     let s = String::from_utf8(bytes).ok()?;
     let normalized = s.replace("\r\n", "\n").replace('\r', "\n");
@@ -690,7 +699,7 @@ async fn on_disk_skill_hash(target_path: &Path) -> Option<String> {
     Some(hex::encode(hasher.finalize()))
 }
 
-async fn atomic_write_skill(target: &Path, content: &str) -> Result<(), AgentToolError> {
+pub(crate) async fn atomic_write_skill(target: &Path, content: &str) -> Result<(), AgentToolError> {
     let parent = target
         .parent()
         .ok_or_else(|| AgentToolError::from("target path has no parent directory"))?;

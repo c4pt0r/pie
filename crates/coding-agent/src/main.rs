@@ -667,6 +667,10 @@ async fn run_repl(mut cli: Cli, cwd: std::path::PathBuf, repo: JsonlSessionRepo)
     // catalog. Two-phase preview→confirm safety inside the tool; see
     // `crates/coding-agent/src/tools/install_skill.rs` for the security model.
     tools.push(tools::install_skill_tool(skill_harness_cell.clone()));
+    // SkillBuilder tool (issue #21). Authors a NEW user skill from structured fields —
+    // renders the canonical SKILL.md itself, then shares InstallSkill's validation,
+    // atomic-write, and hot-reload path via the same harness cell.
+    tools.push(tools::skill_builder_tool(skill_harness_cell.clone()));
     // SetSkillState tool (task #23, S-A2). Enable/disable a loaded skill at runtime via the
     // `~/.pie/skills-state.json` overlay; shares the same harness cell so it can reload the
     // catalog after writing.
@@ -1244,7 +1248,8 @@ When the user asks to delete, remove, or clear scheduled jobs or cron jobs, call
 When the user asks to create a trigger, reminder, watcher, or automation, call NewTrigger and extract a natural-language condition and action from their request. Dynamic triggers fire once by default; set fire_once=false only when the user explicitly asks for a repeating trigger. Trigger output is shown in the TUI and audit by default; set promote_to_chat=true only when the user explicitly asks for trigger results to enter the main chat context or be visible to future turns. \
 When the user asks to view, list, show, inspect, or find trigger ids, call ListTriggers. \
 When the user asks to pause, disable, enable, or resume a dynamic trigger, call SetTriggerState. \
-When the user asks to delete, remove, or clear dynamic triggers, call RemoveTrigger."
+When the user asks to delete, remove, or clear dynamic triggers, call RemoveTrigger. \
+When the user asks to create, save, or codify a reusable skill, workflow, checklist, or convention (技能, 保存为技能), call SkillBuilder with structured name/description/instructions — first without confirm to preview, then with confirm=true after the user agrees. Use InstallSkill only for installing an existing SKILL.md from a URL, file, or pasted content."
     )
 }
 
