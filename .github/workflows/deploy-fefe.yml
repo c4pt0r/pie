@@ -131,6 +131,13 @@ jobs:
             npm install
           fi
 
+      - name: embed shared viewer HTML
+        # The relay serves the same viewer page as the local web UI
+        # (crates/coding-agent/src/ui/web_index.html). The generated TS module is
+        # gitignored, so produce it here before wrangler bundles the worker.
+        working-directory: ${{ steps.validate.outputs.worker_dir }}
+        run: node scripts/embed-html.mjs
+
       - name: apply D1 migrations
         working-directory: ${{ steps.validate.outputs.worker_dir }}
         # `CF_API_KEY` is exposed only to protected deploy-lane Cloudflare
