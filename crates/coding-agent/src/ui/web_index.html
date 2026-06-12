@@ -915,15 +915,35 @@ function applySidebarHidden(hidden, persist) {
   }
 }
 
-let savedSidebar = null;
-try { savedSidebar = localStorage.getItem(SIDEBAR_KEY); } catch (_) {}
-if (savedSidebar !== 'hidden' && savedSidebar !== 'visible') {
-  // No explicit preference: phones get the conversation, not the panels.
-  savedSidebar = window.matchMedia('(max-width: 860px)').matches ? 'hidden' : 'visible';
+const compactLayout = window.matchMedia('(max-width: 860px)');
+
+// Compact layouts always start hidden — the drawer overlays the conversation,
+// so a persisted "visible" must never pin it open on a phone. The stored
+// preference only applies to the wide two-column layout.
+function defaultSidebarHidden() {
+  if (compactLayout.matches) return true;
+  let saved = null;
+  try { saved = localStorage.getItem(SIDEBAR_KEY); } catch (_) {}
+  return saved === 'hidden';
 }
-applySidebarHidden(savedSidebar === 'hidden', false);
+
+applySidebarHidden(defaultSidebarHidden(), false);
 sidebarToggle.addEventListener('click', () => {
-  applySidebarHidden(!currentSidebarHidden(), true);
+  // The drawer is transient on compact layouts: don't persist taps there.
+  applySidebarHidden(!currentSidebarHidden(), !compactLayout.matches);
+});
+compactLayout.addEventListener('change', (event) => {
+  if (event.matches) {
+    applySidebarHidden(true, false);
+  } else {
+    applySidebarHidden(defaultSidebarHidden(), false);
+  }
+});
+document.addEventListener('click', (event) => {
+  if (!compactLayout.matches || currentSidebarHidden()) return;
+  const target = event.target instanceof Element ? event.target : null;
+  if (target && (target.closest('aside') || sidebarToggle.contains(target))) return;
+  applySidebarHidden(true, false);
 });
 
 function node(tag, attrs = {}, children = []) {
