@@ -9,6 +9,10 @@ Pie runs inside your local project directory, can inspect/edit files, run shell 
 
 The goal is not just to build another chat UI for coding, but a local agent runtime for developer workflows: slash commands, session history, skills, MCP tools, cron/triggers, and local automation.
 
+**Highlight: [Loops — stateful cron jobs + a triage inbox](docs/loops.md).** Give a
+recurring job a memory across runs and route its findings into an inbox you triage like
+email — agent loops that prompt *you*, instead of the other way around.
+
 ## Install / build
 
 ```bash
@@ -150,9 +154,10 @@ Inside `pie`, slash commands control the session:
 | `/triggers enable <id>` / `/triggers disable <id>` | Resume or pause a trigger |
 | `/triggers remove <id>` | Delete a trigger |
 | `/cron` | List local scheduled jobs |
-| `/cron add "<minute hour dom month dow>" <prompt>` | Run a prompt on a local schedule |
+| `/cron add [--stateful] "<minute hour dom month dow>" <prompt>` | Run a prompt on a local schedule; `--stateful` makes it a loop with memory, see [docs/loops.md](docs/loops.md) |
 | `/cron enable <id>` / `/cron disable <id>` | Resume or pause a scheduled job |
 | `/cron remove <id>` | Delete a scheduled job |
+| `/inbox [all\|claim <n>\|dismiss <n>\|clear]` | Triage findings reported by stateful loops |
 | `/quit` | Exit |
 
 CLI helpers:
@@ -179,6 +184,8 @@ The agent has tools for common coding workflows:
 - create session-scoped natural-language triggers that run actions when local checks or MCP
   push events match
 - create session-scoped cron jobs that run prompts on a local schedule
+- run stateful loops: recurring jobs that keep notes between runs and report findings to a
+  triage inbox; see [docs/loops.md](docs/loops.md)
 - receive server-pushed MCP notifications and normalize them into the same trigger runtime
 - run local command hooks or HTTP webhooks on agent lifecycle events; see [docs/hooks.md](docs/hooks.md)
 
@@ -257,6 +264,20 @@ UI output use bounded, redacted previews.
 user-global `~/.pie/cron.toml`; a global cron install must be an explicit separate user
 action rather than the default behavior.
 
+### Loops: stateful jobs + inbox
+
+Add `--stateful` to turn a cron job into a loop: the job runs in a background sub-agent,
+keeps its own notes between runs (so "what changed since last time?" works), and reports
+findings to a triage inbox instead of interrupting your chat:
+
+```text
+/cron add --stateful "0 9 * * *" check the repo issues and report anything new since the last run
+/inbox            # triage findings
+/inbox claim 1    # promote a finding into a real agent turn
+```
+
+See [docs/loops.md](docs/loops.md) for the full guide and design rationale.
+
 ## Files and storage
 
 By default, `pie` stores local state under `~/.pie`:
@@ -272,6 +293,8 @@ By default, `pie` stores local state under `~/.pie`:
 | `~/.pie/hooks.toml` | Optional command/webhook hooks |
 | `~/.pie/sessions/<cwd-hash>/<uuidv7>.triggers.json` | Session-scoped dynamic trigger rules |
 | `~/.pie/sessions/<cwd-hash>/<uuidv7>.cron.toml` | Session-scoped cron jobs |
+| `~/.pie/sessions/<cwd-hash>/<uuidv7>.loop-<job-id>.md` | Loop state kept by a stateful cron job |
+| `~/.pie/inbox.jsonl` | Global triage inbox written by stateful loops |
 | `~/.pie/config.toml` | Optional user config, including trigger poll interval |
 
 Set `PIE_DIR` to use a different base directory.
