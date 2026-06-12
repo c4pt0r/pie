@@ -13,6 +13,11 @@ The goal is not just to build another chat UI for coding, but a local agent runt
 recurring job a memory across runs and route its findings into an inbox you triage like
 email — agent loops that prompt *you*, instead of the other way around.
 
+**Highlight: [pie + DS4 — KV prefix-cache optimizations for local models](docs/ds4.md).**
+pie keeps its request stream byte-exact for DS4's prefix cache (reasoning replay,
+transparent 409 recovery, honest cache accounting), so long local-model sessions prefill
+only what's new instead of the whole conversation every turn.
+
 ## Install / build
 
 ```bash
@@ -107,6 +112,10 @@ local model credentials separate from real `OPENAI_API_KEY` credentials.
 `deepseek-v4-flash` descriptor without a `models.json` file. CLI `--base-url`
 wins for the current run. Keep `models.json` when you need different limits,
 compatibility flags, or a project-local override.
+
+pie's client stream is tuned for DS4's byte-exact KV prefix cache — see
+[docs/ds4.md](docs/ds4.md) for the cache-reuse optimizations and how to verify them
+with `/cost`.
 
 ## Quick start
 
