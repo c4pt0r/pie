@@ -487,6 +487,15 @@ impl App {
                     "web login is not implemented yet; run `{command}` from the terminal UI"
                 ));
             }
+            CommandOutcome::OpenModelPicker => {
+                let active = match self.kernel.harness().agent().state().model.clone() {
+                    Some(m) => format!("active model: {}:{}", m.provider.0, m.id),
+                    None => "(no model active)".into(),
+                };
+                self.system_line(format!(
+                    "{active} — click the model name in the header to switch"
+                ));
+            }
             CommandOutcome::Handled => {}
         }
         if input.trim_start().starts_with("/goal") {

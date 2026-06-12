@@ -1108,6 +1108,7 @@ impl App {
                 self.login(&provider, storage_key.as_deref(), terminal)
                     .await;
             }
+            CommandOutcome::OpenModelPicker => {}
             CommandOutcome::Handled => {}
         }
         if input.trim_start().starts_with("/goal") {
@@ -1919,6 +1920,15 @@ impl App {
                     CommandOutcome::SessionImportActivation { .. } => {
                         println!(
                             "imported automation left disabled (no interactive confirm in this mode); re-import with `pie session import --activate-triggers=on` or enable via /triggers enable and /cron enable"
+                        );
+                    }
+                    CommandOutcome::OpenModelPicker => {
+                        match self.kernel.harness().agent().state().model.clone() {
+                            Some(m) => println!("active model: {}:{}", m.provider.0, m.id),
+                            None => println!("(no model active)"),
+                        }
+                        println!(
+                            "interactive picker needs the TUI; use /model <provider:model-id> or /model list"
                         );
                     }
                     _ => {}
