@@ -16,16 +16,12 @@ const SUPPORTED_APIS: [&str; 4] = [
     "anthropic-messages",
 ];
 
-// TODO(model-picker): consumed from Task 4 on
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct ModelEntry {
     pub id: String,
     pub name: String,
 }
 
-// TODO(model-picker): consumed from Task 4 on
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct ProviderGroup {
     pub provider: String,
@@ -34,8 +30,6 @@ pub(crate) struct ProviderGroup {
 }
 
 /// Filtered + grouped catalog with live credential detection.
-// TODO(model-picker): consumed from Task 4 on
-#[allow(dead_code)]
 pub(crate) fn catalog() -> Vec<ProviderGroup> {
     catalog_with(|provider| crate::commands::model_credential_hint(provider).is_none())
 }
@@ -75,8 +69,6 @@ pub(crate) enum PickerLevel {
 }
 
 /// Pure two-level navigation state. Rendering and IO live in `ui/`.
-// TODO(model-picker): consumed from Task 4 on
-#[allow(dead_code)]
 pub(crate) struct ModelPickerState {
     pub groups: Vec<ProviderGroup>,
     pub level: PickerLevel,
@@ -85,7 +77,6 @@ pub(crate) struct ModelPickerState {
     pub active: Option<(String, String)>,
 }
 
-#[allow(dead_code)]
 impl ModelPickerState {
     pub fn new(groups: Vec<ProviderGroup>, active: Option<(String, String)>) -> Self {
         Self {
