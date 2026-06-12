@@ -29,6 +29,7 @@ mod markdown;
 mod mcp_loader;
 mod mentions;
 mod model;
+mod model_picker;
 mod oauth;
 mod otlp;
 mod readline;

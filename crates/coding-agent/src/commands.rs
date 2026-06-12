@@ -925,7 +925,7 @@ impl SlashCommand for ModelCommand {
     }
 }
 
-fn parse_model_spec(spec: &str) -> Option<(&str, &str)> {
+pub(crate) fn parse_model_spec(spec: &str) -> Option<(&str, &str)> {
     let spec = spec.trim();
     let (provider, id) = spec
         .split_once(':')
@@ -939,7 +939,7 @@ fn parse_model_spec(spec: &str) -> Option<(&str, &str)> {
     Some((provider, id))
 }
 
-fn model_credential_hint(provider: &str) -> Option<String> {
+pub(crate) fn model_credential_hint(provider: &str) -> Option<String> {
     let vars = pie_ai::env_api_keys::env_var_names(provider);
     let has_env = vars.iter().any(|var| {
         std::env::var(var)
