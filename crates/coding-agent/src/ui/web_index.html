@@ -1561,7 +1561,11 @@ function render(snapshot) {
   const pinnedToBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight <= 64;
   feed.replaceChildren(...(renderFeedBlocks(snapshot.feed_blocks) || renderFeedLines(snapshot.feed_lines)));
   if (pinnedToBottom) {
-    feed.scrollTop = feed.scrollHeight;
+    // Snap instantly. The feed sets `scroll-behavior: smooth` for keyboard/anchor
+    // nav, but during streaming each snapshot fires this jump faster than a smooth
+    // animation can finish, producing a perpetual slow crawl that never catches the
+    // bottom. `behavior: 'instant'` overrides the CSS for the auto-follow only.
+    feed.scrollTo({ top: feed.scrollHeight, behavior: 'instant' });
   }
   renderSidebar(snapshot);
   renderApproval(snapshot);
