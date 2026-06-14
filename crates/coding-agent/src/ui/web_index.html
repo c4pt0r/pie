@@ -1553,8 +1553,16 @@ function render(snapshot) {
     poll.textContent = '';
     poll.className = '';
   }
+  // Only auto-follow to the newest content when the user is already pinned to
+  // (or near) the bottom. Otherwise preserve their scroll position so they can
+  // read back through history without each incoming snapshot yanking them down.
+  // Measured before replaceChildren, since replacing content changes geometry.
+  // Self-healing: scrolling back to the bottom re-enters the pinned state.
+  const pinnedToBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight <= 64;
   feed.replaceChildren(...(renderFeedBlocks(snapshot.feed_blocks) || renderFeedLines(snapshot.feed_lines)));
-  feed.scrollTop = feed.scrollHeight;
+  if (pinnedToBottom) {
+    feed.scrollTop = feed.scrollHeight;
+  }
   renderSidebar(snapshot);
   renderApproval(snapshot);
 }
