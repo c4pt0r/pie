@@ -60,6 +60,11 @@ pub(crate) enum WorkerFrame {
     Viewers {
         count: u64,
     },
+    /// Remote model switch from the shared web UI — first-class like
+    /// `ControlPlaneResolve`; the capability URL grants it.
+    SetModel {
+        model: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -167,6 +172,7 @@ pub fn start(
     prompt_tx: mpsc::UnboundedSender<String>,
     abort_tx: mpsc::UnboundedSender<()>,
     resolve_tx: mpsc::UnboundedSender<bool>,
+    model_tx: mpsc::UnboundedSender<String>,
 ) -> Result<RelayHandle> {
     let view_token = new_token();
     let agent_key = new_token();
@@ -188,6 +194,7 @@ pub fn start(
         prompt_tx,
         abort_tx,
         resolve_tx,
+        model_tx,
         cancel.clone(),
         shared.clone(),
     ));
@@ -208,6 +215,7 @@ async fn relay_task(
     prompt_tx: mpsc::UnboundedSender<String>,
     abort_tx: mpsc::UnboundedSender<()>,
     resolve_tx: mpsc::UnboundedSender<bool>,
+    model_tx: mpsc::UnboundedSender<String>,
     cancel: CancellationToken,
     shared: Arc<Mutex<RelayShared>>,
 ) {
@@ -299,6 +307,9 @@ async fn relay_task(
                                 }
                                 Ok(WorkerFrame::Viewers { count }) => {
                                     shared.lock().viewers = count;
+                                }
+                                Ok(WorkerFrame::SetModel { model }) => {
+                                    let _ = model_tx.send(model);
                                 }
                                 Err(err) => {
                                     tracing::debug!(error = %err, "unrecognized relay frame");
@@ -411,5 +422,14 @@ mod tests {
         let resolve: WorkerFrame =
             serde_json::from_str(r#"{"type":"control_plane_resolve","approve":true}"#).unwrap();
         assert_eq!(resolve, WorkerFrame::ControlPlaneResolve { approve: true });
+        let set_model: WorkerFrame =
+            serde_json::from_str(r#"{"type":"set_model","model":"anthropic:claude-haiku-4-5"}"#)
+                .unwrap();
+        assert_eq!(
+            set_model,
+            WorkerFrame::SetModel {
+                model: "anthropic:claude-haiku-4-5".into()
+            }
+        );
     }
 }

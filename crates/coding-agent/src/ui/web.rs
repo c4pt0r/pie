@@ -253,6 +253,10 @@ impl App {
             .relay_resolve_rx
             .take()
             .expect("relay_resolve_rx taken once");
+        let mut relay_model_rx = self
+            .relay_model_rx
+            .take()
+            .expect("relay_model_rx taken once");
         let mut turn = TurnState::default();
         self.refresh_goal_state().await;
         self.publish_snapshot(&latest, &snapshot_tx).await;
@@ -292,6 +296,11 @@ impl App {
                 }
                 Some(approve) = relay_resolve_rx.recv() => {
                     self.resolve_from_relay(approve);
+                    self.publish_snapshot(&latest, &snapshot_tx).await;
+                }
+                Some(spec) = relay_model_rx.recv() => {
+                    self.system_line(format!("[web] set model: {spec}"));
+                    self.set_model_from_spec(&spec).await;
                     self.publish_snapshot(&latest, &snapshot_tx).await;
                 }
                 Some(prompt) = async {

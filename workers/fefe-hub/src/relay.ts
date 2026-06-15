@@ -89,6 +89,15 @@ export class RelayCore {
   }
 }
 
+/** Validate a model spec string from a `set_model` request body. Returns the trimmed spec
+ * or `null` if the value is not a non-empty string within the length limit. */
+export function validateSetModel(model: unknown): string | null {
+  if (typeof model !== "string") return null;
+  const spec = model.trim();
+  if (!spec || spec.length > 256) return null;
+  return spec;
+}
+
 /** `/session/<token>` and below. `rest` is "" (no trailing slash), "/", or "/state" etc. */
 export function parseSessionPath(pathname: string): { token: string; rest: string } | null {
   const match = /^\/session\/([^/]+)(\/.*)?$/.exec(pathname);
@@ -142,6 +151,8 @@ export class SessionRelay {
         return this.forwardPrompt(request);
       case "/abort":
         return this.forward({ type: "abort" });
+      case "/model":
+        return this.forwardSetModel(request);
       case "/complete":
         return json({ completions: [] });
       case "/control-plane/resolve":
@@ -267,6 +278,20 @@ export class SessionRelay {
       return json({ ok: false, error: "approve_must_be_boolean" }, 400);
     }
     return this.forward({ type: "control_plane_resolve", approve: body.approve });
+  }
+
+  private async forwardSetModel(request: Request): Promise<Response> {
+    let body: { model?: unknown };
+    try {
+      body = (await request.json()) as { model?: unknown };
+    } catch {
+      return json({ ok: false, error: "invalid_json" }, 400);
+    }
+    const spec = validateSetModel(body.model);
+    if (!spec) {
+      return json({ ok: false, error: "invalid_model" }, 400);
+    }
+    return this.forward({ type: "set_model", model: spec });
   }
 
   private forward(frame: { type: string; [k: string]: unknown }): Response {

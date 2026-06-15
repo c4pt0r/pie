@@ -170,6 +170,8 @@ pub struct App {
     relay_abort_rx: Option<UnboundedReceiver<()>>,
     relay_resolve_tx: UnboundedSender<bool>,
     relay_resolve_rx: Option<UnboundedReceiver<bool>>,
+    relay_model_tx: UnboundedSender<String>,
+    relay_model_rx: Option<UnboundedReceiver<String>>,
     /// Imported-but-disabled automation awaiting the user's "activate now?" answer on the
     /// shared confirm surface (TUI keys, local web modal, or the relay viewer).
     pending_import_activation: Option<PendingImportActivation>,
@@ -190,6 +192,7 @@ impl App {
         let (relay_prompt_tx, relay_prompt_rx) = tokio::sync::mpsc::unbounded_channel();
         let (relay_abort_tx, relay_abort_rx) = tokio::sync::mpsc::unbounded_channel();
         let (relay_resolve_tx, relay_resolve_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (relay_model_tx, relay_model_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             kernel: ReplKernel::new(config.harness, config.retry),
             registry: config.registry,
@@ -234,6 +237,8 @@ impl App {
             relay_abort_rx: Some(relay_abort_rx),
             relay_resolve_tx,
             relay_resolve_rx: Some(relay_resolve_rx),
+            relay_model_tx,
+            relay_model_rx: Some(relay_model_rx),
             pending_import_activation: None,
         }
     }
@@ -381,6 +386,10 @@ impl App {
             .relay_resolve_rx
             .take()
             .expect("relay_resolve_rx taken once");
+        let mut relay_model_rx = self
+            .relay_model_rx
+            .take()
+            .expect("relay_model_rx taken once");
         let mut turn = TurnState::default();
         self.refresh_goal_state().await;
 
@@ -422,6 +431,10 @@ impl App {
                 }
                 Some(approve) = relay_resolve_rx.recv() => {
                     self.resolve_from_relay(approve);
+                }
+                Some(spec) = relay_model_rx.recv() => {
+                    self.system_line(format!("[web] set model: {spec}"));
+                    self.set_model_from_spec(&spec).await;
                 }
                 Some(prompt) = async {
                     match control_plane_prompt_rx.as_mut() {
@@ -490,6 +503,7 @@ impl App {
                     self.relay_prompt_tx.clone(),
                     self.relay_abort_tx.clone(),
                     self.relay_resolve_tx.clone(),
+                    self.relay_model_tx.clone(),
                 ) {
                     Ok(handle) => {
                         self.system_line(format!("web relay: {}", handle.url));
