@@ -313,6 +313,26 @@
       text-decoration: underline;
       text-underline-offset: 2px;
     }
+    .markdown table {
+      border-collapse: collapse;
+      margin: 0 0 10px;
+      font-size: 13px;
+      max-width: 100%;
+      display: block;
+      overflow-x: auto;
+    }
+    .markdown th, .markdown td {
+      border: 1px solid var(--line);
+      padding: 5px 10px;
+      text-align: left;
+      vertical-align: top;
+      overflow-wrap: anywhere;
+    }
+    .markdown th {
+      background: var(--soft);
+      font-weight: 650;
+      white-space: nowrap;
+    }
     .tool-details {
       margin: 0 0 12px;
       color: var(--tool);
@@ -1321,6 +1341,47 @@ function paragraphHtml(lines) {
   return '<p>' + lines.map(renderInlineMarkdown).join('<br>') + '</p>';
 }
 
+// GFM tables. Split a row into trimmed cells, honoring \| escapes and the
+// optional leading/trailing pipes. Avoids regex lookbehind for browser reach.
+function splitTableRow(line) {
+  let s = line.trim().replace(/^\|/, '').replace(/\|$/, '');
+  const cells = [];
+  let buf = '';
+  for (let k = 0; k < s.length; k++) {
+    const ch = s[k];
+    if (ch === '\\' && s[k + 1] === '|') { buf += '|'; k++; continue; }
+    if (ch === '|') { cells.push(buf.trim()); buf = ''; continue; }
+    buf += ch;
+  }
+  cells.push(buf.trim());
+  return cells;
+}
+
+// The delimiter row under the header: every cell is dashes with optional colons.
+function isTableDivider(line) {
+  if (!line || line.indexOf('|') === -1) return false;
+  const cells = splitTableRow(line);
+  return cells.length > 0 && cells.every((c) => /^:?-+:?$/.test(c));
+}
+
+function cellAlign(spec) {
+  const left = spec.startsWith(':');
+  const right = spec.endsWith(':');
+  if (left && right) return 'center';
+  if (right) return 'right';
+  if (left) return 'left';
+  return '';
+}
+
+function tableHtml(header, aligns, rows) {
+  const styleFor = (i) => (aligns[i] ? ' style="text-align:' + aligns[i] + '"' : '');
+  const head = '<thead><tr>' + header.map((c, i) =>
+    '<th' + styleFor(i) + '>' + renderInlineMarkdown(c) + '</th>').join('') + '</tr></thead>';
+  const body = '<tbody>' + rows.map((r) => '<tr>' + header.map((_c, i) =>
+    '<td' + styleFor(i) + '>' + renderInlineMarkdown(r[i] ?? '') + '</td>').join('') + '</tr>').join('') + '</tbody>';
+  return '<table>' + head + body + '</table>';
+}
+
 function markdownToHtml(markdown) {
   const lines = String(markdown ?? '').replace(/\r\n/g, '\n').split('\n');
   const out = [];
@@ -1346,7 +1407,8 @@ function markdownToHtml(markdown) {
     quote = [];
   }
 
-  for (const line of lines) {
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
     const fence = line.match(/^```/);
     if (fence) {
       if (inCode) {
@@ -1378,6 +1440,22 @@ function markdownToHtml(markdown) {
       flushQuote();
       const level = heading[1].length;
       out.push('<h' + level + '>' + renderInlineMarkdown(heading[2]) + '</h' + level + '>');
+      continue;
+    }
+    if (line.indexOf('|') !== -1 && i + 1 < lines.length && isTableDivider(lines[i + 1])) {
+      flushParagraph();
+      flushList();
+      flushQuote();
+      const header = splitTableRow(line);
+      const aligns = splitTableRow(lines[i + 1]).map(cellAlign);
+      let j = i + 2;
+      const rows = [];
+      while (j < lines.length && lines[j].trim() && lines[j].indexOf('|') !== -1) {
+        rows.push(splitTableRow(lines[j]));
+        j++;
+      }
+      out.push(tableHtml(header, aligns, rows));
+      i = j - 1;
       continue;
     }
     const unordered = line.match(/^\s*[-*]\s+(.+)$/);
@@ -1611,6 +1689,46 @@ function preserveToolExpansion(nodes) {
   }
 }
 
+// Rebuilding the feed (replaceChildren) destroys any text the user has
+// selected inside it. While a selection is active we defer the rebuild and
+// mark the feed dirty; a selectionchange listener catches it up to the latest
+// snapshot once the selection collapses.
+let latestSnapshot = null;
+let feedDirty = false;
+
+function feedSelectionActive() {
+  const sel = window.getSelection();
+  if (!sel || sel.isCollapsed || sel.rangeCount === 0) return false;
+  return feed.contains(sel.anchorNode) && feed.contains(sel.focusNode);
+}
+
+function rebuildFeed(snapshot) {
+  // Only auto-follow to the newest content when the user is already pinned to
+  // (or near) the bottom. Otherwise preserve their scroll position so they can
+  // read back through history without each incoming snapshot yanking them down.
+  // Measured before replaceChildren, since replacing content changes geometry.
+  // Self-healing: scrolling back to the bottom re-enters the pinned state.
+  const pinnedToBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight <= 64;
+  const feedNodes = renderFeedBlocks(snapshot.feed_blocks) || renderFeedLines(snapshot.feed_lines);
+  preserveToolExpansion(feedNodes);
+  feed.replaceChildren(...feedNodes);
+  if (pinnedToBottom) {
+    // Snap instantly. The feed sets `scroll-behavior: smooth` for keyboard/anchor
+    // nav, but during streaming each snapshot fires this jump faster than a smooth
+    // animation can finish, producing a perpetual slow crawl that never catches the
+    // bottom. `behavior: 'instant'` overrides the CSS for the auto-follow only.
+    feed.scrollTo({ top: feed.scrollHeight, behavior: 'instant' });
+  }
+  feedDirty = false;
+}
+
+// Catch the feed up once a deferred selection is released.
+document.addEventListener('selectionchange', () => {
+  if (feedDirty && latestSnapshot && !feedSelectionActive()) {
+    rebuildFeed(latestSnapshot);
+  }
+});
+
 function render(snapshot) {
   model.textContent = snapshot.model;
   const cwdText = String(snapshot.cwd || '');
@@ -1632,21 +1750,11 @@ function render(snapshot) {
     poll.textContent = '';
     poll.className = '';
   }
-  // Only auto-follow to the newest content when the user is already pinned to
-  // (or near) the bottom. Otherwise preserve their scroll position so they can
-  // read back through history without each incoming snapshot yanking them down.
-  // Measured before replaceChildren, since replacing content changes geometry.
-  // Self-healing: scrolling back to the bottom re-enters the pinned state.
-  const pinnedToBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight <= 64;
-  const feedNodes = renderFeedBlocks(snapshot.feed_blocks) || renderFeedLines(snapshot.feed_lines);
-  preserveToolExpansion(feedNodes);
-  feed.replaceChildren(...feedNodes);
-  if (pinnedToBottom) {
-    // Snap instantly. The feed sets `scroll-behavior: smooth` for keyboard/anchor
-    // nav, but during streaming each snapshot fires this jump faster than a smooth
-    // animation can finish, producing a perpetual slow crawl that never catches the
-    // bottom. `behavior: 'instant'` overrides the CSS for the auto-follow only.
-    feed.scrollTo({ top: feed.scrollHeight, behavior: 'instant' });
+  latestSnapshot = snapshot;
+  if (feedSelectionActive()) {
+    feedDirty = true; // defer; rebuilding now would clear the user's selection
+  } else {
+    rebuildFeed(snapshot);
   }
   renderSidebar(snapshot);
   renderApproval(snapshot);
