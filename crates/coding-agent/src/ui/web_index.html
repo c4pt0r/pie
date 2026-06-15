@@ -1532,6 +1532,27 @@ function renderFeedBlocks(blocks) {
   return nodes;
 }
 
+// The feed is rebuilt wholesale on every snapshot (replaceChildren), and a
+// tool call's expanded state lives only in the DOM as <details open>. Without
+// this, expanding a tool panel during streaming collapses again on the very
+// next snapshot. Persist the open state across renders, keyed by the tool's
+// ordinal position in the feed — the feed is append-only, so the Nth tool call
+// keeps its index across re-renders.
+const openToolKeys = new Set();
+
+function preserveToolExpansion(nodes) {
+  let toolIndex = 0;
+  for (const el of nodes) {
+    if (!(el.classList && el.classList.contains('tool-details'))) continue;
+    const key = toolIndex++;
+    if (openToolKeys.has(key)) el.open = true;
+    el.addEventListener('toggle', () => {
+      if (el.open) openToolKeys.add(key);
+      else openToolKeys.delete(key);
+    });
+  }
+}
+
 function render(snapshot) {
   model.textContent = snapshot.model;
   const cwdText = String(snapshot.cwd || '');
@@ -1559,7 +1580,9 @@ function render(snapshot) {
   // Measured before replaceChildren, since replacing content changes geometry.
   // Self-healing: scrolling back to the bottom re-enters the pinned state.
   const pinnedToBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight <= 64;
-  feed.replaceChildren(...(renderFeedBlocks(snapshot.feed_blocks) || renderFeedLines(snapshot.feed_lines)));
+  const feedNodes = renderFeedBlocks(snapshot.feed_blocks) || renderFeedLines(snapshot.feed_lines);
+  preserveToolExpansion(feedNodes);
+  feed.replaceChildren(...feedNodes);
   if (pinnedToBottom) {
     // Snap instantly. The feed sets `scroll-behavior: smooth` for keyboard/anchor
     // nav, but during streaming each snapshot fires this jump faster than a smooth
