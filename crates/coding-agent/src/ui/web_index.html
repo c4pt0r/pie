@@ -801,6 +801,15 @@
 
     /* Chat: flatten the rounded user bubble into a square bordered block. */
     .feed-user .feed-body { border: 1px solid var(--line); background: var(--field); }
+
+    /* Composer action buttons: monospace TEXT labels (send / attach / stop),
+       flush with the input height — matches the screenshot's text buttons. */
+    .composer-btn {
+      height: 42px;
+      padding: 0 18px;
+      font-size: 13px;
+      letter-spacing: 0.02em;
+    }
   </style>
 </head>
 <body>
@@ -827,9 +836,9 @@
       <div id="attachmentStrip" class="attachment-strip"></div>
       <form id="form">
         <textarea id="input" placeholder="Message pie, or type /help"></textarea>
-        <button type="button" class="secondary icon-button" id="attachImage" title="Attach images" aria-label="Attach images">📎</button>
-        <button type="submit" class="icon-button" title="Send" aria-label="Send">↑</button>
-        <button type="button" class="secondary icon-button" id="abort" title="Abort" aria-label="Abort">■</button>
+        <button type="button" class="secondary composer-btn" id="attachImage" title="Attach images" aria-label="Attach images">attach</button>
+        <button type="submit" class="composer-btn" title="Send" aria-label="Send">send</button>
+        <button type="button" class="secondary composer-btn" id="abort" title="Abort" aria-label="Abort">stop</button>
         <input id="imageInput" class="hidden-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple>
       </form>
       <div class="form-hint">Enter send · Cmd+Enter newline · paste or attach images</div>
