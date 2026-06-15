@@ -907,7 +907,7 @@ impl App {
             Ok(_) => {
                 if let Some(hint) = commands::model_credential_hint(&provider) {
                     self.system_line(format!(
-                        "switched to {provider}:{id} — login required: {hint}"
+                        "selected {provider}:{id}, but login is required: {hint}"
                     ));
                 } else {
                     self.system_line(format!("switched to {provider}:{id}"));
@@ -3317,6 +3317,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_picker_esc_at_model_level_returns_to_provider_level() {
+        let mut app = test_app();
+        app.model_picker = Some(crate::model_picker::ModelPickerState::new(
+            picker_groups(),
+            None,
+        ));
+        // Descend into the model list.
+        assert!(app.handle_model_picker_key(&key(KeyCode::Enter)).await);
+        assert!(matches!(
+            app.model_picker.as_ref().unwrap().level,
+            crate::model_picker::PickerLevel::Models { .. }
+        ));
+        // Esc goes back to provider level — picker stays open.
+        assert!(app.handle_model_picker_key(&key(KeyCode::Esc)).await);
+        assert!(
+            app.model_picker.is_some(),
+            "picker should still be open after Esc at model level"
+        );
+        assert_eq!(
+            app.model_picker.as_ref().unwrap().level,
+            crate::model_picker::PickerLevel::Providers,
+            "Esc at model level should return to provider level"
+        );
+    }
+
+    #[tokio::test]
     async fn model_picker_enter_descends_then_switches_model() {
         let mut app = test_app();
         app.model_picker = Some(crate::model_picker::ModelPickerState::new(
@@ -3329,7 +3355,18 @@ mod tests {
         let model = app.kernel.harness().agent().state().model.clone().unwrap();
         assert_eq!(model.provider.0, "anthropic");
         assert_eq!(model.id, "claude-haiku-4-5");
-        assert!(feed_text(&app).contains("switched to anthropic:claude-haiku-4-5"));
+        // In envs with ANTHROPIC_API_KEY set the message is "switched to …"; without it
+        // the credential hint fires and the message is "selected …, but login is required: …".
+        // Either way the model spec appears in the feed.
+        let feed = feed_text(&app);
+        assert!(
+            feed.contains("anthropic:claude-haiku-4-5"),
+            "feed should mention the model: {feed}"
+        );
+        assert!(
+            feed.contains("switched to") || feed.contains("selected"),
+            "feed should contain a switch/selected verb: {feed}"
+        );
     }
 
     #[test]
