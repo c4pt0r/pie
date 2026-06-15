@@ -50,12 +50,16 @@ enum WebCommand {
     ResolveControlPlane {
         approve: bool,
     },
+    SetModel {
+        spec: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct WebSnapshot {
     session_id: String,
     model: String,
+    model_catalog: Vec<crate::model_picker::ProviderGroup>,
     cwd: String,
     busy: bool,
     queued_count: usize,
@@ -199,6 +203,11 @@ struct ControlPlaneDecisionRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct SetModelRequest {
+    model: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct TriggerRuleRequest {
     id: String,
 }
@@ -329,6 +338,7 @@ impl App {
                 };
                 self.resolve_control_plane_prompt(decision);
             }
+            WebCommand::SetModel { spec } => self.set_model_from_spec(&spec).await,
         }
     }
 
@@ -515,6 +525,7 @@ impl App {
         WebSnapshot {
             session_id: self.session_id.clone(),
             model,
+            model_catalog: self.model_catalog.clone(),
             cwd: self.cwd.display().to_string(),
             busy: self.busy,
             queued_count: self.queued_turns.len(),
@@ -642,6 +653,7 @@ fn web_router(state: HttpState) -> Router {
         .route("/state", get(state_snapshot))
         .route("/events", get(events))
         .route("/prompt", post(prompt))
+        .route("/model", post(set_model))
         .route("/complete", post(complete))
         .route("/abort", post(abort))
         .route("/trigger/immediate", post(trigger_immediate))
@@ -712,6 +724,19 @@ async fn trigger_immediate(
     let accepted = state
         .commands
         .send(WebCommand::TriggerRuleNow { id: req.id })
+        .is_ok();
+    Json(CommandAccepted { accepted })
+}
+
+async fn set_model(
+    State(state): State<HttpState>,
+    Json(request): Json<SetModelRequest>,
+) -> impl IntoResponse {
+    let accepted = state
+        .commands
+        .send(WebCommand::SetModel {
+            spec: request.model,
+        })
         .is_ok();
     Json(CommandAccepted { accepted })
 }
@@ -934,6 +959,7 @@ mod tests {
         let latest = Arc::new(Mutex::new(WebSnapshot {
             session_id: "sess-1".into(),
             model: "provider:model".into(),
+            model_catalog: Vec::new(),
             cwd: "/tmp/pie".into(),
             busy: false,
             queued_count: 0,
@@ -1059,6 +1085,21 @@ mod tests {
             other => panic!("unexpected command: {other:?}"),
         }
 
+        let accepted: serde_json::Value = client
+            .post(format!("{base}/model"))
+            .json(&json!({ "model": "anthropic:claude-haiku-4-5" }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(accepted["accepted"], true);
+        match command_rx.recv().await.unwrap() {
+            WebCommand::SetModel { spec } => assert_eq!(spec, "anthropic:claude-haiku-4-5"),
+            other => panic!("unexpected command: {other:?}"),
+        }
+
         let completions: serde_json::Value = client
             .post(format!("{base}/complete"))
             .json(&json!({ "text": "/he" }))
@@ -1082,6 +1123,7 @@ mod tests {
             .send(WebSnapshot {
                 session_id: "sess-1".into(),
                 model: "provider:model".into(),
+                model_catalog: Vec::new(),
                 cwd: "/tmp/pie".into(),
                 busy: true,
                 queued_count: 1,
