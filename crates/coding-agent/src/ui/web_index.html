@@ -752,6 +752,55 @@
       #feed { padding-left: 14px; padding-right: 14px; }
       footer { padding-left: 12px; padding-right: 12px; }
     }
+
+    /* ===================================================================
+       smolmachines-style visual layer.
+       Square corners, thin borders, monospace for titles/labels/code, and
+       solid-black primary buttons. Layered last so it overrides the base
+       rules above by source order. Colors still resolve through the CSS
+       variables, so the dark theme inherits this look automatically.
+       =================================================================== */
+
+    /* Square everything — drop the pill / bubble / rounded radii. */
+    .cwd-chip, .dot, .pill, .tool-details, .completion-popup, .metrics,
+    .detail-panel, .approval-panel, .approval-payload, .attachment-chip,
+    .attachment-chip button, .markdown pre, .markdown code,
+    button, textarea, .feed-user .feed-body { border-radius: 0; }
+
+    /* Monospace for the technical chrome: titles, labels, tags, status, code. */
+    .brand strong, .side-title, .section-head h2, .cwd-chip, .meta,
+    .run-state, #poll, .pill, .count, .metric span, .metric b,
+    .approval-label, .form-hint, .side-subtle, button,
+    .completion-item { font-family: var(--font-mono); }
+    .brand strong { letter-spacing: 0.01em; }
+
+    /* Tags / badges: bordered square chips, like [official] [os]. */
+    .cwd-chip, .pill { border-color: var(--line-strong); padding: 1px 7px; }
+    /* Status indicator → small square. */
+    .dot { width: 6px; height: 6px; }
+
+    /* Buttons: rectangular, thin-bordered, monospace. Primary = solid black. */
+    button { border-color: var(--ink); font-size: 13px; }
+    button:hover { opacity: 1; filter: none; background: var(--soft); }
+    /* Secondary → outline button: panel fill, thin border, ink on hover. */
+    button.secondary {
+      border-color: var(--line-strong);
+      background: var(--field);
+      color: var(--muted);
+    }
+    button.secondary:hover {
+      border-color: var(--ink);
+      background: var(--soft);
+      color: var(--ink);
+    }
+    /* Primary (submit / approve) keeps the black fill — restore its hover. */
+    button[type="submit"]:hover, #approveApproval:hover { background: var(--button-bg); opacity: 0.85; }
+
+    /* Code & tool blocks: keep them light, square, thin-bordered. */
+    .copy-button { border-color: var(--line-strong); }
+
+    /* Chat: flatten the rounded user bubble into a square bordered block. */
+    .feed-user .feed-body { border: 1px solid var(--line); background: var(--field); }
   </style>
 </head>
 <body>
