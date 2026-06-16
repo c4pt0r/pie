@@ -830,6 +830,14 @@
       font-size: 13px;
       letter-spacing: 0.02em;
     }
+
+    /* Header text button (export): compact outline button next to the toggles. */
+    .header-text-btn {
+      height: 30px;
+      padding: 0 12px;
+      font-size: 12px;
+      letter-spacing: 0.02em;
+    }
   </style>
 </head>
 <body>
@@ -843,6 +851,7 @@
       </div>
       <div class="header-actions">
         <span id="status" class="run-state"><span class="dot"></span><span id="statusText">ready</span></span>
+        <button type="button" class="secondary header-text-btn" id="exportConv" title="Export conversation as JSON (a readable snapshot, not a re-importable session)" aria-label="Export conversation">export</button>
         <button type="button" class="sidebar-toggle icon-button" id="sidebarToggle" title="Hide sidebar" aria-label="Hide sidebar">◨</button>
         <button type="button" class="theme-toggle icon-button" id="themeToggle" title="Switch to dark theme" aria-label="Switch to dark theme">◐</button>
       </div>
@@ -1886,6 +1895,38 @@ form.addEventListener('submit', async (event) => {
 
 abortButton.addEventListener('click', () => fetch('abort', { method: 'POST' }));
 attachImageButton.addEventListener('click', () => imageInput.click());
+
+// Client-side conversation export. Downloads the current snapshot's feed as
+// JSON — a readable / structured copy that works in relay mode too (no agent
+// round-trip). NOTE: feed_blocks is the display projection, so this is a
+// snapshot for reading/sharing, not a re-importable .piesession session.
+const exportConvButton = document.getElementById('exportConv');
+exportConvButton.addEventListener('click', () => {
+  const snap = latestSnapshot;
+  if (!snap) return;
+  const payload = {
+    pie_export: 'conversation',
+    version: 1,
+    note: 'Display snapshot of the conversation feed — readable/structured, not a re-importable session. Use `/session export` for a faithful .piesession archive.',
+    exported_at: new Date().toISOString(),
+    session_id: snap.session_id || null,
+    model: snap.model || null,
+    cwd: snap.cwd || null,
+    feed_blocks: Array.isArray(snap.feed_blocks) ? snap.feed_blocks : null,
+    feed_lines: Array.isArray(snap.feed_blocks) ? null : (snap.feed_lines || null)
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+  const sid = String(snap.session_id || 'session').slice(0, 8);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'pie-conversation-' + sid + '-' + stamp + '.json';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+});
 imageInput.addEventListener('change', async () => {
   await addImageFiles(imageInput.files);
   imageInput.value = '';
