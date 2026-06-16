@@ -138,6 +138,9 @@ pub struct App {
     main_run_rx: Option<UnboundedReceiver<String>>,
     control_plane_prompt_rx: Option<UnboundedReceiver<UiControlPlanePrompt>>,
     control_plane_prompt: Option<UiControlPlanePrompt>,
+    model_picker: Option<crate::model_picker::ModelPickerState>,
+    /// Cached for web snapshots; refreshed on picker open and model switch.
+    model_catalog: Vec<crate::model_picker::ProviderGroup>,
     panel_status: PanelStatus,
 
     input: TextArea<'static>,
@@ -167,6 +170,8 @@ pub struct App {
     relay_abort_rx: Option<UnboundedReceiver<()>>,
     relay_resolve_tx: UnboundedSender<bool>,
     relay_resolve_rx: Option<UnboundedReceiver<bool>>,
+    relay_model_tx: UnboundedSender<String>,
+    relay_model_rx: Option<UnboundedReceiver<String>>,
     /// Imported-but-disabled automation awaiting the user's "activate now?" answer on the
     /// shared confirm surface (TUI keys, local web modal, or the relay viewer).
     pending_import_activation: Option<PendingImportActivation>,
@@ -187,6 +192,7 @@ impl App {
         let (relay_prompt_tx, relay_prompt_rx) = tokio::sync::mpsc::unbounded_channel();
         let (relay_abort_tx, relay_abort_rx) = tokio::sync::mpsc::unbounded_channel();
         let (relay_resolve_tx, relay_resolve_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (relay_model_tx, relay_model_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             kernel: ReplKernel::new(config.harness, config.retry),
             registry: config.registry,
@@ -208,6 +214,8 @@ impl App {
             main_run_rx: Some(config.main_run_rx),
             control_plane_prompt_rx: config.control_plane_prompt_rx,
             control_plane_prompt: None,
+            model_picker: None,
+            model_catalog: crate::model_picker::catalog(),
             panel_status: config.panel_status,
             input: new_textarea(),
             completions: Vec::new(),
@@ -229,6 +237,8 @@ impl App {
             relay_abort_rx: Some(relay_abort_rx),
             relay_resolve_tx,
             relay_resolve_rx: Some(relay_resolve_rx),
+            relay_model_tx,
+            relay_model_rx: Some(relay_model_rx),
             pending_import_activation: None,
         }
     }
@@ -376,6 +386,10 @@ impl App {
             .relay_resolve_rx
             .take()
             .expect("relay_resolve_rx taken once");
+        let mut relay_model_rx = self
+            .relay_model_rx
+            .take()
+            .expect("relay_model_rx taken once");
         let mut turn = TurnState::default();
         self.refresh_goal_state().await;
 
@@ -417,6 +431,10 @@ impl App {
                 }
                 Some(approve) = relay_resolve_rx.recv() => {
                     self.resolve_from_relay(approve);
+                }
+                Some(spec) = relay_model_rx.recv() => {
+                    self.system_line(format!("[web] set model: {spec}"));
+                    self.set_model_from_spec(&spec).await;
                 }
                 Some(prompt) = async {
                     match control_plane_prompt_rx.as_mut() {
@@ -485,6 +503,7 @@ impl App {
                     self.relay_prompt_tx.clone(),
                     self.relay_abort_tx.clone(),
                     self.relay_resolve_tx.clone(),
+                    self.relay_model_tx.clone(),
                 ) {
                     Ok(handle) => {
                         self.system_line(format!("web relay: {}", handle.url));
@@ -713,6 +732,9 @@ impl App {
         if self.handle_control_plane_prompt_key(&key) {
             return Ok(());
         }
+        if self.handle_model_picker_key(&key).await {
+            return Ok(());
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -808,6 +830,106 @@ impl App {
             });
         }
         true
+    }
+
+    fn open_model_picker(&mut self) {
+        self.model_catalog = crate::model_picker::catalog();
+        if self.model_catalog.is_empty() {
+            self.system_line(
+                "no openai/anthropic-compatible models registered; use /model <provider:model-id>",
+            );
+            return;
+        }
+        let active = self
+            .kernel
+            .harness()
+            .agent()
+            .state()
+            .model
+            .clone()
+            .map(|m| (m.provider.0, m.id));
+        self.model_picker = Some(crate::model_picker::ModelPickerState::new(
+            self.model_catalog.clone(),
+            active,
+        ));
+    }
+
+    async fn handle_model_picker_key(&mut self, key: &KeyEvent) -> bool {
+        if self.model_picker.is_none() {
+            return false;
+        }
+        if key.kind == KeyEventKind::Release {
+            return true;
+        }
+        enum PickerAction {
+            None,
+            Close,
+            Select(String),
+        }
+        let action = {
+            let Some(picker) = self.model_picker.as_mut() else {
+                return true;
+            };
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    picker.up();
+                    PickerAction::None
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    picker.down();
+                    PickerAction::None
+                }
+                KeyCode::Enter => match picker.enter() {
+                    Some(spec) => PickerAction::Select(spec),
+                    None => PickerAction::None,
+                },
+                KeyCode::Esc => {
+                    if picker.back() {
+                        PickerAction::Close
+                    } else {
+                        PickerAction::None
+                    }
+                }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    PickerAction::Close
+                }
+                _ => PickerAction::None,
+            }
+        };
+        match action {
+            PickerAction::None => {}
+            PickerAction::Close => self.model_picker = None,
+            PickerAction::Select(spec) => {
+                self.model_picker = None;
+                self.set_model_from_spec(&spec).await;
+            }
+        }
+        true
+    }
+
+    async fn set_model_from_spec(&mut self, spec: &str) {
+        let Some((provider, id)) = commands::parse_model_spec(spec) else {
+            self.error_line(format!("invalid model spec: {spec}"));
+            return;
+        };
+        let (provider, id) = (provider.to_string(), id.to_string());
+        let Some(model) = pie_ai::get_model(&pie_ai::Provider::from(provider.as_str()), &id) else {
+            self.error_line(format!("unknown model: {provider}:{id}"));
+            return;
+        };
+        match self.kernel.harness().set_model(model).await {
+            Ok(_) => {
+                if let Some(hint) = commands::model_credential_hint(&provider) {
+                    self.system_line(format!(
+                        "selected {provider}:{id}, but login is required: {hint}"
+                    ));
+                } else {
+                    self.system_line(format!("switched to {provider}:{id}"));
+                }
+                self.model_catalog = crate::model_picker::catalog();
+            }
+            Err(e) => self.error_line(format!("set_model failed: {e}")),
+        }
     }
 
     // ── submit / dispatch ───────────────────────────────────────────────────────────────
@@ -1108,6 +1230,7 @@ impl App {
                 self.login(&provider, storage_key.as_deref(), terminal)
                     .await;
             }
+            CommandOutcome::OpenModelPicker => self.open_model_picker(),
             CommandOutcome::Handled => {}
         }
         if input.trim_start().starts_with("/goal") {
@@ -1437,7 +1560,45 @@ impl App {
 
         // Completion popup, drawn above the input over the feed.
         self.render_completions(frame, status_area);
+        self.render_model_picker(frame);
         self.render_control_plane_prompt(frame);
+    }
+
+    fn render_model_picker(&self, frame: &mut ratatui::Frame) {
+        let Some(picker) = self.model_picker.as_ref() else {
+            return;
+        };
+        let area = frame.area();
+        let width = area.width.clamp(40, 64);
+        let height = area.height.clamp(8, 18);
+        let rect = centered_rect(area, width, height);
+        // borders (2) + title line + blank + footer = 5 rows of chrome
+        let visible = rect.height.saturating_sub(5).max(1) as usize;
+        let (title, rows) = picker.view(visible);
+        let mut text = vec![
+            Line::styled(title, Style::default().fg(Color::Yellow)),
+            Line::raw(""),
+        ];
+        for (label, selected) in rows {
+            if selected {
+                text.push(Line::styled(
+                    format!("❯ {label}"),
+                    Style::default().fg(Color::Cyan),
+                ));
+            } else {
+                text.push(Line::raw(format!("  {label}")));
+            }
+        }
+        text.push(Line::styled(
+            "↑↓/jk navigate · Enter select · Esc back",
+            Style::default().fg(Color::DarkGray),
+        ));
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Select model ")
+            .border_style(Style::default().fg(Color::Cyan));
+        frame.render_widget(Clear, rect);
+        frame.render_widget(Paragraph::new(text).block(block), rect);
     }
 
     fn render_control_plane_prompt(&self, frame: &mut ratatui::Frame) {
@@ -1928,6 +2089,15 @@ impl App {
                     CommandOutcome::SessionImportActivation { .. } => {
                         println!(
                             "imported automation left disabled (no interactive confirm in this mode); re-import with `pie session import --activate-triggers=on` or enable via /triggers enable and /cron enable"
+                        );
+                    }
+                    CommandOutcome::OpenModelPicker => {
+                        match self.kernel.harness().agent().state().model.clone() {
+                            Some(m) => println!("active model: {}:{}", m.provider.0, m.id),
+                            None => println!("(no model active)"),
+                        }
+                        println!(
+                            "interactive picker needs the TUI; use /model <provider:model-id> or /model list"
                         );
                     }
                     _ => {}
@@ -3136,5 +3306,104 @@ mod tests {
         assert_eq!(row.chars().nth(7), Some('-'), "{rendered}");
         assert_eq!(row.chars().nth(10), Some(' '), "{rendered}");
         assert_eq!(row.chars().nth(13), Some(':'), "{rendered}");
+    }
+
+    fn picker_groups() -> Vec<crate::model_picker::ProviderGroup> {
+        vec![crate::model_picker::ProviderGroup {
+            provider: "anthropic".into(),
+            has_credential: true,
+            models: vec![crate::model_picker::ModelEntry {
+                id: "claude-haiku-4-5".into(),
+                name: "Claude Haiku 4.5".into(),
+            }],
+        }]
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[tokio::test]
+    async fn model_picker_keys_are_modal_and_navigate() {
+        let mut app = test_app();
+        app.model_picker = Some(crate::model_picker::ModelPickerState::new(
+            picker_groups(),
+            None,
+        ));
+        // Modal: keys are consumed while open.
+        assert!(app.handle_model_picker_key(&key(KeyCode::Down)).await);
+        // Esc at the top level closes.
+        assert!(app.handle_model_picker_key(&key(KeyCode::Esc)).await);
+        assert!(app.model_picker.is_none());
+        // Closed: keys pass through.
+        assert!(!app.handle_model_picker_key(&key(KeyCode::Down)).await);
+    }
+
+    #[tokio::test]
+    async fn model_picker_esc_at_model_level_returns_to_provider_level() {
+        let mut app = test_app();
+        app.model_picker = Some(crate::model_picker::ModelPickerState::new(
+            picker_groups(),
+            None,
+        ));
+        // Descend into the model list.
+        assert!(app.handle_model_picker_key(&key(KeyCode::Enter)).await);
+        assert!(matches!(
+            app.model_picker.as_ref().unwrap().level,
+            crate::model_picker::PickerLevel::Models { .. }
+        ));
+        // Esc goes back to provider level — picker stays open.
+        assert!(app.handle_model_picker_key(&key(KeyCode::Esc)).await);
+        assert!(
+            app.model_picker.is_some(),
+            "picker should still be open after Esc at model level"
+        );
+        assert_eq!(
+            app.model_picker.as_ref().unwrap().level,
+            crate::model_picker::PickerLevel::Providers,
+            "Esc at model level should return to provider level"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_picker_enter_descends_then_switches_model() {
+        let mut app = test_app();
+        app.model_picker = Some(crate::model_picker::ModelPickerState::new(
+            picker_groups(),
+            None,
+        ));
+        assert!(app.handle_model_picker_key(&key(KeyCode::Enter)).await); // descend
+        assert!(app.handle_model_picker_key(&key(KeyCode::Enter)).await); // select
+        assert!(app.model_picker.is_none());
+        let model = app.kernel.harness().agent().state().model.clone().unwrap();
+        assert_eq!(model.provider.0, "anthropic");
+        assert_eq!(model.id, "claude-haiku-4-5");
+        // In envs with ANTHROPIC_API_KEY set the message is "switched to …"; without it
+        // the credential hint fires and the message is "selected …, but login is required: …".
+        // Either way the model spec appears in the feed.
+        let feed = feed_text(&app);
+        assert!(
+            feed.contains("anthropic:claude-haiku-4-5"),
+            "feed should mention the model: {feed}"
+        );
+        assert!(
+            feed.contains("switched to") || feed.contains("selected"),
+            "feed should contain a switch/selected verb: {feed}"
+        );
+    }
+
+    #[test]
+    fn model_picker_renders_centered_overlay() {
+        let mut app = test_app();
+        app.model_picker = Some(crate::model_picker::ModelPickerState::new(
+            picker_groups(),
+            None,
+        ));
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("Select provider"));
+        assert!(text.contains("anthropic (1)"));
     }
 }

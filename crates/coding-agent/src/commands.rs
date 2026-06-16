@@ -99,6 +99,9 @@ pub enum CommandOutcome {
         storage_key: Option<String>,
         recovery_command: Option<String>,
     },
+    /// Bare `/model` — the REPL owns the interactive picker UI, so the
+    /// command requests it instead of printing the catalog.
+    OpenModelPicker,
     /// `/web-connect` family — the relay lives on the UI `App`, so the REPL layer
     /// performs the action (issue #22).
     WebRelay(WebRelayAction),
@@ -155,6 +158,7 @@ impl std::fmt::Debug for CommandOutcome {
                 .field("storage_key", storage_key)
                 .field("recovery_command", recovery_command)
                 .finish(),
+            Self::OpenModelPicker => f.write_str("OpenModelPicker"),
             Self::WebRelay(action) => f.debug_tuple("WebRelay").field(action).finish(),
             Self::SessionImportActivation {
                 session_path,
@@ -881,13 +885,7 @@ impl SlashCommand for ModelCommand {
     }
     async fn run(&self, argv: &[String], ctx: &CommandCtx<'_>) -> CommandOutcome {
         if argv.is_empty() {
-            let current = ctx.harness.agent().state().model.clone();
-            match current {
-                Some(m) => cprintln!("active model: {}:{}", m.provider.0, m.id),
-                None => cprintln!("(no model active)"),
-            }
-            cprintln!("Use /model list [provider] to show supported providers and models.");
-            return CommandOutcome::Handled;
+            return CommandOutcome::OpenModelPicker;
         }
         if matches!(argv.first().map(|s| s.as_str()), Some("list" | "ls")) {
             let provider = argv.get(1).map(String::as_str);
@@ -926,7 +924,7 @@ impl SlashCommand for ModelCommand {
     }
 }
 
-fn parse_model_spec(spec: &str) -> Option<(&str, &str)> {
+pub(crate) fn parse_model_spec(spec: &str) -> Option<(&str, &str)> {
     let spec = spec.trim();
     let (provider, id) = spec
         .split_once(':')
@@ -940,7 +938,7 @@ fn parse_model_spec(spec: &str) -> Option<(&str, &str)> {
     Some((provider, id))
 }
 
-fn model_credential_hint(provider: &str) -> Option<String> {
+pub(crate) fn model_credential_hint(provider: &str) -> Option<String> {
     let vars = pie_ai::env_api_keys::env_var_names(provider);
     let has_env = vars.iter().any(|var| {
         std::env::var(var)

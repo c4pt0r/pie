@@ -6,6 +6,7 @@ import {
   createTestApp,
   isValidToken,
   parseSessionPath,
+  validateSetModel,
 } from "../dist/index.js";
 
 const TOKEN = "a".repeat(40);
@@ -115,12 +116,12 @@ test("router redirects bare session URLs to trailing slash", async () => {
 test("router forwards session subpaths to the durable object for the token", async () => {
   const log = [];
   const app = createTestApp("v", fakeRelayNamespace(log));
-  for (const rest of ["/", "/state", "/events", "/prompt"]) {
+  for (const rest of ["/", "/state", "/events", "/prompt", "/model"]) {
     await app.fetch(new Request(`${BASE}/session/${TOKEN}${rest}`));
   }
   assert.deepEqual(
     log.map((entry) => entry.path),
-    ["/", "/state", "/events", "/prompt"],
+    ["/", "/state", "/events", "/prompt", "/model"],
   );
   assert.ok(log.every((entry) => entry.token === TOKEN));
 });
@@ -168,6 +169,14 @@ test("control-plane resolve validates input and reports agent_offline without a 
   assert.equal(offline.status, 503);
   const body = await offline.json();
   assert.equal(body.error, "agent_offline");
+});
+
+test("set_model body validation accepts specs and rejects junk", () => {
+  assert.equal(validateSetModel("anthropic:claude-haiku-4-5"), "anthropic:claude-haiku-4-5");
+  assert.equal(validateSetModel("  ds4:deepseek-v4-flash  "), "ds4:deepseek-v4-flash");
+  assert.equal(validateSetModel(""), null);
+  assert.equal(validateSetModel(42), null);
+  assert.equal(validateSetModel("x".repeat(300)), null);
 });
 
 test("legacy hub paths still return 410 with the relay enabled", async () => {

@@ -1,6 +1,6 @@
 import { isValidToken, parseSessionPath } from "./relay.js";
 
-export { RelayCore, SessionRelay, isValidToken, parseSessionPath } from "./relay.js";
+export { RelayCore, SessionRelay, isValidToken, parseSessionPath, validateSetModel } from "./relay.js";
 
 const PROTOCOL_VERSION = "2025-03-26";
 const DEFAULT_VERSION = "0.1.0";

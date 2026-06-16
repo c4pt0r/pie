@@ -124,6 +124,26 @@
       text-overflow: ellipsis;
       white-space: nowrap;
     }
+    .model-picker { position: relative; }
+    .model-label {
+      cursor: pointer; background: none; border: 1px solid transparent;
+      border-radius: 6px; padding: 2px 8px; font: inherit; color: inherit;
+    }
+    .model-label:hover { border-color: var(--line); background: var(--soft); }
+    .model-menu {
+      position: absolute; top: calc(100% + 4px); left: 0; z-index: 40;
+      min-width: 260px; max-height: 60vh; overflow-y: auto;
+      background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+      box-shadow: 0 8px 24px var(--shadow); padding: 6px 0; text-align: left;
+    }
+    .model-menu .menu-provider { padding: 6px 12px 2px; color: var(--muted); font-size: 12px; }
+    .model-menu .menu-provider .nokey { color: var(--faint); margin-left: 6px; }
+    .model-menu .menu-model {
+      padding: 4px 12px 4px 20px; cursor: pointer;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .model-menu .menu-model:hover { background: var(--soft); }
+    .model-menu .menu-model.active { font-weight: 600; }
     .run-state {
       flex: 0 0 auto;
       display: inline-flex;
@@ -847,7 +867,10 @@
       <div class="brand">
         <strong>pie web</strong>
         <span id="cwd" class="cwd-chip"></span>
-        <span id="model" class="meta"></span>
+        <span class="model-picker" id="modelPicker">
+          <button type="button" id="model" class="meta model-label" title="Switch model"></button>
+          <div id="modelMenu" class="model-menu" hidden></div>
+        </span>
       </div>
       <div class="header-actions">
         <span id="status" class="run-state"><span class="dot"></span><span id="statusText">ready</span></span>
@@ -1002,15 +1025,86 @@ function applySidebarHidden(hidden, persist) {
   }
 }
 
-let savedSidebar = null;
-try { savedSidebar = localStorage.getItem(SIDEBAR_KEY); } catch (_) {}
-if (savedSidebar !== 'hidden' && savedSidebar !== 'visible') {
-  // No explicit preference: phones get the conversation, not the panels.
-  savedSidebar = window.matchMedia('(max-width: 860px)').matches ? 'hidden' : 'visible';
+const compactLayout = window.matchMedia('(max-width: 860px)');
+
+// Compact layouts always start hidden — the drawer overlays the conversation,
+// so a persisted "visible" must never pin it open on a phone. The stored
+// preference only applies to the wide two-column layout.
+function defaultSidebarHidden() {
+  if (compactLayout.matches) return true;
+  let saved = null;
+  try { saved = localStorage.getItem(SIDEBAR_KEY); } catch (_) {}
+  return saved === 'hidden';
 }
-applySidebarHidden(savedSidebar === 'hidden', false);
+
+applySidebarHidden(defaultSidebarHidden(), false);
 sidebarToggle.addEventListener('click', () => {
-  applySidebarHidden(!currentSidebarHidden(), true);
+  // The drawer is transient on compact layouts: don't persist taps there.
+  applySidebarHidden(!currentSidebarHidden(), !compactLayout.matches);
+});
+compactLayout.addEventListener('change', (event) => {
+  if (event.matches) {
+    applySidebarHidden(true, false);
+  } else {
+    applySidebarHidden(defaultSidebarHidden(), false);
+  }
+});
+document.addEventListener('click', (event) => {
+  if (!compactLayout.matches || currentSidebarHidden()) return;
+  const target = event.target instanceof Element ? event.target : null;
+  if (target && (target.closest('aside') || sidebarToggle.contains(target))) return;
+  applySidebarHidden(true, false);
+});
+
+const modelMenu = document.getElementById('modelMenu');
+let modelCatalog = [];
+
+function buildModelMenu() {
+  const current = model.textContent;
+  const nodes = [];
+  for (const group of modelCatalog) {
+    const head = node('div', { class: 'menu-provider', text: group.provider });
+    if (!group.has_credential) {
+      head.appendChild(node('span', { class: 'nokey', text: 'no key' }));
+    }
+    nodes.push(head);
+    for (const entry of group.models) {
+      const spec = group.provider + ':' + entry.id;
+      const item = node('div', {
+        class: 'menu-model' + (spec === current ? ' active' : ''),
+        text: entry.id,
+      });
+      item.title = spec;
+      item.addEventListener('click', () => {
+        modelMenu.hidden = true;
+        fetch('model', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: spec }),
+        }).catch(() => {});
+      });
+      nodes.push(item);
+    }
+  }
+  if (!nodes.length) {
+    nodes.push(node('div', { class: 'menu-provider', text: 'no compatible models' }));
+  }
+  modelMenu.replaceChildren(...nodes);
+}
+
+model.addEventListener('click', (event) => {
+  event.stopPropagation();
+  if (modelMenu.hidden) {
+    buildModelMenu();
+    modelMenu.hidden = false;
+  } else {
+    modelMenu.hidden = true;
+  }
+});
+document.addEventListener('click', (event) => {
+  if (!modelMenu.hidden && !modelMenu.contains(event.target)) {
+    modelMenu.hidden = true;
+  }
 });
 
 function node(tag, attrs = {}, children = []) {
@@ -1740,6 +1834,7 @@ document.addEventListener('selectionchange', () => {
 
 function render(snapshot) {
   model.textContent = snapshot.model;
+  modelCatalog = snapshot.model_catalog || [];
   const cwdText = String(snapshot.cwd || '');
   cwd.textContent = cwdText || '.';
   cwd.title = cwdText;
