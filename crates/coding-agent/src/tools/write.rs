@@ -36,14 +36,19 @@ impl AgentTool for WriteTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| AgentToolError::from("missing `content`"))?;
 
-        if let Some(parent) = std::path::Path::new(path).parent() {
-            if !parent.as_os_str().is_empty() {
-                let _ = tokio::fs::create_dir_all(parent).await;
+        // Serialize the overwrite per file so a concurrent `edit`/`write` on the same path
+        // cannot interleave. See `tools::fs_guard`.
+        crate::tools::fs_guard::with_file_lock(std::path::Path::new(path), || async {
+            if let Some(parent) = std::path::Path::new(path).parent() {
+                if !parent.as_os_str().is_empty() {
+                    let _ = tokio::fs::create_dir_all(parent).await;
+                }
             }
-        }
-        tokio::fs::write(path, content.as_bytes())
-            .await
-            .map_err(|e| AgentToolError::from(format!("write {path}: {e}")))?;
+            tokio::fs::write(path, content.as_bytes())
+                .await
+                .map_err(|e| AgentToolError::from(format!("write {path}: {e}")))
+        })
+        .await?;
 
         let bytes = content.len();
         let lines = content.lines().count();

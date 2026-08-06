@@ -5,6 +5,7 @@
 pub mod bash;
 pub mod edit;
 pub mod find;
+pub mod fs_guard;
 pub mod git;
 pub mod grep;
 pub mod install_skill;
