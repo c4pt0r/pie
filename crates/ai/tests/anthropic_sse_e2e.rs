@@ -36,6 +36,26 @@ async fn serve_once(body: &'static str) -> String {
     format!("http://{addr}")
 }
 
+async fn serve_status_once(status: &str, content_type: &str, body: &'static str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let status = status.to_string();
+    let content_type = content_type.to_string();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = socket.read(&mut buf).await;
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+        socket.flush().await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
 fn anthropic_model(base_url: String) -> Model {
     Model {
         id: "claude-test".into(),
@@ -202,6 +222,75 @@ async fn http_error_becomes_error_event() {
         }
     }
     assert_eq!(error_msg.as_deref(), Some("overloaded"));
+}
+
+#[tokio::test]
+async fn http_error_body_is_normalized_and_redacted() {
+    let body =
+        r#"{"error":{"message":"bad key","token":"secret-token"},"api_key":"sk-test","safe":"ok"}"#;
+    let base = serve_status_once("400 Bad Request", "application/json", body).await;
+    let model = anthropic_model(base);
+    let opts = StreamOptions {
+        api_key: Some("test-key".into()),
+        ..Default::default()
+    };
+
+    let mut s = stream(&model, &user_ctx("hi"), Some(&opts));
+    let mut error = None;
+    while let Some(ev) = s.next().await {
+        if let AssistantMessageEvent::Error { error: msg, .. } = ev {
+            error = Some(msg);
+        }
+    }
+
+    let error = error.expect("error event");
+    assert_eq!(
+        error.error_message.as_deref(),
+        Some("HTTP 400 Bad Request: bad key")
+    );
+    let diagnostics = error.diagnostics.expect("diagnostics");
+    let diagnostic = diagnostics
+        .iter()
+        .find(|d| d.get("kind").and_then(|v| v.as_str()) == Some("provider_http_error"))
+        .expect("provider HTTP diagnostic");
+    let data = diagnostic.get("data").expect("diagnostic data");
+    assert_eq!(data["status"], 400);
+    assert_eq!(data["bodyType"], "object");
+    assert_eq!(data["body"]["api_key"], "[redacted]");
+    assert_eq!(data["body"]["error"]["token"], "[redacted]");
+    assert_eq!(data["body"]["safe"], "ok");
+}
+
+#[tokio::test]
+async fn raw_stop_reason_is_preserved_in_diagnostics() {
+    let body = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_raw\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n\
+event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"pause_turn\"},\"usage\":{\"output_tokens\":1}}\n\n\
+event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+
+    let base = serve_once(body).await;
+    let model = anthropic_model(base);
+    let opts = StreamOptions {
+        api_key: Some("test-key".into()),
+        ..Default::default()
+    };
+
+    let mut s = stream(&model, &user_ctx("hi"), Some(&opts));
+    let mut done = None;
+    while let Some(ev) = s.next().await {
+        if let AssistantMessageEvent::Done { message, .. } = ev {
+            done = Some(message);
+        }
+    }
+
+    let message = done.expect("done message");
+    assert_eq!(message.stop_reason, StopReason::Stop);
+    let diagnostics = message.diagnostics.expect("diagnostics");
+    let diagnostic = diagnostics
+        .iter()
+        .find(|d| d.get("kind").and_then(|v| v.as_str()) == Some("provider_raw_stop_reason"))
+        .expect("raw stop reason diagnostic");
+    assert_eq!(diagnostic["data"]["provider"], "anthropic");
+    assert_eq!(diagnostic["data"]["rawStopReason"], "pause_turn");
 }
 
 #[tokio::test]

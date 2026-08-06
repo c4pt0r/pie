@@ -13,6 +13,7 @@ pub mod json_parse;
 pub mod node_http_proxy;
 pub mod oauth;
 pub mod overflow;
+pub mod provider_diagnostics;
 pub mod retry;
 pub mod sanitize_unicode;
 pub mod sse;
