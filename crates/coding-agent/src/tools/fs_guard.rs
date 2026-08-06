@@ -137,4 +137,53 @@ mod tests {
         .await;
         assert_eq!(held, 42);
     }
+
+    /// Upstream-parity: a symlink alias shares the lock of its canonical target (the key is the
+    /// realpath). Holding the target's lock must block a lock request made via the symlink.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_alias_shares_target_lock() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        let dir = tempdir().unwrap();
+        let real = dir.path().join("real.txt");
+        std::fs::write(&real, "x").unwrap();
+        let link = dir.path().join("link.txt");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // Hold the target's lock via a holder task until we release it.
+        let (tx_acquired, rx_acquired) = tokio::sync::oneshot::channel::<()>();
+        let (tx_release, rx_release) = tokio::sync::oneshot::channel::<()>();
+        let real_holder = real.clone();
+        let holder = tokio::spawn(async move {
+            with_file_lock(&real_holder, || async move {
+                tx_acquired.send(()).unwrap();
+                rx_release.await.unwrap();
+            })
+            .await;
+        });
+        rx_acquired.await.unwrap();
+
+        // A request via the symlink must block, because the key is the canonical target path.
+        let completed = Arc::new(AtomicBool::new(false));
+        let waiter = tokio::spawn({
+            let completed = Arc::clone(&completed);
+            async move {
+                with_file_lock(&link, || async {}).await;
+                completed.store(true, Ordering::SeqCst);
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !completed.load(Ordering::SeqCst),
+            "a symlink alias must share the lock of its canonical target"
+        );
+
+        tx_release.send(()).unwrap();
+        holder.await.unwrap();
+        waiter.await.unwrap();
+        assert!(completed.load(Ordering::SeqCst));
+    }
 }
