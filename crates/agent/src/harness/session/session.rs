@@ -10,6 +10,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::Mutex;
 
 use crate::types::AgentMessage;
 
@@ -361,11 +362,22 @@ pub fn build_session_context(path_entries: &[SessionTreeEntry]) -> SessionContex
 #[derive(Clone)]
 pub struct Session {
     storage: Arc<dyn SessionStorage>,
+    /// Serializes every operation that chooses or moves the current leaf. Session clones share
+    /// this gate, so reading the parent and appending the new entry is one writer operation.
+    ///
+    /// Storage remains responsible for persistence only. Restricting callers from constructing
+    /// multiple independent `Session` facades over the same storage is part of the later
+    /// repository-ownership work; normal repository-created sessions and their clones share this
+    /// lock today.
+    writer: Arc<Mutex<()>>,
 }
 
 impl Session {
     pub fn new(storage: Arc<dyn SessionStorage>) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            writer: Arc::new(Mutex::new(())),
+        }
     }
 
     pub fn storage(&self) -> &Arc<dyn SessionStorage> {
@@ -431,18 +443,23 @@ impl Session {
         Ok(None)
     }
 
-    async fn append_typed(&self, entry: SessionTreeEntry) -> Result<String, SessionError> {
+    async fn append_with_current_leaf(
+        &self,
+        build: impl FnOnce(String, Option<String>) -> SessionTreeEntry,
+    ) -> Result<String, SessionError> {
+        let _writer = self.writer.lock().await;
+        let id = self.storage.create_entry_id().await?;
+        let parent = self.storage.get_leaf_id().await?;
+        let entry = build(id, parent);
         let id = entry.id().to_string();
         self.storage.append_entry(entry).await?;
         Ok(id)
     }
 
     pub async fn append_message(&self, message: AgentMessage) -> Result<String, SessionError> {
-        let id = self.storage.create_entry_id().await?;
-        let parent = self.storage.get_leaf_id().await?;
-        self.append_typed(SessionTreeEntry::Message {
+        self.append_with_current_leaf(|id, parent_id| SessionTreeEntry::Message {
             id,
-            parent_id: parent,
+            parent_id,
             timestamp: Self::now_rfc3339(),
             message,
         })
@@ -453,13 +470,12 @@ impl Session {
         &self,
         thinking_level: impl Into<String>,
     ) -> Result<String, SessionError> {
-        let id = self.storage.create_entry_id().await?;
-        let parent = self.storage.get_leaf_id().await?;
-        self.append_typed(SessionTreeEntry::ThinkingLevelChange {
+        let thinking_level = thinking_level.into();
+        self.append_with_current_leaf(|id, parent_id| SessionTreeEntry::ThinkingLevelChange {
             id,
-            parent_id: parent,
+            parent_id,
             timestamp: Self::now_rfc3339(),
-            thinking_level: thinking_level.into(),
+            thinking_level,
         })
         .await
     }
@@ -469,14 +485,14 @@ impl Session {
         provider: impl Into<String>,
         model_id: impl Into<String>,
     ) -> Result<String, SessionError> {
-        let id = self.storage.create_entry_id().await?;
-        let parent = self.storage.get_leaf_id().await?;
-        self.append_typed(SessionTreeEntry::ModelChange {
+        let provider = provider.into();
+        let model_id = model_id.into();
+        self.append_with_current_leaf(|id, parent_id| SessionTreeEntry::ModelChange {
             id,
-            parent_id: parent,
+            parent_id,
             timestamp: Self::now_rfc3339(),
-            provider: provider.into(),
-            model_id: model_id.into(),
+            provider,
+            model_id,
         })
         .await
     }
@@ -489,17 +505,17 @@ impl Session {
         details: Option<Value>,
         from_hook: bool,
     ) -> Result<String, SessionError> {
-        let id = self.storage.create_entry_id().await?;
-        let parent = self.storage.get_leaf_id().await?;
-        self.append_typed(SessionTreeEntry::Compaction {
+        let summary = summary.into();
+        let first_kept_entry_id = first_kept_entry_id.into();
+        self.append_with_current_leaf(|id, parent_id| SessionTreeEntry::Compaction {
             id,
-            parent_id: parent,
+            parent_id,
             timestamp: Self::now_rfc3339(),
-            summary: summary.into(),
-            first_kept_entry_id: first_kept_entry_id.into(),
+            summary,
+            first_kept_entry_id,
             tokens_before,
             details,
-            from_hook: if from_hook { Some(true) } else { None },
+            from_hook: from_hook.then_some(true),
         })
         .await
     }
@@ -509,13 +525,12 @@ impl Session {
         custom_type: impl Into<String>,
         data: Option<Value>,
     ) -> Result<String, SessionError> {
-        let id = self.storage.create_entry_id().await?;
-        let parent = self.storage.get_leaf_id().await?;
-        self.append_typed(SessionTreeEntry::Custom {
+        let custom_type = custom_type.into();
+        self.append_with_current_leaf(|id, parent_id| SessionTreeEntry::Custom {
             id,
-            parent_id: parent,
+            parent_id,
             timestamp: Self::now_rfc3339(),
-            custom_type: custom_type.into(),
+            custom_type,
             data,
         })
         .await
@@ -527,31 +542,31 @@ impl Session {
         label: Option<String>,
     ) -> Result<String, SessionError> {
         let target = target_id.into();
+        let _writer = self.writer.lock().await;
         if self.storage.get_entry(&target).await?.is_none() {
             return Err(Self::not_found(format!("Entry {target} not found")));
         }
         let id = self.storage.create_entry_id().await?;
         let parent = self.storage.get_leaf_id().await?;
-        self.append_typed(SessionTreeEntry::Label {
-            id,
+        let entry = SessionTreeEntry::Label {
+            id: id.clone(),
             parent_id: parent,
             timestamp: Self::now_rfc3339(),
             target_id: target,
             label,
-        })
-        .await
+        };
+        self.storage.append_entry(entry).await?;
+        Ok(id)
     }
 
     pub async fn append_session_name(
         &self,
         name: impl Into<String>,
     ) -> Result<String, SessionError> {
-        let id = self.storage.create_entry_id().await?;
-        let parent = self.storage.get_leaf_id().await?;
         let n = name.into().trim().to_string();
-        self.append_typed(SessionTreeEntry::SessionInfo {
+        self.append_with_current_leaf(|id, parent_id| SessionTreeEntry::SessionInfo {
             id,
-            parent_id: parent,
+            parent_id,
             timestamp: Self::now_rfc3339(),
             name: Some(n),
         })
@@ -563,6 +578,7 @@ impl Session {
         entry_id: Option<&str>,
         summary: Option<BranchSummaryInput>,
     ) -> Result<Option<String>, SessionError> {
+        let _writer = self.writer.lock().await;
         if let Some(id) = entry_id {
             if self.storage.get_entry(id).await?.is_none() {
                 return Err(Self::not_found(format!("Entry {id} not found")));
@@ -575,15 +591,16 @@ impl Session {
         let id = self.storage.create_entry_id().await?;
         let from_id = entry_id.map(String::from).unwrap_or_else(|| "root".into());
         let entry = SessionTreeEntry::BranchSummary {
-            id,
+            id: id.clone(),
             parent_id: entry_id.map(String::from),
             timestamp: Self::now_rfc3339(),
             from_id,
             summary: summary.summary,
             details: summary.details,
-            from_hook: if summary.from_hook { Some(true) } else { None },
+            from_hook: summary.from_hook.then_some(true),
         };
-        Ok(Some(self.append_typed(entry).await?))
+        self.storage.append_entry(entry).await?;
+        Ok(Some(id))
     }
 }
 

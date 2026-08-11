@@ -62,7 +62,15 @@ impl SessionStorage for MemorySessionStorage {
     }
 
     async fn set_leaf_id(&self, id: Option<String>) -> Result<(), SessionError> {
-        self.lock().leaf_id = id;
+        let mut g = self.lock();
+        let entry = SessionTreeEntry::Leaf {
+            id: uuidv7(),
+            parent_id: g.leaf_id.clone(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            target_id: id.clone(),
+        };
+        g.entries.push(entry);
+        g.leaf_id = id;
         Ok(())
     }
 
@@ -72,7 +80,10 @@ impl SessionStorage for MemorySessionStorage {
 
     async fn append_entry(&self, entry: SessionTreeEntry) -> Result<(), SessionError> {
         let mut g = self.lock();
-        g.leaf_id = Some(entry.id().to_string());
+        g.leaf_id = match &entry {
+            SessionTreeEntry::Leaf { target_id, .. } => target_id.clone(),
+            _ => Some(entry.id().to_string()),
+        };
         g.entries.push(entry);
         Ok(())
     }
