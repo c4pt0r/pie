@@ -28,6 +28,9 @@ use crate::api_registry::ApiProvider;
 use crate::types::*;
 use crate::utils::abort::{self, AbortErrorOrReqwest, AbortableNext};
 use crate::utils::event_stream::{AssistantMessageEventSender, AssistantMessageEventStream};
+use crate::utils::provider_diagnostics::{
+    add_diagnostic, normalize_provider_http_error, raw_stop_reason_diagnostic,
+};
 use crate::utils::sse::SseStream;
 
 /// Default Anthropic API host. Used as the fallback when `Model::base_url` is empty.
@@ -257,7 +260,13 @@ async fn run(
             }
             Err(AbortErrorOrReqwest::Reqwest(_)) => String::new(),
         };
-        push_error(&mut sender, &model, format!("HTTP {status}: {txt}"));
+        let normalized = normalize_provider_http_error("anthropic", status, &txt);
+        push_error_with_diagnostic(
+            &mut sender,
+            &model,
+            normalized.message,
+            normalized.diagnostic,
+        );
         return;
     }
 
@@ -337,6 +346,7 @@ fn handle_sse(
                 .pointer("/delta/stop_reason")
                 .and_then(|v| v.as_str())
             {
+                add_diagnostic(partial, raw_stop_reason_diagnostic("anthropic", reason));
                 partial.stop_reason = map_stop_reason(reason);
             }
             if let Some(u) = payload.get("usage") {
@@ -771,6 +781,22 @@ fn push_error(sender: &mut AssistantMessageEventSender, model: &Model, msg: Stri
     let mut p = empty_partial(model);
     p.stop_reason = StopReason::Error;
     p.error_message = Some(msg);
+    sender.push(AssistantMessageEvent::Error {
+        reason: ErrorReason::Error,
+        error: p,
+    });
+}
+
+fn push_error_with_diagnostic(
+    sender: &mut AssistantMessageEventSender,
+    model: &Model,
+    msg: String,
+    diagnostic: Value,
+) {
+    let mut p = empty_partial(model);
+    p.stop_reason = StopReason::Error;
+    p.error_message = Some(msg);
+    add_diagnostic(&mut p, diagnostic);
     sender.push(AssistantMessageEvent::Error {
         reason: ErrorReason::Error,
         error: p,
