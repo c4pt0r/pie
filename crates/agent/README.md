@@ -1,12 +1,12 @@
 # pie-agent-core (Rust)
 
 Rust port of [`@earendil-works/pie-agent-core`](https://github.com/earendil-works/pi) — the
-stateful agent runtime layered on top of [`pie-ai`](../pi-rs-rust). Provides the agent loop, tool
+stateful agent runtime layered on top of [`pie-ai`](../ai). Provides the agent loop, tool
 execution, session persistence, compaction, skills resolution, and prompt-template plumbing.
 
 ## Status
 
-1:1 source-level port with `pi-rs-rust` as a path dependency. All four target subsystems —
+1:1 source-level port with `pie-ai` as a path dependency. All four target subsystems —
 **harness, Agent loop, session, compaction** — are functional and covered by integration tests
 against a synthetic stream.
 

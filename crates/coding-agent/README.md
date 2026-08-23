@@ -1,7 +1,7 @@
 # pie-coding-agent (Rust)
 
-Minimal coding agent CLI built on top of [`pie-agent-core`](../pie-agent-core-rs) and
-[`pie-ai`](../pi-rs-rust). Modeled on the TS implementation in
+Minimal coding agent CLI built on top of [`pie-agent-core`](../agent) and
+[`pie-ai`](../ai). Modeled on the TS implementation in
 `packages/coding-agent/` of the upstream `pi` monorepo, but trimmed to the essentials.
 
 ## What's in scope
