@@ -250,6 +250,12 @@ The experimental public cross-agent messaging service has been removed from the 
 surface. Configure ordinary MCP servers explicitly in `~/.pie/mcp.toml` when you need external
 tools or notification sources.
 
+## Web search through MCP
+
+For opt-in web search and page excerpts without a Parallel API key, see the
+[Parallel Search MCP example](examples/mcp-parallel-search/). It uses pie's
+existing Streamable HTTP transport and leaves built-in tools available.
+
 ## Cron jobs
 
 Cron jobs are time-based automations, separate from dynamic triggers. By default they are

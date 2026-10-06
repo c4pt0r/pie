@@ -20,16 +20,23 @@ use tokio_util::sync::CancellationToken;
 pub struct McpAgentTool {
     client: Arc<McpClient>,
     definition: Tool,
+    remote_name: String,
 }
 
 impl McpAgentTool {
     /// Build an adapter for one server-side tool. The pie_ai::Tool definition is constructed
     /// from the MCP catalog entry; the input schema is forwarded verbatim.
     pub fn new(client: Arc<McpClient>, tool: &McpTool) -> Self {
+        Self::with_prefix(client, tool, "")
+    }
+
+    /// Prefix the agent-visible name while retaining the server's wire name.
+    pub fn with_prefix(client: Arc<McpClient>, tool: &McpTool, prefix: &str) -> Self {
         Self {
             client,
+            remote_name: tool.name.clone(),
             definition: Tool {
-                name: tool.name.clone(),
+                name: format!("{prefix}{}", tool.name),
                 description: tool.description.clone().unwrap_or_default(),
                 parameters: tool.input_schema.clone(),
             },
@@ -65,7 +72,7 @@ impl AgentTool for McpAgentTool {
         // after the user hit Ctrl-C.
         let result = match self
             .client
-            .tools_call(&self.definition.name, Some(params), Some(cancel.clone()))
+            .tools_call(&self.remote_name, Some(params), Some(cancel.clone()))
             .await
         {
             Ok(r) => r,

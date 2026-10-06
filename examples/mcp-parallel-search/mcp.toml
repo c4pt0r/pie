@@ -1,0 +1,8 @@
+# Merge this block into ~/.pie/mcp.toml or <project>/.pie/mcp.toml.
+# No Parallel API key, auth entry, or local server process is needed.
+[[server]]
+name = "parallel-search"
+# Keep pie's built-in web_search and web_fetch available under their existing names.
+tool_prefix = "parallel_"
+kind = "streamable_http"
+endpoint = "https://search.parallel.ai/mcp"

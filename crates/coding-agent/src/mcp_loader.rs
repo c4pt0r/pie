@@ -30,6 +30,9 @@ pub struct McpConfig {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ServerConfig {
     pub name: String,
+    /// Optional prefix for agent-visible tool names; wire names stay unchanged.
+    #[serde(default)]
+    pub tool_prefix: String,
     #[serde(default)]
     pub kind: ServerKind,
     pub command: Option<String>,
@@ -230,7 +233,11 @@ async fn connect_one(
     let tools = client.tools_list().await?;
     let mut out: Vec<Arc<dyn AgentTool>> = Vec::with_capacity(tools.len());
     for tool in &tools {
-        let adapter = McpAgentTool::new(client.clone(), tool);
+        let adapter = if s.tool_prefix.is_empty() {
+            McpAgentTool::new(client.clone(), tool)
+        } else {
+            McpAgentTool::with_prefix(client.clone(), tool, &s.tool_prefix)
+        };
         out.push(Arc::new(adapter));
     }
     Ok((out, hook))
@@ -358,6 +365,7 @@ mod tests {
     async fn client_count_reflects_successful_connections_not_attempts() {
         let configs = vec![
             ServerConfig {
+                tool_prefix: String::new(),
                 name: "broken-a".into(),
                 kind: ServerKind::Stdio,
                 command: Some("/definitely/not/a/real/path/for/mcp/test-a".into()),
@@ -372,6 +380,7 @@ mod tests {
                 inject_and_run: false,
             },
             ServerConfig {
+                tool_prefix: String::new(),
                 name: "broken-b".into(),
                 kind: ServerKind::Stdio,
                 command: Some("/definitely/not/a/real/path/for/mcp/test-b".into()),
@@ -439,6 +448,7 @@ body_cap_bytes = 1048576
         assert_eq!(cfg.server.len(), 1);
         let server = &cfg.server[0];
         assert_eq!(server.name, "remote-docs");
+        assert!(server.tool_prefix.is_empty());
         assert_eq!(server.kind, ServerKind::StreamableHttp);
         assert_eq!(
             server.endpoint.as_deref(),
@@ -456,6 +466,7 @@ body_cap_bytes = 1048576
     #[tokio::test]
     async fn streamable_http_rejects_command_args() {
         let server = ServerConfig {
+            tool_prefix: String::new(),
             name: "custom-http".into(),
             kind: ServerKind::StreamableHttp,
             command: Some("node".into()),
@@ -520,5 +531,195 @@ body_cap_bytes = 1048576
         .to_string();
         assert!(!err.contains(secret_like_ref), "{err}");
         assert!(err.contains("<configured-token-ref>"), "{err}");
+    }
+
+    /// Opt-in network check for the runnable Parallel example. PIE_DIR must point
+    /// to an empty directory so user-global MCP config and saved keys are isolated.
+    #[tokio::test]
+    #[ignore = "calls the anonymous Parallel Search MCP endpoint"]
+    async fn parallel_search_live() {
+        let isolated = std::env::var("PIE_DIR").expect("set PIE_DIR to an empty directory");
+        assert!(
+            !Path::new(&isolated).exists()
+                || std::fs::read_dir(&isolated).unwrap().next().is_none(),
+            "PIE_DIR must be empty"
+        );
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join(".pie")).unwrap();
+        std::fs::write(
+            project.path().join(".pie/mcp.toml"),
+            include_str!("../../../examples/mcp-parallel-search/mcp.toml"),
+        )
+        .unwrap();
+        let loaded = load_all(project.path()).await;
+        assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
+        assert_eq!(loaded.server_names, ["parallel-search"]);
+        assert_eq!(loaded.client_count, 1);
+        assert_eq!(loaded.tools.len(), 2);
+        // Select from the combined user-facing registry, as the agent does.
+        let mut tools = crate::tools::default_tools(project.path().join("memory"));
+        tools.extend(loaded.tools);
+        let mut names = std::collections::HashSet::new();
+        assert!(
+            tools
+                .iter()
+                .all(|tool| names.insert(tool.definition().name.clone()))
+        );
+        assert!(names.contains("web_search") && names.contains("web_fetch"));
+        let session_id = uuid::Uuid::new_v4().to_string();
+        for (name, params) in [
+            (
+                "parallel_web_search",
+                serde_json::json!({
+                    "objective": "Find the official Rust book explanation of ownership rules",
+                    "search_queries": ["Rust book ownership rules"],
+                    "session_id": session_id,
+                }),
+            ),
+            (
+                "parallel_web_fetch",
+                serde_json::json!({
+                    "urls": ["https://doc.rust-lang.org/book/ch04-01-what-is-ownership.html"],
+                    "objective": "Explain the Rust ownership rules",
+                    "session_id": session_id,
+                }),
+            ),
+        ] {
+            let tool = tools
+                .iter()
+                .find(|t| t.definition().name == name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            let result = tool
+                .execute(
+                    "parallel-smoke",
+                    params,
+                    tokio_util::sync::CancellationToken::new(),
+                    None,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let text = result
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    pie_ai::UserContentBlock::Text(t) => Some(t.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                text.contains("https://doc.rust-lang.org/"),
+                "{name}: {text}"
+            );
+            assert!(text.to_lowercase().contains("ownership"), "{name}: {text}");
+            println!(
+                "{name}: source URL and ownership excerpts returned ({} bytes)",
+                text.len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_example_sends_anonymous_requests_with_project_user_agent() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let fixture = tokio::spawn(async move {
+            let mut calls = Vec::new();
+            while calls.len() < 2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let (header_end, content_len) = loop {
+                    let mut chunk = [0; 4096];
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&chunk[..n]);
+                    if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..end]).to_lowercase();
+                        assert!(headers.contains("user-agent: pie-mcp/"), "{headers}");
+                        assert!(!headers.contains("authorization:"), "{headers}");
+                        let len = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.strip_prefix("content-length: ")
+                                    .map(|v| v.parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        break (end + 4, len);
+                    }
+                };
+                while bytes.len() < header_end + content_len {
+                    let mut chunk = [0; 4096];
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&chunk[..n]);
+                }
+                if bytes.starts_with(b"GET ") {
+                    socket.write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                    continue;
+                }
+                let request: serde_json::Value =
+                    serde_json::from_slice(&bytes[header_end..]).unwrap();
+                let result = match request["method"].as_str().unwrap() {
+                    "initialize" => serde_json::json!({
+                        "protocolVersion": "2025-03-26", "capabilities": {},
+                        "serverInfo": {"name": "anonymous-fixture", "version": "1"}
+                    }),
+                    "notifications/initialized" => {
+                        socket.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                        continue;
+                    }
+                    "tools/list" => serde_json::json!({"tools": [
+                        {"name": "web_search", "inputSchema": {"type": "object"}},
+                        {"name": "web_fetch", "inputSchema": {"type": "object"}}
+                    ]}),
+                    "tools/call" => {
+                        calls.push(request["params"]["name"].as_str().unwrap().to_owned());
+                        serde_json::json!({"content": [{"type": "text", "text": "fixture excerpt"}]})
+                    }
+                    method => panic!("unexpected method {method}"),
+                };
+                let body =
+                    serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "result": result})
+                        .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+            calls
+        });
+        let mut cfg: McpConfig = toml::from_str(include_str!(
+            "../../../examples/mcp-parallel-search/mcp.toml"
+        ))
+        .unwrap();
+        // Keep the example's config, changing only its address to a hermetic fixture.
+        cfg.server[0].endpoint = Some(endpoint);
+        let (tools, _, diagnostics, count, _) = connect_all(&cfg.server).await;
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(count, 1);
+        for name in ["parallel_web_search", "parallel_web_fetch"] {
+            let tool = tools.iter().find(|t| t.definition().name == name).unwrap();
+            let result = tool
+                .execute(
+                    "fixture-call",
+                    serde_json::json!({}),
+                    tokio_util::sync::CancellationToken::new(),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(&result.content[0], pie_ai::UserContentBlock::Text(t) if t.text == "fixture excerpt")
+            );
+        }
+        let calls = tokio::time::timeout(std::time::Duration::from_secs(5), fixture)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(calls, ["web_search", "web_fetch"]);
     }
 }
